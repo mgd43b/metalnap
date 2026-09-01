@@ -199,6 +199,19 @@ operational knob you may need to turn during an incident (`metalnap/config.py`).
 it would take without touching anything** — run it there first, for as long as
 it takes to trust the numbers.
 
+## Artifact Hub
+
+Listed as a **Helm charts** repository (there is no "OCI" kind — OCI is
+expressed by the URL scheme) pointing at `oci://ghcr.io/mgd43b/charts/metalnap`.
+
+The `artifacthub-repo.yml` ownership file is **not** served over HTTP and
+**not** packaged inside the chart. For an OCI repository Artifact Hub reads a
+separate OCI artifact in the same repository, tagged `artifacthub.io`, carrying
+a layer of media type
+`application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml`. The
+release workflow pushes it; `oras repo tags` should show both `artifacthub.io`
+and the chart version.
+
 ## Contributing
 
 Two things make a change reviewable here:

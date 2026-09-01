@@ -1,13 +1,14 @@
 # Artifact Hub repository metadata.
 #
-# Add the repo at https://artifacthub.io/control-panel/repositories as an OCI
-# repository pointing at:
+# For an OCI repository this file is NOT served from a URL and NOT packaged
+# inside the chart -- Artifact Hub looks for it as a SEPARATE OCI artifact in
+# the same repository, tagged `artifacthub.io`, with a specific layer media
+# type. Pushed by .github/workflows/release.yml; see the `metadata` job there
+# for the exact oras invocation.
 #
-#     oci://ghcr.io/mgd43b/charts/metalnap
-#
-# Artifact Hub reads this file from the OCI artifact itself, so it must be
-# packaged with the chart -- not only committed here.
-repositoryID: ""          # filled in by Artifact Hub after the repo is claimed
+# The repository ID is not a secret: it is shown in the Artifact Hub control
+# panel and is published precisely so ownership can be verified.
+repositoryID: 216105ba-adfd-4d17-9033-d654b10d01a1
 owners:
   - name: mgd43b
     email: matt+claude@reloadingtracker.com
