@@ -230,6 +230,45 @@ class TestProtectedNodes(unittest.TestCase):
                          "a protected node stopped its peer being managed")
 
 
+class TestDryRunTouchesNothing(unittest.TestCase):
+    """dry_run must not mutate ANY external state.
+
+    Both of these were live bugs found by shadowing metalnap next to the
+    controller it is replacing. The second is the dangerous one: `stranded` is
+    read from the CLUSTER, not from our own state, so a dry_run shadow sharing
+    the cordon annotation would uncordon a node the live controller was
+    mid-drain on. It had not fired only because no sleep happened to occur
+    while the shadow was up.
+    """
+
+    def test_stranded_repair_does_not_cordon_in_dry_run(self):
+        h = Harness({"a": node(ready=True, cordoned=True, ours=True),
+                     "b": None}, shortfall=400.0)
+        c = h.controller(mode="dry_run")
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [],
+                         "dry_run uncordoned a node -- it would fight the "
+                         "controller it is shadowing")
+
+    def test_mid_sleep_abort_does_not_cordon_in_dry_run(self):
+        h = Harness({"a": node(ready=True, cordoned=True, ours=True),
+                     "b": None}, shortfall=400.0)
+        c = h.controller(mode="dry_run")
+        c.st["a"] = {"phase": "sleeping", "phase_since": h.t}
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [], "dry_run changed a cordon")
+
+    def test_dry_run_powers_nothing(self):
+        h = Harness({"a": node(ready=False), "b": None}, shortfall=400.0)
+        c = h.controller(mode="dry_run")
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+        self.assertEqual(h.acted["off"], [])
+
+
 class TestFitGuard(unittest.TestCase):
     """shortfall() is a sum; it cannot say WHY work is waiting."""
 
@@ -288,6 +327,22 @@ class TestNotifier(unittest.TestCase):
         c.sleep("a", h.states["a"])
         self.assertEqual(h.acted["off"], [],
                          "powered off a node it could not announce")
+
+    def test_dry_run_never_touches_the_notifier(self):
+        """dry_run must not mutate anything outside the process.
+
+        A shadow deployment that silences alerts is not observing, it is
+        participating -- and it fights the controller it was meant to be
+        compared against. Found in production: a dry_run metalnap created a
+        live Alertmanager silence beside the incumbent's.
+        """
+        h = Harness({"a": node(ready=False), "b": None}, shortfall=400.0)
+        spy = self.Spy()
+        c = h.controller(mode="dry_run")
+        c.notifier = spy
+        c.tick()
+        self.assertEqual(spy.down, [], "dry_run announced a node as down")
+        self.assertEqual(spy.up, [], "dry_run cleared a notification")
 
     def test_a_node_that_is_up_gets_its_notification_cleared(self):
         """A leftover silence on a live node swallows a real failure."""

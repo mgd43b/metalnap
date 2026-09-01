@@ -53,6 +53,26 @@ class Controller:
     def _node(self, name) -> dict:
         return self.st.setdefault(name, {})
 
+    def _set_cordon(self, name, cordoned):
+        """
+        The ONLY route to a cordon change, so `dry_run` cannot be bypassed.
+
+        wake() and sleep() return early when the mode is not `on`, but tick()
+        also cordons directly -- the mid-sleep abort and the stranded repair --
+        and those paths had no mode check at all. A dry_run shadow would
+        therefore uncordon a node the LIVE controller was mid-drain on, because
+        `stranded` is read from the cluster rather than from our own state.
+        It had not fired yet only because no sleep happened to occur while the
+        shadow was up.
+
+        A guard at every call site is a guard that gets missed at one of them.
+        """
+        if self.cfg.mode != "on":
+            self.log("info", "dry_run: would %s" %
+                     ("cordon" if cordoned else "uncordon"), node=name)
+            return
+        self.node_source.set_cordon(name, cordoned)
+
     def run_forever(self):
         self.log("info", "metalnap starting", nodes=self.nodes,
                  interval_s=self.cfg.interval_s)
@@ -91,7 +111,7 @@ class Controller:
             # Uncordon FIRST. Anything after this point is an optimisation, and
             # an optimisation must never be able to strand a node that is
             # already powered and Ready but not yet schedulable.
-            self.node_source.set_cordon(name, False)
+            self._set_cordon(name, False)
             s["awake_since"] = self.now()
             s["sleep_attempts"] = 0
             s.pop("cooldown_until", None)
@@ -154,7 +174,7 @@ class Controller:
         self.log("error", reason, node=name,
                  cooldown_s=self.cfg.sleep_cooldown_s)
         try:
-            self.node_source.set_cordon(name, False)
+            self._set_cordon(name, False)
         except Exception as e:                        # noqa: BLE001
             self.log("error", "could not uncordon after abandoning sleep",
                      node=name, err=str(e))
@@ -182,7 +202,7 @@ class Controller:
             # clock that is supposed to survive a restart, and a node with hung
             # work could be held indefinitely, one restart at a time.
             if not (state and state.cordoned and state.ours):
-                self.node_source.set_cordon(name, True)
+                self._set_cordon(name, True)
             s["phase"] = "sleeping"
             s["phase_since"] = self.now()
             return
@@ -312,11 +332,22 @@ class Controller:
         # re-asserted, and -- more importantly -- one left over on a node that
         # is UP is cleared, so a real failure of it is not silently swallowed.
         for n in present:
+            want_down = not states[n].ready
+            if cfg.mode != "on":
+                # dry_run must not mutate ANYTHING outside this process, and a
+                # notifier writes to a real system. A shadow deployment that
+                # silences alerts is not observing, it is participating -- and
+                # it will fight the controller it was meant to be compared
+                # against. Caught by exactly that: a dry_run metalnap created a
+                # live Alertmanager silence next to the incumbent's.
+                self.log("info", "dry_run: would mark node %s"
+                                 % ("down" if want_down else "up"), node=n)
+                continue
             try:
-                if states[n].ready:
-                    self.notifier.back_up(n)
-                else:
+                if want_down:
                     self.notifier.going_down(n)
+                else:
+                    self.notifier.back_up(n)
             except Exception as e:                    # noqa: BLE001
                 self.log("warn", "notification reconcile failed", node=n,
                          err=str(e))
@@ -385,7 +416,7 @@ class Controller:
                          node=n, want=want, awake=len(awake))
                 st[n]["phase"] = None
                 try:
-                    self.node_source.set_cordon(n, False)
+                    self._set_cordon(n, False)
                     awake.append(n)
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
@@ -412,7 +443,7 @@ class Controller:
                 self.log("warn", "stranded node needed; completing the wake",
                          node=n)
                 try:
-                    self.node_source.set_cordon(n, False)
+                    self._set_cordon(n, False)
                     self._node(n)["awake_since"] = self.now()
                     awake.append(n)
                 except Exception as e:                # noqa: BLE001

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.2 — 2026-09-01
+
+**`dry_run` was not dry.** Two external mutations escaped it, both found within
+an hour of shadowing metalnap next to the controller it is meant to replace —
+which is the entire argument for shadowing.
+
+1. **Notifications fired in `dry_run`.** A shadow created a live Alertmanager
+   silence beside the incumbent's. A dry-run controller that silences alerts is
+   not observing, it is participating.
+
+2. **Cordon changes escaped `dry_run` via `tick()`.** `wake()` and `sleep()`
+   check the mode and return early, but tick() also cordons directly — the
+   mid-sleep abort and the stranded repair — and neither had a mode check.
+   This one is dangerous: `stranded` is read from the CLUSTER, not from the
+   controller's own state, so a shadow sharing the cordon annotation would
+   **uncordon a node the live controller was mid-drain on**. It had not fired
+   only because no sleep happened to occur while the shadow was up.
+
+Every cordon change now goes through one mode-checked choke point. A guard at
+each call site is a guard that gets missed at one of them — which is exactly
+what happened.
+
+Tests 19 → 23.
+
+
 ## v0.2.1 — 2026-09-01
 
 Refuses to power-manage a **protected** node — one carrying
