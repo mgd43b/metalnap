@@ -1,0 +1,49 @@
+{{- if and .Values.rbac.create .Values.warmup.image }}
+# The Warmup seam runs a one-shot pod on a freshly woken node, so it needs to
+# create and delete that pod. Namespaced, not in the ClusterRole: this is the
+# only thing metalnap writes besides node cordons, and it writes it in exactly
+# one namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "metalnap.fullname" . }}-warmup
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+rules:
+  # `create` cannot be constrained by resourceNames -- RBAC has no name to
+  # match against at admission time. This is the one unrestricted verb.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create"]
+  # `delete` IS constrained, to exactly the warmup pods for exactly the nodes
+  # this release manages. Names are generated from .Values.nodes, so there is
+  # no second list to keep in sync -- a hand-maintained one drifts, and the
+  # failure is silent: the wake succeeds and the scratch pod is never cleaned
+  # up.
+  #
+  # Deliberately NOT delete-any-pod: metalnap must not be able to remove a
+  # runner pod, which is how running work gets destroyed. It releases idle
+  # units through their own scheduler's API instead.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "delete"]
+    resourceNames:
+    {{- range .Values.nodes }}
+      - metalnap-warmup-{{ . }}
+    {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "metalnap.fullname" . }}-warmup
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "metalnap.fullname" . }}-warmup
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "metalnap.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
