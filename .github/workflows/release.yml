@@ -49,10 +49,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # QEMU so the arm64 layer can be built on an amd64 runner. Without this
+      # the image is amd64-only, and the README's `docker pull` fails outright
+      # on Apple Silicon and on ARM servers -- which is most people's first
+      # contact with the project.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
