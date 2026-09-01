@@ -95,6 +95,19 @@ jobs:
 
       - name: Package and push
         run: |
-          helm registry login ghcr.io             -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+          helm registry login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
           helm package charts/metalnap -d /tmp/pkg
           helm push /tmp/pkg/metalnap-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+      - name: Push the Artifact Hub metadata
+        # For an OCI repository this file is NOT served over HTTP and NOT
+        # packaged inside the chart -- both of which are the natural guess, and
+        # both are wrong. Artifact Hub looks for a SEPARATE OCI artifact in the
+        # same repository, tagged `artifacthub.io`, and reads the layer with
+        # the media type below. Without it the repository stays unverified and
+        # nothing says why.
+        run: |
+          curl -sSL -o /tmp/oras.tgz https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz
+          tar xzf /tmp/oras.tgz -C /tmp oras
+          echo "${{ secrets.GITHUB_TOKEN }}" | /tmp/oras login ghcr.io -u ${{ github.actor }} --password-stdin
+          /tmp/oras push ghcr.io/${{ github.repository_owner }}/charts/metalnap:artifacthub.io --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
