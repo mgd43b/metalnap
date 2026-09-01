@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "metalnap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+spec:
+  # Exactly one. Two controllers would race each other's cordons, and the
+  # loser's decisions are made from state the winner has already changed.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "metalnap.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "metalnap.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when config changes; the process reads env at start.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "metalnap.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: metalnap
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "metalnap.fullname" . }}
+          env:
+            - name: BMC_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bmc.existingSecret }}
+                  key: user
+            - name: BMC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bmc.existingSecret }}
+                  key: pass
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # No tolerations by default, and that is load-bearing rather than an
+      # oversight: metalnap must never be scheduled onto a node it manages, or
+      # it will cordon and power off the machine it is running on.
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

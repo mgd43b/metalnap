@@ -1,0 +1,80 @@
+image:
+  repository: ghcr.io/mgd43b/metalnap
+  # Pin a version. `latest` is published for convenience but a controller that
+  # power-cycles hardware should never float.
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Nodes metalnap is allowed to manage. It will touch nothing else.
+nodes: []
+  # - k8s14
+  # - k8s15
+
+# off | dry_run | on
+#
+# Ships as dry_run ON PURPOSE. In this mode it observes and logs every decision
+# it WOULD take and touches nothing. Watch it for as long as it takes to trust
+# the numbers before promoting to `on`.
+mode: dry_run
+
+bmc:
+  # Format string for a node's BMC hostname. {node} is substituted.
+  hostFormat: "{node}-ipmi.internal.example.org"
+  # Existing Secret with keys `user` and `pass`. Created out of band -- BMC
+  # credentials do not belong in values.yaml or in git.
+  existingSecret: metalnap-bmc
+
+prometheus:
+  url: http://prometheus-k8s.monitoring.svc:9090
+
+arc:
+  namespace: arc-runners
+
+# The annotation that marks a cordon as metalnap's own. A cordon WITHOUT it is
+# an operator's, and metalnap will never override it. Changing this on a
+# running install orphans any cordon it currently holds.
+cordonAnnotation: metalnap.io/cordoned
+
+# Every timer, in seconds. Defaults match metalnap/config.py.
+timers:
+  intervalS: 60
+  wakeSustainS: 120       # demand must persist this long before waking
+  sleepSustainS: 1200     # ...and stay low this long before sleeping
+  minUptimeS: 2700        # a freshly-woken node may not sleep yet
+  wakeTimeoutS: 900
+  drainTimeoutS: 1800
+  maxSleepAttempts: 5
+  sleepCooldownS: 1800
+  defaultCapacityGib: 125.7
+
+# Override the demand queries if your signal differs.
+queries:
+  shortfall: ""           # empty = the ARC default from __main__.py
+  saturation: ""          # empty = the ARC default; "-" disables the term
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+affinity: {}
+
+# DELIBERATELY EMPTY, and think hard before filling it.
+#
+# metalnap must not run on a node it manages. Tolerating the taint that keeps
+# work off your sleepable nodes lets the scheduler place the controller on one
+# of them -- and it will then cordon and power off the machine it is running
+# on, losing the process mid-drain.
+tolerations: []
+
+podAnnotations: {}

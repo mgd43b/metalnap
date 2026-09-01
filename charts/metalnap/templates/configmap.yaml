@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "metalnap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+data:
+  MODE: {{ .Values.mode | quote }}
+  NODES: {{ join "," .Values.nodes | quote }}
+  BMC_HOST_FMT: {{ .Values.bmc.hostFormat | quote }}
+  PROM_URL: {{ .Values.prometheus.url | quote }}
+  ARC_NAMESPACE: {{ .Values.arc.namespace | quote }}
+  CORDON_ANNOTATION: {{ .Values.cordonAnnotation | quote }}
+  INTERVAL_S: {{ .Values.timers.intervalS | quote }}
+  WAKE_SUSTAIN_S: {{ .Values.timers.wakeSustainS | quote }}
+  SLEEP_SUSTAIN_S: {{ .Values.timers.sleepSustainS | quote }}
+  MIN_UPTIME_S: {{ .Values.timers.minUptimeS | quote }}
+  WAKE_TIMEOUT_S: {{ .Values.timers.wakeTimeoutS | quote }}
+  DRAIN_TIMEOUT_S: {{ .Values.timers.drainTimeoutS | quote }}
+  MAX_SLEEP_ATTEMPTS: {{ .Values.timers.maxSleepAttempts | quote }}
+  SLEEP_COOLDOWN_S: {{ .Values.timers.sleepCooldownS | quote }}
+  DEFAULT_CAPACITY: {{ .Values.timers.defaultCapacityGib | quote }}
+  {{- with .Values.queries.shortfall }}
+  SHORTFALL_QUERY: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.queries.saturation }}
+  SATURATION_QUERY: {{ if eq .Values.queries.saturation "-" }}""{{ else }}{{ .Values.queries.saturation | quote }}{{ end }}
+  {{- end }}

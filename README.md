@@ -6,6 +6,7 @@ running work to do it.**
 [![ci](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/metalnap)](https://artifacthub.io/packages/search?repo=metalnap)
 
 metalnap watches a demand signal, works out how many machines should be awake,
 and powers physical nodes off and on over IPMI (or Redfish, or Wake-on-LAN, or
@@ -128,7 +129,41 @@ git clone https://github.com/mgd43b/metalnap && cd metalnap
 python3 -B tests/sim.py --seeds 20 --ticks 400
 ```
 
-## Run it
+## Install with Helm
+
+```bash
+# BMC credentials are created out of band -- they do not belong in values.yaml
+kubectl create ns metalnap
+kubectl -n metalnap create secret generic metalnap-bmc \
+  --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
+
+helm install metalnap oci://ghcr.io/mgd43b/charts/metalnap \
+  -n metalnap --version 0.1.0 \
+  --set 'nodes={node1,node2}' \
+  --set bmc.hostFormat='{node}-ipmi.internal.example.org' \
+  --set prometheus.url=http://prometheus-k8s.monitoring.svc:9090
+```
+
+It installs in **`dry_run`** and touches nothing. Watch what it decides:
+
+```bash
+kubectl -n metalnap logs -l app.kubernetes.io/name=metalnap -f
+```
+
+When the decisions look right:
+
+```bash
+helm upgrade metalnap oci://ghcr.io/mgd43b/charts/metalnap \
+  -n metalnap --reuse-values --set mode=on
+```
+
+`--set mode=off` is the rollback, and it never touches a node on the way out.
+
+> The chart sets **no tolerations**, deliberately. metalnap must not be
+> scheduled onto a node it manages, or it will cordon and power off the machine
+> it is running on.
+
+## Run it directly
 
 A container image is published to GitHub Container Registry on each release:
 

@@ -1,0 +1,30 @@
+apiVersion: v2
+name: metalnap
+description: Suspend idle bare-metal Kubernetes nodes to save power, without killing running work
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/mgd43b/metalnap
+sources:
+  - https://github.com/mgd43b/metalnap
+keywords:
+  - bare-metal
+  - power-management
+  - autoscaling
+  - ipmi
+  - energy-efficiency
+  - self-hosted-runners
+maintainers:
+  - name: mgd43b
+    url: https://github.com/mgd43b
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/category: integration-delivery
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/signKey: |
+    fingerprint: none
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/mgd43b/metalnap
+    - name: safety rules
+      url: https://github.com/mgd43b/metalnap#the-rules-it-will-not-break

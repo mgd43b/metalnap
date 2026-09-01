@@ -1,0 +1,45 @@
+{{- if .Values.rbac.create }}
+# What is DENIED here matters more than what is granted.
+#
+# There is deliberately no pods/delete and no pods/eviction. Evicting worker
+# pods directly is how running work gets destroyed; metalnap releases idle
+# units through their own scheduler's API instead, which deregisters them
+# before teardown. It should not be ABLE to evict a pod even if a future bug
+# tells it to.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "metalnap.fullname" . }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+rules:
+  # patch is for cordon/uncordon and the ownership annotation, which move
+  # together in a single patch -- split across two calls, a crash between them
+  # leaves a cordon nobody claims.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # delete on ephemeralrunners is how an IDLE runner is released: it is ARC's
+  # own scale-down path, which deregisters the runner from GitHub BEFORE
+  # removing the pod, so no job can be dispatched into something about to be
+  # destroyed.
+  - apiGroups: ["actions.github.com"]
+    resources: ["ephemeralrunners"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "metalnap.fullname" . }}
+  labels: {{- include "metalnap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "metalnap.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "metalnap.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

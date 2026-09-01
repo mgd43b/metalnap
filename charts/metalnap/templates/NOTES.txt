@@ -1,0 +1,29 @@
+metalnap {{ .Chart.AppVersion }} installed as {{ include "metalnap.fullname" . }}.
+
+  Managing nodes : {{ if .Values.nodes }}{{ join ", " .Values.nodes }}{{ else }}NONE -- set `nodes` or it will do nothing{{ end }}
+  Mode           : {{ .Values.mode }}
+
+{{ if eq .Values.mode "dry_run" -}}
+It is in DRY RUN and will not touch anything. It logs every decision it would
+take. Watch it until those decisions look right:
+
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name=metalnap -f
+
+Then promote it:
+
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set mode=on
+{{- else if eq .Values.mode "on" -}}
+It is LIVE and will power hardware off and on.
+
+Roll it back at any time without touching a node:
+
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set mode=off
+{{- end }}
+
+{{ if not .Values.tolerations -}}
+No tolerations are set, which is correct: metalnap must not be scheduled onto a
+node it manages, or it will cordon and power off the machine it is running on.
+{{- else -}}
+WARNING: tolerations are set. Make sure none of them allow scheduling onto a
+node listed in `nodes` -- metalnap would then power off the machine it runs on.
+{{- end }}

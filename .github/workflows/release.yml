@@ -69,3 +69,32 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  chart:
+    # Separate job so a chart problem cannot half-publish an image, and so the
+    # chart is only pushed once the image it references actually exists.
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Lint and render
+        # `helm template` alone proves the chart parses; rendering and checking
+        # the objects proves it produces the thing it claims to.
+        run: |
+          helm lint charts/metalnap --set 'nodes={a,b}'
+          helm template t charts/metalnap --set 'nodes={a,b}' > /tmp/r.yaml
+          grep -q 'kind: ClusterRole' /tmp/r.yaml
+          grep -q 'runAsNonRoot: true' /tmp/r.yaml
+          # The controller must never tolerate the taint on nodes it manages.
+          if grep -q 'tolerations:' /tmp/r.yaml; then
+            echo "chart renders tolerations by default -- metalnap could be"                  "scheduled onto a node it powers off" >&2
+            exit 1
+          fi
+
+      - name: Package and push
+        run: |
+          helm registry login ghcr.io             -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+          helm package charts/metalnap -d /tmp/pkg
+          helm push /tmp/pkg/metalnap-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
