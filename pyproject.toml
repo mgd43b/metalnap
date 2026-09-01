@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metalnap"
+version = "0.1.0"
+description = "Power bare-metal Kubernetes nodes down when the queue is empty, without killing running work"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["requests>=2.25"]
+
+[project.urls]
+Homepage = "https://github.com/mgd43b/metalnap"
+
+[tool.setuptools.packages.find]
+include = ["metalnap*"]
