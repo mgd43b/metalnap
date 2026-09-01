@@ -17,6 +17,15 @@ Required:
 
 Optional:
     MODE                    off | dry_run | on          (default dry_run)
+    ALERTMANAGER_URL        silence a node's alerts while it is down.
+                            STRONGLY recommended -- without it every sleep
+                            looks like a node dying and pages someone.
+    WARMUP_IMAGE            pull this onto a node after waking it, so the
+                            first jobs do not each pay for it
+    WARMUP_PULL_SECRETS     comma-separated imagePullSecrets for the above
+    BURST_TAINT_KEY         taint keeping other work off sleepable nodes
+                            (default ci-burst); used for the warmup pod's
+                            toleration and for the pending-pod fit check
     ARC_NAMESPACE           default arc-runners
     CORDON_ANNOTATION       default metalnap.io/cordoned
     SHORTFALL_QUERY         override the default PromQL
@@ -29,9 +38,11 @@ import sys
 from . import Config, Controller
 from .drain import ArcDrain
 from .drain.arc import ARC_SATURATION_QUERY
-from .kube import Kube, KubeNodeSource
+from .kube import Kube, KubeNodeSource, PendingPodFit
+from .notify import AlertmanagerNotifier
 from .power import IpmiPower
 from .signal import PrometheusSignal
+from .warmup import ImagePrepull
 
 
 def default_shortfall_query(ns):
@@ -69,8 +80,28 @@ def main(argv=None):
 
     sat_q = os.environ.get("SATURATION_QUERY", ARC_SATURATION_QUERY)
 
+    # Silencing is opt-in by URL, but strongly recommended: without it every
+    # sleep looks like a node dying and pages someone.
+    am = os.environ.get("ALERTMANAGER_URL")
+    notifier = AlertmanagerNotifier(am) if am else None
+
+    # Warming is opt-in by image. Without it the first work after a wake pays
+    # the pull.
+    warm_image = os.environ.get("WARMUP_IMAGE")
+    taint = os.environ.get("BURST_TAINT_KEY", "ci-burst")
+    warmup = ImagePrepull(
+        kube, warm_image, namespace=ns,
+        tolerations=[{"key": taint, "operator": "Equal", "value": "true",
+                      "effect": "NoSchedule"}],
+        image_pull_secrets=[{"name": s} for s in
+                            filter(None, os.environ.get(
+                                "WARMUP_PULL_SECRETS", "").split(","))],
+    ) if warm_image else None
+
     Controller(
         nodes=nodes,
+        notifier=notifier,
+        warmup=warmup,
         node_source=KubeNodeSource(
             kube, annotation=os.environ.get("CORDON_ANNOTATION",
                                             "metalnap.io/cordoned")),
@@ -79,7 +110,8 @@ def main(argv=None):
         signal=PrometheusSignal(
             require("PROM_URL"),
             os.environ.get("SHORTFALL_QUERY") or default_shortfall_query(ns),
-            sat_q or None),
+            sat_q or None,
+            fit_check=PendingPodFit(kube, ns, toleration_key=taint)),
         drain=ArcDrain(kube, namespace=ns),
         config=Config(),
     ).run_forever()

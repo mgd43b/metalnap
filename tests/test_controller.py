@@ -27,9 +27,9 @@ class Harness:
     """A minimal stub world. Records what the controller tried to do."""
 
     def __init__(self, states, shortfall=0.0, saturated=0, busy=(), idle=(),
-                 holds=False):
+                 holds=False, fits=True):
         self.states = states
-        self._shortfall, self._saturated = shortfall, saturated
+        self._shortfall, self._saturated, self._fits = shortfall, saturated, fits
         self._busy, self._idle, self._holds = list(busy), list(idle), holds
         self.acted = {"cordon": [], "on": [], "off": [], "released": []}
         self.t = 1000.0
@@ -55,6 +55,9 @@ class Harness:
 
     def saturated_units(self):
         return self._saturated
+
+    def fits_node(self, capacity):
+        return self._fits
 
     # DrainPolicy
     def busy(self, n):
@@ -194,6 +197,75 @@ class TestDemandSignal(unittest.TestCase):
         c.st["want_high_since"] = 0.0
         c.tick()
         self.assertEqual(h.acted["on"], [])
+
+
+class TestFitGuard(unittest.TestCase):
+    """shortfall() is a sum; it cannot say WHY work is waiting."""
+
+    def test_unplaceable_demand_does_not_wake_a_node(self):
+        h = Harness({"a": node(ready=False), "b": None},
+                    shortfall=400.0, fits=False)
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], [],
+                         "powered on a node for work that cannot run there")
+
+    def test_saturation_bypasses_the_fit_guard(self):
+        """A saturated queue has nothing pending to inspect -- that IS the
+        problem -- so the guard must not veto a saturation-driven wake."""
+        h = Harness({"a": node(ready=False), "b": None},
+                    shortfall=0.0, saturated=1, fits=False)
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"],
+                         "fit guard vetoed a saturation-driven wake")
+
+
+class TestNotifier(unittest.TestCase):
+    """A node powering off looks exactly like a node dying."""
+
+    class Spy:
+        def __init__(self, fail=False):
+            self.down, self.up, self.fail = [], [], fail
+
+        def going_down(self, n):
+            if self.fail:
+                raise RuntimeError("alertmanager unreachable")
+            self.down.append(n)
+
+        def back_up(self, n):
+            self.up.append(n)
+
+    def test_announced_before_power_off(self):
+        h = Harness({"a": node(), "b": None})
+        spy = self.Spy()
+        c = h.controller()
+        c.notifier = spy
+        c.st["a"] = {"phase": "sleeping", "phase_since": h.t}
+        c.sleep("a", h.states["a"])
+        self.assertEqual(spy.down, ["a"], "powered off without announcing")
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_not_powered_off_if_the_announcement_fails(self):
+        """Otherwise the alert fires and nobody knows it was us."""
+        h = Harness({"a": node(), "b": None})
+        c = h.controller()
+        c.notifier = self.Spy(fail=True)
+        c.st["a"] = {"phase": "sleeping", "phase_since": h.t}
+        c.sleep("a", h.states["a"])
+        self.assertEqual(h.acted["off"], [],
+                         "powered off a node it could not announce")
+
+    def test_a_node_that_is_up_gets_its_notification_cleared(self):
+        """A leftover silence on a live node swallows a real failure."""
+        h = Harness({"a": node(ready=True), "b": None})
+        spy = self.Spy()
+        c = h.controller()
+        c.notifier = spy
+        c.tick()
+        self.assertIn("a", spy.up, "never cleared the notification")
 
 
 class TestFlickeringDemand(unittest.TestCase):

@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.2.0 — 2026-09-01
+
+Closes the three gaps between metalnap and the controller it was extracted
+from. Each is a new seam rather than a hardcode, so they generalise past the
+one deployment that needed them.
+
+### Notifier (new, optional — but configure it)
+
+Tell something a node is going away, and that it came back.
+`AlertmanagerNotifier` is the reference.
+
+Without this, every sleep pages someone: a node powering off looks exactly like
+a node dying. Worse than the noise, it teaches people to ignore precisely the
+alerts that would tell them a node had genuinely failed. metalnap now **refuses
+to power off a node whose shutdown it could not announce** — the alert would
+fire and nobody would know it was us.
+
+Notifications are reconciled every tick, not on transitions, so one lost to a
+restart is re-asserted, and — the half people forget — a stale one on a node
+that is UP is cleared.
+
+### Warmup (new, optional)
+
+Prepare a node after it is Ready but before it matters. `ImagePrepull` runs a
+one-shot pod so a large image lands in the local cache; measured on the origin
+deployment, 450s cold against 0.69s warm.
+
+Runs as its own phase **after** the node is already uncordoned. Warming first
+means a slow warmup strands a node that is powered, Ready and serving nothing —
+learned the hard way.
+
+### DemandSignal.fits_node (new method — breaking)
+
+`shortfall()` is a sum, which assumes everything waiting is waiting on
+capacity. Work blocked on a selector, a taint or an unbound volume inflates it
+and powers on hardware that cannot help. `PendingPodFit` answers it for
+Kubernetes.
+
+Skipped when saturation drove the demand: a saturated queue has nothing pending
+to inspect, so applying the check there would veto every saturation-driven
+wake.
+
+**Breaking:** existing `DemandSignal` implementations must add `fits_node`.
+Return `True` if you cannot tell. The API is explicitly unstable pre-1.0.
+
+### Tests
+
+16 unit tests (was 11) and three new simulation invariants. Verified by
+mutation: dropping the pre-power-off announcement, and never clearing a stale
+notification, each fail 40/40 seeds.
+
+
 ## chart 0.1.1 — 2026-09-01
 
 Chart-only fix; `appVersion` stays 0.1.0.

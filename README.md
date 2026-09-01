@@ -79,12 +79,20 @@ Implement three small duck-typed interfaces (`metalnap/types.py`):
 
 | seam | question it answers | reference implementation |
 |---|---|---|
-| `DemandSignal` | how much capacity is wanted? | `PrometheusSignal` (any PromQL) |
+| `DemandSignal` | how much capacity is wanted, and would it fit here? | `PrometheusSignal` + `PendingPodFit` |
 | `DrainPolicy` | what is *busy* here, and how do I release an idle unit? | `ArcDrain` (GitHub ARC runners) |
 | `PowerBackend` | how do I turn this box on and off? | `IpmiPower` (ipmitool) |
+| `Notifier` *(optional)* | tell something a node is going away, and came back | `AlertmanagerNotifier` |
+| `Warmup` *(optional)* | prepare a node before it takes work | `ImagePrepull` |
 
 Plus `NodeSource` for reading node state and applying cordons — `KubeNodeSource`
 covers Kubernetes.
+
+**Configure a `Notifier` even though it is optional.** A node powering off looks
+exactly like a node dying, so without one every sleep pages someone — and worse,
+it teaches people to ignore precisely the alerts that would tell them a node had
+genuinely failed. metalnap refuses to power off a node whose shutdown it could
+not announce, for the same reason.
 
 ### One thing worth stealing even if you use none of the above
 

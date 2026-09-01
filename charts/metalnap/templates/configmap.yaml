@@ -9,6 +9,17 @@ data:
   NODES: {{ join "," .Values.nodes | quote }}
   BMC_HOST_FMT: {{ .Values.bmc.hostFormat | quote }}
   PROM_URL: {{ .Values.prometheus.url | quote }}
+  BURST_TAINT_KEY: {{ .Values.burstTaintKey | quote }}
+  {{- with .Values.alertmanager.url }}
+  ALERTMANAGER_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.warmup.image }}
+  WARMUP_IMAGE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.warmup.pullSecrets }}
+  WARMUP_PULL_SECRETS: {{ join "," . | quote }}
+  {{- end }}
+  WARMUP_TIMEOUT_S: {{ .Values.timers.warmupTimeoutS | default 900 | quote }}
   ARC_NAMESPACE: {{ .Values.arc.namespace | quote }}
   CORDON_ANNOTATION: {{ .Values.cordonAnnotation | quote }}
   INTERVAL_S: {{ .Values.timers.intervalS | quote }}

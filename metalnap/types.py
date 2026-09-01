@@ -76,6 +76,20 @@ class DemandSignal(Protocol):
         Return 0 if the concept does not apply to your signal.
         """
 
+    def fits_node(self, capacity: float) -> bool:
+        """
+        Could the waiting work actually run on a node of this size?
+
+        Borrowed from Cluster Autoscaler's scale-up simulation, and the reason
+        it matters: shortfall() is usually a SUM, which silently assumes every
+        waiting item is waiting on capacity. Work blocked on a node selector, a
+        taint it does not tolerate, or an unbound volume inflates that sum and
+        wakes hardware that cannot help it.
+
+        Return True if you cannot tell -- but know that "always True" means
+        powering on a machine for work it can never run.
+        """
+
 
 class DrainPolicy(Protocol):
     """
@@ -135,3 +149,73 @@ class DrainPolicy(Protocol):
         Scope this tightly. It gates the power-off, so counting unrelated
         workloads keeps the node awake forever.
         """
+
+
+class Notifier(Protocol):
+    """
+    Tell something that a node is going away, and that it came back.
+
+    OPTIONAL -- defaults to a no-op. Skipping it is the single most likely way
+    to make an operator hate this controller: a node powering off looks exactly
+    like a node dying, so every sleep pages someone. Worse than the noise, it
+    trains people to ignore precisely the alerts that would tell them a node
+    had genuinely failed.
+
+    Implementations must be IDEMPOTENT and self-healing. The controller calls
+    these on every relevant tick, not only on transitions, so a notification
+    lost to a restart or an outage is re-asserted rather than lost forever.
+    """
+
+    def going_down(self, node: str) -> None:
+        """Called before a node is powered off, and while it stays down."""
+
+    def back_up(self, node: str) -> None:
+        """Called once a node is serving again. Must clear `going_down`."""
+
+
+class Warmup(Protocol):
+    """
+    Prepare a node to take work, after it is Ready but before it matters.
+
+    OPTIONAL -- defaults to a no-op. The reference use is pulling a large
+    container image so the first jobs do not each pay for it; measured on the
+    deployment this came from, a cold pull was 450s against 0.69s warm.
+
+    Runs as its own phase AFTER the node is already uncordoned and schedulable.
+    That ordering is deliberate and was learned the hard way: warming before
+    uncordoning means a slow warmup strands a node that is powered, Ready and
+    serving nothing. Worst case here is a few early jobs paying the pull, which
+    is exactly the behaviour you had before any warmup existed.
+    """
+
+    def start(self, node: str) -> None:
+        """Begin. MUST NOT block -- completion is polled by done()."""
+
+    def done(self, node: str) -> bool:
+        """True once finished, either way. Never blocks."""
+
+    def cleanup(self, node: str) -> None:
+        """Remove any leftovers. Called on success and on timeout."""
+
+
+class NullNotifier:
+    """Default. Does nothing, loudly documented so it is a choice."""
+
+    def going_down(self, node):
+        pass
+
+    def back_up(self, node):
+        pass
+
+
+class NullWarmup:
+    """Default. Nothing to warm, so a node is ready the moment it is Ready."""
+
+    def start(self, node):
+        pass
+
+    def done(self, node):
+        return True
+
+    def cleanup(self, node):
+        pass

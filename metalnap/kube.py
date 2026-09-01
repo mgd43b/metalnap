@@ -113,3 +113,49 @@ class KubeNodeSource:
                 self.annotation: (datetime.now(timezone.utc).isoformat()
                                   if cordoned else None)}},
         })
+
+
+class PendingPodFit:
+    """
+    Would at least one PENDING pod actually run on a node of this size?
+
+    Borrowed from Cluster Autoscaler's scale-up simulation. A demand signal is
+    usually a sum, which quietly assumes everything waiting is waiting on
+    capacity -- a pod stuck on a nodeSelector, an unbound PVC, or a taint it
+    does not tolerate inflates that sum and powers on hardware that cannot help
+    it.
+
+    `toleration_key` matters: a pod that does not tolerate the taint keeping
+    work off your sleepable nodes can never land there, however much room the
+    node has.
+    """
+
+    def __init__(self, kube, namespace, toleration_key=None):
+        self.kube, self.ns, self.toleration_key = kube, namespace, toleration_key
+
+    def __call__(self, capacity_gib):
+        pods = self.kube.request(
+            "GET", "/api/v1/namespaces/%s/pods?fieldSelector=status.phase=Pending"
+                   % self.ns)
+        for p in pods.get("items", []):
+            if p["spec"].get("nodeName"):
+                continue                      # already placed
+            if self.toleration_key:
+                tols = p["spec"].get("tolerations", [])
+                if not any(t.get("key") == self.toleration_key
+                           or (t.get("operator") == "Exists" and not t.get("key"))
+                           for t in tols):
+                    continue
+            # Effective request is containers plus native sidecars; plain
+            # initContainers are only a floor, so summing them all over-counts.
+            req = 0.0
+            for c in p["spec"].get("containers", []):
+                req += mem_to_gib(c.get("resources", {})
+                                  .get("requests", {}).get("memory", "0"))
+            for c in p["spec"].get("initContainers", []):
+                if c.get("restartPolicy") == "Always":
+                    req += mem_to_gib(c.get("resources", {})
+                                      .get("requests", {}).get("memory", "0"))
+            if req <= capacity_gib:
+                return True
+        return False

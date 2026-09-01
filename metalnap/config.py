@@ -33,6 +33,9 @@ class Config:
     max_sleep_attempts: int = _i("MAX_SLEEP_ATTEMPTS", 5)
     #: How long to refuse re-entering a sleep after abandoning one.
     sleep_cooldown_s: int = _i("SLEEP_COOLDOWN_S", 1800)
+    #: Give up waiting for the post-wake warmup. The node is already in
+    #: service by then, so this is a warning, not a failure.
+    warmup_timeout_s: int = _i("WARMUP_TIMEOUT_S", 900)
     #: Fallback capacity when a node reports none, in the signal's unit.
     default_capacity: float = _f("DEFAULT_CAPACITY", 125.7)
 

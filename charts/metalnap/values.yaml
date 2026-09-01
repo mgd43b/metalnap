@@ -27,6 +27,24 @@ bmc:
 prometheus:
   url: http://prometheus-k8s.monitoring.svc:9090
 
+# STRONGLY recommended. A node powering off looks exactly like a node dying, so
+# without this every sleep pages someone -- and people paged for routine events
+# stop reading the alerts that matter. Leave the URL empty to disable, and
+# accept that consequence knowingly.
+alertmanager:
+  url: http://alertmanager-main.monitoring.svc:9093
+
+# Pull this image onto a node after waking it, so the first jobs do not each
+# pay for it. Empty disables the warmup entirely.
+warmup:
+  image: ""
+  pullSecrets: []
+
+# The taint that keeps other work off your sleepable nodes. Used for the warmup
+# pod's toleration and for the pending-work fit check -- work that does not
+# tolerate it can never land here, however much room the node has.
+burstTaintKey: ci-burst
+
 arc:
   namespace: arc-runners
 
@@ -43,6 +61,7 @@ timers:
   minUptimeS: 2700        # a freshly-woken node may not sleep yet
   wakeTimeoutS: 900
   drainTimeoutS: 1800
+  warmupTimeoutS: 900
   maxSleepAttempts: 5
   sleepCooldownS: 1800
   defaultCapacityGib: 125.7

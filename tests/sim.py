@@ -116,6 +116,8 @@ class Sim:
         self.blocked = None
         self.zombie_since = {}
         self.sleepable_since = {}
+        self.notified = {}
+        self.warming = {}
 
     # -- clock -----------------------------------------------------------
     def now(self):
@@ -179,6 +181,31 @@ class Sim:
 
     def saturated_units(self):
         return self.saturated
+
+    def fits_node(self, capacity):
+        # Sometimes the waiting work genuinely cannot run here -- a selector,
+        # a taint, an unbound volume. A controller that ignores this powers on
+        # hardware for nothing.
+        return self.rnd.random() > 0.1
+
+    # -- Notifier --------------------------------------------------------
+    def going_down(self, node):
+        self.notified[node] = "down"
+
+    def back_up(self, node):
+        self.notified[node] = "up"
+
+    # -- Warmup ----------------------------------------------------------
+    def start(self, node):
+        self.warming[node] = self.t
+
+    def done(self, node):
+        # Takes a few ticks, so the phase is genuinely observed rather than
+        # completing instantly and never being exercised.
+        return self.t - self.warming.get(node, self.t) > 120
+
+    def cleanup(self, node):
+        self.warming.pop(node, None)
 
     # -- DrainPolicy -----------------------------------------------------
     def _on(self, node):
@@ -309,6 +336,21 @@ class Sim:
                    [(w.name, w.node, w.work) for w in self.workers]))
 
         # ---- SAFETY ----
+        # A powered-off node must be announced as down; a live one must NOT
+        # still be announced. A stale notification on a healthy node swallows
+        # its next real failure, which is worse than the noise it suppressed.
+        for n in self.nodes.values():
+            ann = self.notified.get(n.name)
+            # `powered AND ready` -- not ready alone. A node mid-shutdown is
+            # briefly still Ready while the OS goes down, and announcing it as
+            # down is exactly right there.
+            if n.powered and n.ready and ann == "down":
+                fail("%s is Ready but still announced as down -- a real "
+                     "failure of it would be silenced" % n.name)
+            if not n.powered and ann != "down":
+                fail("%s was powered off without being announced as down "
+                     "(announced=%r)" % (n.name, ann))
+
         if self.powered_off_busy:
             fail("powered off a node running work: %s"
                  % (self.powered_off_busy[0],))
@@ -416,6 +458,7 @@ class Sim:
     def run(self, restart_prob=0.02):
         c = Controller(nodes=["a", "b"], node_source=self, power=_Power(self),
                        signal=self, drain=self, config=self.cfg,
+                       notifier=self, warmup=self,
                        log=lambda lvl, msg, **kv: self.log.append(
                            (self.t, lvl, msg)),
                        clock=self.now)

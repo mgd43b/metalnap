@@ -25,12 +25,19 @@ from typing import Dict, List, Optional
 
 class Controller:
     def __init__(self, nodes, node_source, power, signal, drain, config,
-                 log=None, clock=time.time):
+                 notifier=None, warmup=None, log=None, clock=time.time):
         self.nodes: List[str] = list(nodes)
         self.node_source = node_source
         self.power = power
         self.signal = signal
         self.drain = drain
+        from .types import NullNotifier, NullWarmup
+        # Both default to no-ops so a minimal wiring still works, but the
+        # defaults are named types rather than `if self.notifier:` scattered
+        # through the reconcile -- a null object cannot be forgotten at one
+        # call site the way a None check can.
+        self.notifier = notifier or NullNotifier()
+        self.warmup = warmup or NullWarmup()
         self.cfg = config.validate()
         self.now = clock
         self._log = log or _default_log
@@ -88,12 +95,47 @@ class Controller:
             s["awake_since"] = self.now()
             s["sleep_attempts"] = 0
             s.pop("cooldown_until", None)
-            s["phase"] = None
             self.log("info", "WAKE complete -- node uncordoned", node=name)
+            # Warm AFTER the node is already schedulable. Warming first means a
+            # slow warmup strands a node that is powered, Ready and serving
+            # nothing; this way the worst case is a few early items paying the
+            # cost, which is what happened before any warmup existed.
+            try:
+                self.warmup.start(name)
+                s["phase"] = "warming"
+                s["phase_since"] = self.now()
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "warmup could not start; first work may pay "
+                                 "the cost", node=name, err=str(e))
+                s["phase"] = None
             return
         if self.now() - s.get("phase_since", 0) > self.cfg.wake_timeout_s:
             self.log("error", "WAKE TIMEOUT -- node did not become Ready",
                      node=name, timeout_s=self.cfg.wake_timeout_s)
+            s["phase"] = None
+        return
+
+    def warm(self, name):
+        """One non-blocking step of the warmup phase."""
+        s = self._node(name)
+        timed_out = (self.now() - s.get("phase_since", 0)
+                     > self.cfg.warmup_timeout_s)
+        finished = False
+        try:
+            finished = self.warmup.done(name)
+        except Exception as e:                        # noqa: BLE001
+            self.log("warn", "warmup check failed", node=name, err=str(e))
+        if finished or timed_out:
+            # The node is already in service, so a timeout here is a warning,
+            # never a failure.
+            self.log("warn" if timed_out else "info",
+                     "warmup did not finish in time" if timed_out
+                     else "warmup finished", node=name)
+            try:
+                self.warmup.cleanup(name)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "warmup cleanup failed", node=name,
+                         err=str(e))
             s["phase"] = None
 
     # -- sleep -----------------------------------------------------------
@@ -213,6 +255,17 @@ class Controller:
                      units=residual[:5])
             return
 
+        # Tell the world BEFORE cutting power. A node going down looks exactly
+        # like a node dying; without this every sleep pages someone, and people
+        # who are paged for routine events stop reading the alerts that matter.
+        try:
+            self.notifier.going_down(name)
+        except Exception as e:                        # noqa: BLE001
+            # Do not power off a node we could not announce -- the alert would
+            # fire and nobody would know it was us.
+            self.log("warn", "could not announce the shutdown; not powering "
+                             "off this tick", node=name, err=str(e))
+            return
         self.power.soft_off(name)
         s["phase"] = None
         s["sleep_attempts"] = 0
@@ -239,6 +292,20 @@ class Controller:
         if not present:
             self.log("info", "no configured node exists yet")
             return
+
+        # Reconcile notifications every tick rather than only on transitions.
+        # A notification lost to a restart or an Alertmanager outage is then
+        # re-asserted, and -- more importantly -- one left over on a node that
+        # is UP is cleared, so a real failure of it is not silently swallowed.
+        for n in present:
+            try:
+                if states[n].ready:
+                    self.notifier.back_up(n)
+                else:
+                    self.notifier.going_down(n)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "notification reconcile failed", node=n,
+                         err=str(e))
 
         awake = [n for n in present
                  if states[n].ready and not states[n].cordoned]
@@ -267,6 +334,25 @@ class Controller:
         effective = shortfall + saturated * capacity
         want = max(0, min(len(wakeable), math.ceil(effective / capacity)))
 
+        # Scale-up simulation: would the waiting work actually FIT here?
+        # shortfall() is a sum, which assumes everything waiting is waiting on
+        # capacity. Work blocked on a selector, a taint or a volume inflates it
+        # and powers on a machine that cannot help.
+        #
+        # Skipped when saturation drove the demand: a saturated queue has
+        # nothing pending to inspect -- that is the entire problem -- so
+        # applying the check there would veto every saturation-driven wake.
+        if want > len(awake) and saturated == 0:
+            try:
+                if not self.signal.fits_node(capacity):
+                    self.log("info", "demand present but none of it could run "
+                                     "on a node this size; not waking",
+                             shortfall=round(shortfall, 1))
+                    want = len(awake)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "fit check failed; not waking", err=str(e))
+                want = len(awake)
+
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
         # node draining would stop any other being woken.
@@ -293,6 +379,8 @@ class Controller:
             try:
                 if phase == "waking":
                     self.wake(n)
+                elif phase == "warming":
+                    self.warm(n)
                 else:
                     self.sleep(n, states[n])
             except Exception as e:                    # noqa: BLE001
