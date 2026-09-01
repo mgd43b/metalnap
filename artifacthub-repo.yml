@@ -12,4 +12,19 @@ repositoryID: 216105ba-adfd-4d17-9033-d654b10d01a1
 owners:
   - name: mgd43b
     email: matt+claude@reloadingtracker.com
-ignore: []
+ignore:
+  # Chart 0.1.0 shipped an artifacthub.io/signKey annotation with a placeholder
+  # fingerprint and no url. `url` is mandatory once that entry exists, so
+  # Artifact Hub cannot enrich the package and errors on EVERY processing pass:
+  #
+  #     invalid annotation: sign key url not provided (package: metalnap
+  #     version: 0.1.0)
+  #
+  # Published chart versions are immutable, so 0.1.0 cannot be repaired -- and
+  # it is already excluded from available_versions, so nobody can discover or
+  # install it through Artifact Hub anyway. Ignoring it silences a permanent,
+  # unfixable error without deleting a published artifact.
+  #
+  # `version` is a REGULAR EXPRESSION; omitting it would ignore every version.
+  - name: metalnap
+    version: ^0\.1\.0$
