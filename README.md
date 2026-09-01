@@ -1,19 +1,38 @@
 # metalnap
 
-Power your bare-metal Kubernetes nodes down when the queue is empty — and never
-kill running work to do it.
+**Suspend idle bare-metal Kubernetes nodes to save power — and never kill
+running work to do it.**
 
-Cluster Autoscaler and Karpenter assume a cloud API. Metal3 and Ironic assume
-you want the whole provisioning lifecycle. metalnap does one narrow thing:
-watches a demand signal, and turns physical machines off and on to match, with
-a safety posture built for work that takes minutes to hours and must not be
-interrupted.
+[![ci](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+[![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
-It was extracted from a controller that has been sleeping and waking a
-two-node Supermicro Twin serving CI since 2026.
+metalnap watches a demand signal, works out how many machines should be awake,
+and powers physical nodes off and on over IPMI (or Redfish, or Wake-on-LAN, or
+a PDU) to match. It drains a node gracefully before pulling its power, and it
+will not interrupt work that is running.
 
-> **Status: v0.1, early.** The core is exercised hard (see Testing) but the
-> API is not yet stable and it has run in exactly one environment.
+**Why not an existing autoscaler?** Cluster Autoscaler and Karpenter scale by
+calling a cloud API — there is nothing to call when the machine is in your
+rack. Metal3 and Ironic manage the whole bare-metal provisioning lifecycle,
+which is a much larger commitment than "turn this box off overnight".
+`kube-green` and similar scale *workloads*, not hardware, so the power bill
+does not move. metalnap does the one narrow thing none of those do.
+
+**Good fit if:** you run self-hosted CI runners, batch or burst capacity on
+your own hardware, a homelab or on-prem cluster with a real power bill, and
+your jobs take minutes to hours and must not be killed mid-flight.
+
+**Not a fit if:** your nodes are cloud instances (use Karpenter), your
+workloads are stateless web services you can simply scale to zero, or you need
+full provisioning and inventory management (use Metal3).
+
+Extracted from a controller that has been sleeping and waking a two-node
+Supermicro Twin serving GitHub Actions CI.
+
+> **Status: v0.1, early.** The core is exercised hard — see [Testing](#testing)
+> — but the API is not stable and it has run in exactly one environment. The
+> safety rules below are the mature part; the packaging is not.
 
 ## What it does
 
@@ -102,15 +121,39 @@ cannot reach.
 
 ## Try it
 
+The simulation harness needs no cluster, no hardware and no dependencies:
+
 ```bash
 git clone https://github.com/mgd43b/metalnap && cd metalnap
 python3 -B tests/sim.py --seeds 20 --ticks 400
 ```
 
-No dependencies for the harness. `requests` for the Kubernetes and Prometheus
-adapters; `ipmitool` on PATH for the IPMI backend.
+## Run it
 
-See `examples/arc-ipmi/` for the wiring the reference deployment uses.
+A container image is published to GitHub Container Registry on each release:
+
+```bash
+docker pull ghcr.io/mgd43b/metalnap:latest
+docker run --rm ghcr.io/mgd43b/metalnap:latest --help
+```
+
+`python -m metalnap` wires up the reference stack — Kubernetes + GitHub ARC +
+IPMI + Prometheus — entirely from environment variables, so the image is
+useful without writing code:
+
+```bash
+NODES=k8s14,k8s15 BMC_HOST_FMT='{node}-ipmi.internal.example.org' BMC_USER=... BMC_PASS=... PROM_URL=http://prometheus:9090 MODE=dry_run   python3 -m metalnap
+```
+
+**It ships as `MODE=dry_run`** and will not touch anything until you say
+otherwise. Leave it there until the decisions in the log look right.
+
+If your stack differs, import `Controller` and pass your own seams — see
+[`examples/arc-ipmi/`](examples/arc-ipmi/) for the full wiring including RBAC,
+and `metalnap/__main__.py` as a worked example.
+
+Installing as a library: `pip install -e .` (`requests` is the only runtime
+dependency; `ipmitool` on PATH for the IPMI backend). Not on PyPI yet.
 
 ## Configuration
 
@@ -120,6 +163,19 @@ operational knob you may need to turn during an incident (`metalnap/config.py`).
 `MODE` is `off` | `dry_run` | `on`. **`dry_run` observes and logs every decision
 it would take without touching anything** — run it there first, for as long as
 it takes to trust the numbers.
+
+## Contributing
+
+Two things make a change reviewable here:
+
+1. **Add the test before the fix**, and show it failing. Both suites are
+   mutation-verified; a test that passes against the broken code is worse than
+   none, and this project has shipped that mistake more than once.
+2. **Say which rule the change touches.** If it relaxes one of the safety rules
+   above, the pull request should say which incident makes that safe now.
+
+Bug reports are most useful with the seed and tick count if the simulation
+harness found it — every run is reproducible from those two numbers.
 
 ## Licence
 

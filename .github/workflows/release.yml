@@ -1,0 +1,58 @@
+# Publishes a container image to ghcr.io. Runs on a version tag, and on manual
+# dispatch for a one-off build.
+#
+# GITHUB_TOKEN's packages:write is enough -- no PAT, no repo secrets to
+# configure. PyPI publishing is deliberately NOT here: it needs a trusted
+# publisher configured on the PyPI side first, and a workflow that fails on
+# every tag until someone does that is worse than no workflow.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Gate on the test suites
+        # A tag must not publish an image the suites have not passed. Cheap
+        # enough (~10s) that there is no excuse to skip it.
+        run: |
+          python -m venv .venv
+          .venv/bin/python -B tests/test_controller.py
+          .venv/bin/python -B tests/sim.py --seeds 60 --ticks 900
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
