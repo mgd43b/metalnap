@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.3 — 2026-09-01
+
+Moves the scale-up fit guard to **after** the stranded reconcile, matching the
+controller this replaces.
+
+Found by a differential test that drives both implementations through identical
+synthetic states: 40 divergences in 3,000 cases, every one of them here and
+every one with `fits_node()` returning False. Guarding first meant a *stranded*
+node — already powered, already cordoned — was put to sleep rather than
+returned to service.
+
+Both behaviours are safe; neither destroys work. Returning it wins on two
+grounds: it matches the documented "wake readily, sleep reluctantly" bias, and
+it means a transient fit-check failure cannot power off a node that was only
+ever mid-wake.
+
+After the move: **5,000/5,000 identical decisions.**
+
+
 ## v0.2.2 — 2026-09-01
 
 **`dry_run` was not dry.** Two external mutations escaped it, both found within

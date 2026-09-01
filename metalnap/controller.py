@@ -379,25 +379,6 @@ class Controller:
         effective = shortfall + saturated * capacity
         want = max(0, min(len(wakeable), math.ceil(effective / capacity)))
 
-        # Scale-up simulation: would the waiting work actually FIT here?
-        # shortfall() is a sum, which assumes everything waiting is waiting on
-        # capacity. Work blocked on a selector, a taint or a volume inflates it
-        # and powers on a machine that cannot help.
-        #
-        # Skipped when saturation drove the demand: a saturated queue has
-        # nothing pending to inspect -- that is the entire problem -- so
-        # applying the check there would veto every saturation-driven wake.
-        if want > len(awake) and saturated == 0:
-            try:
-                if not self.signal.fits_node(capacity):
-                    self.log("info", "demand present but none of it could run "
-                                     "on a node this size; not waking",
-                             shortfall=round(shortfall, 1))
-                    want = len(awake)
-            except Exception as e:                    # noqa: BLE001
-                self.log("warn", "fit check failed; not waking", err=str(e))
-                want = len(awake)
-
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
         # node draining would stop any other being woken.
@@ -456,6 +437,35 @@ class Controller:
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not sleep", node=n, err=str(e))
             return  # one corrective action per tick; re-observe next
+
+        # Scale-up simulation: would the waiting work actually FIT here?
+        # shortfall() is a sum, which assumes everything waiting is waiting on
+        # capacity. Work blocked on a selector, a taint or a volume inflates it
+        # and powers on a machine that cannot help.
+        #
+        # Skipped when saturation drove the demand: a saturated queue has
+        # nothing pending to inspect -- that is the entire problem -- so
+        # applying the check there would veto every saturation-driven wake.
+        #
+        # POSITION MATTERS, and it is deliberately after the stranded reconcile
+        # rather than before it. A differential test against the controller
+        # this replaces found 40 divergences in 3000 states, every one of them
+        # here and every one with fits=False: guarding first meant a STRANDED
+        # node -- already powered, already cordoned -- got put to sleep instead
+        # of returned to service. Both are safe, but returning it matches the
+        # documented "wake readily, sleep reluctantly" bias, and it means a
+        # transient fit-check failure cannot power off a node that was only
+        # ever mid-wake.
+        if want > len(awake) and saturated == 0:
+            try:
+                if not self.signal.fits_node(capacity):
+                    self.log("info", "demand present but none of it could run "
+                                     "on a node this size; not waking",
+                             shortfall=round(shortfall, 1))
+                    want = len(awake)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "fit check failed; not waking", err=str(e))
+                want = len(awake)
 
         now = self.now()
         self.log("info", "observed", shortfall=round(shortfall, 1),
