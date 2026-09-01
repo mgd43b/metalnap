@@ -85,8 +85,8 @@ test that calls `tick()` once cannot see any of them.
 So there are two suites, and they do different jobs:
 
 ```bash
-python3 -B tests/test_controller.py          # deterministic, precise scenarios
-python3 -B tests/sim.py --seeds 60 --ticks 500   # ~30k ticks, ~1s
+python3 -B tests/test_controller.py               # deterministic, precise
+python3 -B tests/sim.py --seeds 60 --ticks 900    # ~54k ticks, ~2s
 ```
 
 `tests/sim.py` drives the controller through thousands of ticks against a fake

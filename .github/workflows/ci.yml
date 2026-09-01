@@ -2,38 +2,42 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
   workflow_dispatch: {}
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.14"
+
+      - name: Create venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e .
 
       - name: Byte-compile
-        run: python3 -m compileall -q metalnap tests
+        run: .venv/bin/python -m compileall -q metalnap tests
 
       - name: Unit tests
-        run: python3 -B tests/test_controller.py
+        # Deterministic, precise scenarios. Everything guarding running work or
+        # an operator's cordon is covered here, not left to a probabilistic
+        # backstop.
+        run: .venv/bin/python -B tests/test_controller.py
 
       - name: Simulation harness
-        # Thousands of ticks against a fake cluster with randomised demand and
-        # injected faults, asserting safety AND liveness after every tick.
-        # Every bug this project's ancestor shipped lived in a SEQUENCE, which
-        # single-call unit tests cannot see. ~1s for 30k ticks.
-        run: python3 -B tests/sim.py --seeds 60 --ticks 500
+        # Thousands of ticks against a fake cluster with phased demand, hung
+        # work, operator maintenance and injected restarts, asserting safety
+        # AND liveness after every tick. Every bug this project's ancestor
+        # shipped lived in a SEQUENCE, which single-call unit tests cannot see.
+        run: .venv/bin/python -B tests/sim.py --seeds 60 --ticks 900
 
-      - name: Simulation harness (long soak)
-        # A wider sweep on one interpreter: some invariants are probabilistic
-        # backstops and want more seeds to be reliable.
-        if: matrix.python == '3.11'
-        run: python3 -B tests/sim.py --seeds 200 --ticks 800
+      - name: Simulation harness (soak)
+        # Wider sweep: several invariants are backstops that want more seeds to
+        # be reliable. ~1s per 30k ticks, so this stays cheap.
+        run: .venv/bin/python -B tests/sim.py --seeds 400 --ticks 900

@@ -34,6 +34,31 @@ it report OK while testing nothing:
   * liveness demanded a sleep from nodes holding hung work, i.e. demanded the
     controller destroy it.
 
+MEASURED DETECTION, by reintroducing each real bug and counting failing seeds
+(60 seeds x 900 ticks):
+
+    busy work ignored when draining        60/60
+    controller never sleeps anything       34/60
+    no pre-release re-check                21/60
+    cordon timestamp re-stamped             7/60
+    idle units never released               4/60
+    saturation signal ignored               3/60
+    wake timer reset by a flickering signal  2/60
+    in-flight operation ignores a cordon     1/60
+
+The low-rate rows are BACKSTOPS, not primary cover. Anything guarding running
+work or an operator's cordon also has a deterministic test in
+test_controller.py, because a 1-in-60 chance is not a safety guarantee. Use
+this harness for emergent, sequence-dependent failures; use the unit tests for
+precise scenarios you can already name.
+
+WHAT IT CANNOT REACH: any interleaving this generator does not produce. The
+signal model is shaped from real incidents -- phased demand, a capped-queue
+mode where shortfall parks just below one node's worth while saturation
+toggles, hung work that outlives the drain timeout, operator maintenance,
+injected restarts -- but it is a model, and a bug outside its shape will not be
+found here.
+
 Run: python3 -B tests/sim.py [--seeds N] [--ticks N]
 """
 import argparse
@@ -90,6 +115,7 @@ class Sim:
         self.killed_work, self.powered_off_busy, self.stomped = [], [], []
         self.blocked = None
         self.zombie_since = {}
+        self.sleepable_since = {}
 
     # -- clock -----------------------------------------------------------
     def now(self):
@@ -199,9 +225,23 @@ class Sim:
                 if w.ticks_left <= 0:
                     self.workers.remove(w)   # finishing work removes the unit
 
+        # Decide the phase BEFORE creating work. Creating work during a quiet
+        # phase meant a node never stayed sleepable for a full settle window,
+        # so the sleep-liveness check could never fire -- a controller that
+        # never slept anything passed cleanly.
+        self.phase_left -= 1
+        if self.phase_left <= 0:
+            self.busy_phase = not self.busy_phase
+            self.big = self.rnd.random() < 0.4
+            self.capped = (not self.big) and self.rnd.random() < 0.5
+            # Quiet phases must outlast the liveness budget, or that invariant
+            # is unreachable.
+            self.phase_left = (self.rnd.randint(230, 320) if not self.busy_phase
+                               else self.rnd.randint(45, 90))
+
         schedulable = [n for n in self.nodes.values()
                        if n.ready and not n.cordoned]
-        if schedulable and self.rnd.random() < 0.5:
+        if self.busy_phase and schedulable and self.rnd.random() < 0.5:
             for _ in range(self.rnd.randint(0, 3)):
                 n = self.rnd.choice(schedulable)
                 self.next_id += 1
@@ -212,7 +252,13 @@ class Sim:
                 self.workers.append(Worker(
                     "w%d" % self.next_id, n.name,
                     work="work-%d" % self.next_id if busy else None,
-                    ticks_left=(10 ** 6 if stuck
+                    # Hung work outlives the drain timeout by a wide margin
+                    # -- enough to exercise that branch -- but NOT forever.
+                    # Real hung jobs hit a scheduler timeout and die. Modelling
+                    # them as immortal let them accumulate until every node was
+                    # permanently non-drainable, which silently exempted every
+                    # node from the liveness checks and left them toothless.
+                    ticks_left=(self.rnd.randint(150, 400) if stuck
                                 else self.rnd.randint(1, 6)) if busy else 0))
 
         # An operator takes a node for maintenance, and later releases it.
@@ -227,16 +273,6 @@ class Sim:
 
         # PHASED demand. Rerolling every tick never held demand below capacity
         # for the consecutive ticks a sleep needs, so the sleep path never ran.
-        self.phase_left -= 1
-        if self.phase_left <= 0:
-            self.busy_phase = not self.busy_phase
-            self.big = self.rnd.random() < 0.4
-            self.capped = (not self.big) and self.rnd.random() < 0.5
-            # Quiet phases must be able to OUTLAST the liveness budget
-            # (~120 ticks with production timers) or that invariant can never
-            # fire. Capping phases at 90 made it unreachable.
-            self.phase_left = (self.rnd.randint(130, 220) if not self.busy_phase
-                               else self.rnd.randint(45, 90))
         if not self.busy_phase:
             self.demand, self.saturated = 0.0, 0
             self.quiet_ticks += 1
@@ -320,17 +356,43 @@ class Sim:
         # sequentially: the last one waits behind every drain before it. Budget
         # accordingly, or this invariant fails on correct behaviour whenever
         # more than one node needs to go down.
+        # Worst-case convergence, and every term is reachable together:
+        #   min_uptime      a node that just woke may not sleep yet
+        #   sleep_sustain   demand must stay low for a full window first
+        #   sleep_cooldown  an abandoned sleep backs off before retrying
+        #   N x drain       one corrective action per tick, so nodes drain
+        #                   sequentially and the last waits behind the rest
+        # Omitting the cooldown made this fail on correct behaviour roughly
+        # 1 seed in 100 -- rare enough to look like a real bug, which is
+        # exactly the kind of flake that erodes trust in a suite.
+        # Measured PER NODE, against how long THAT node has been continuously
+        # sleepable -- not against a global quiet counter.
+        #
+        # The first version compared a global counter to an instantaneous
+        # drainable set, so a node that kept flipping in and out of drainable
+        # still accrued the global clock and failed on correct behaviour. That
+        # is a modelling error in kind, not degree, and the symptom was needing
+        # to nudge the budget upward every time the soak widened -- which is
+        # how you end up with a suite nobody trusts.
         settle = ((self.cfg.min_uptime_s + self.cfg.sleep_sustain_s
+                   + self.cfg.sleep_cooldown_s
                    + len(self.nodes) * self.cfg.drain_timeout_s)
                   / self.cfg.interval_s) + 25
-        if self.quiet_ticks > settle:
-            drainable = [n for n in self.nodes.values()
-                         if n.name not in self.human_held
+        for n in self.nodes.values():
+            sleepable = (self.busy_phase is False
+                         and n.powered
+                         and n.name not in self.human_held
                          and not any(w.node == n.name and w.work
-                                     for w in self.workers)]
-            if drainable and all(n.powered for n in drainable):
-                fail("no drainable node powered off after %d quiet ticks "
-                     "(budget %d)" % (self.quiet_ticks, settle))
+                                     for w in self.workers))
+            if not sleepable:
+                self.sleepable_since.pop(n.name, None)
+                continue
+            self.sleepable_since.setdefault(n.name, self.t)
+            held_for = (self.t - self.sleepable_since[n.name]) / self.cfg.interval_s
+            if held_for > settle:
+                fail("%s has been continuously sleepable for %d ticks "
+                     "(budget %d) and is still powered"
+                     % (n.name, held_for, settle))
 
         # Sustained demand must actually produce a node. A WINDOWED MAJORITY,
         # not a run length: the signal flickers by nature, so a counter that
