@@ -49,10 +49,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # QEMU so the arm64 layer can be built on an amd64 runner. Without this
-      # the image is amd64-only, and the README's `docker pull` fails outright
-      # on Apple Silicon and on ARM servers -- which is most people's first
-      # contact with the project.
+      # QEMU so the arm64 layer builds on an amd64 runner.
+      #
+      # The honest rationale, since the first version of this comment gave a
+      # bad one: this controller runs IN the cluster it manages, so it will
+      # never run on a laptop. Apple Silicon is not the reason. The reason is
+      # ARM servers with BMCs -- Ampere Altra and similar -- which are real but
+      # uncommon, and evaluators running `--help` before deploying.
+      #
+      # Cost is +93s (41s -> 134s) on RELEASE ONLY, not on push. Cheap enough
+      # to keep for a case that might arrive; drop `platforms` if it ever is
+      # not.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
