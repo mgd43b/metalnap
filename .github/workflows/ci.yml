@@ -24,6 +24,14 @@ jobs:
       - name: Byte-compile
         run: .venv/bin/python -m compileall -q metalnap tests
 
+      - name: Chart annotations
+        # helm lint does not know what Artifact Hub expects, so an invalid
+        # annotation packages and publishes cleanly and only fails at INDEXING
+        # -- surfacing as an email hours later. Catch it on the PR instead.
+        run: |
+          .venv/bin/pip install --quiet pyyaml
+          .venv/bin/python charts/validate.py charts/metalnap/Chart.yaml
+
       - name: Unit tests
         # Deterministic, precise scenarios. Everything guarding running work or
         # an operator's cordon is covered here, not left to a probabilistic

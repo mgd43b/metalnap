@@ -1,5 +1,19 @@
 # Changelog
 
+## chart 0.1.1 — 2026-09-01
+
+Chart-only fix; `appVersion` stays 0.1.0.
+
+Removes an invalid `artifacthub.io/signKey` annotation. It carried a
+placeholder fingerprint and no `url`, and `url` is mandatory once the entry
+exists — so Artifact Hub failed to index the package with *"sign key url not
+provided"*. Chart 0.1.0 is left as published; versions are immutable.
+
+Adds `charts/validate.py`, run by CI on every push and again before release.
+`helm lint` has no knowledge of Artifact Hub's annotation spec, so an invalid
+annotation packages cleanly, publishes cleanly, and only fails at indexing —
+surfacing as an email hours later, if anyone is watching for it.
+
 ## v0.1.0 — 2026-09-01
 
 First release. Extracted from a controller that has been sleeping and waking a

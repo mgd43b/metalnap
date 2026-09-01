@@ -2,7 +2,7 @@ apiVersion: v2
 name: metalnap
 description: Suspend idle bare-metal Kubernetes nodes to save power, without killing running work
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "0.1.0"
 home: https://github.com/mgd43b/metalnap
 sources:
@@ -21,8 +21,10 @@ annotations:
   artifacthub.io/license: MIT
   artifacthub.io/category: integration-delivery
   artifacthub.io/prerelease: "true"
-  artifacthub.io/signKey: |
-    fingerprint: none
+  # NO artifacthub.io/signKey here. It is optional, and `url` is MANDATORY once
+  # the entry exists -- a placeholder fingerprint with no url fails indexing
+  # with "sign key url not provided", which is exactly what v0.1.0 did. Add it
+  # only alongside real `helm package --sign` provenance and a published key.
   artifacthub.io/links: |
     - name: source
       url: https://github.com/mgd43b/metalnap

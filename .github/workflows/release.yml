@@ -83,6 +83,8 @@ jobs:
         # `helm template` alone proves the chart parses; rendering and checking
         # the objects proves it produces the thing it claims to.
         run: |
+          python3 -m pip install --quiet pyyaml
+          python3 charts/validate.py charts/metalnap/Chart.yaml
           helm lint charts/metalnap --set 'nodes={a,b}'
           helm template t charts/metalnap --set 'nodes={a,b}' > /tmp/r.yaml
           grep -q 'kind: ClusterRole' /tmp/r.yaml
