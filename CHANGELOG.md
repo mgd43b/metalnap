@@ -1,5 +1,19 @@
 # Changelog
 
+## chart 0.2.5 — 2026-09-01
+
+Stops the name doubling when the release is named after the chart. `helm
+install metalnap` produced `metalnap-metalnap`; it now produces `metalnap`,
+using the standard Helm idiom. Other release names are unaffected
+(`prod` still yields `prod-metalnap`).
+
+Cosmetic, and deliberately NOT applied to a running install: changing resource
+names on upgrade makes Helm create the new Deployment before removing the old,
+which would briefly run two controllers in `on` — and two controllers race each
+other's cordons, with the loser acting on state the winner already changed.
+Worth having for the next install, not worth a race to retrofit.
+
+
 ## chart 0.2.4 — 2026-09-01
 
 Chart-only fix: **the Warmup seam had no RBAC**. It was added in 0.2.0 and the

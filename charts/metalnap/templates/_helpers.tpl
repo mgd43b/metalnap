@@ -3,7 +3,12 @@
 {{- end -}}
 
 {{- define "metalnap.fullname" -}}
-{{- printf "%s-%s" .Release.Name (include "metalnap.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- $name := include "metalnap.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "metalnap.labels" -}}
