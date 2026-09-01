@@ -4,9 +4,11 @@
 running work to do it.**
 
 [![ci](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/metalnap/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/mgd43b/metalnap?label=release&color=blue)](https://github.com/mgd43b/metalnap/releases/latest)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/metalnap)](https://artifacthub.io/packages/search?repo=metalnap)
+[![image](https://img.shields.io/badge/ghcr.io-metalnap-2496ED?logo=docker&logoColor=white)](https://github.com/mgd43b/metalnap/pkgs/container/metalnap)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/metalnap)](https://artifacthub.io/packages/search?repo=metalnap)
 
 metalnap watches a demand signal, works out how many machines should be awake,
 and powers physical nodes off and on over IPMI (or Redfish, or Wake-on-LAN, or
