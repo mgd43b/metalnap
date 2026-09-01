@@ -1,5 +1,29 @@
 # Changelog
 
+## chart 0.2.6 — 2026-09-01
+
+Fails readably when `mode` is not a valid quoted string.
+
+`on`, `off`, `yes` and `no` are YAML 1.1 **booleans**, so an unquoted
+`mode: on` in a values file arrives as `true`. Without this check the chart
+failed with *"incompatible types for comparison: bool and string"* from a
+template comparison — which points at the template rather than at the one
+character that caused it. And had it rendered, it would have emitted
+`MODE: "true"`, an invalid mode that makes the controller refuse to start.
+
+The trap is worst on the documented rollback: `--set mode=off` is safe (that
+path stringifies), but `mode: off` written into a values file is not, and those
+look interchangeable.
+
+Now:
+
+    mode: on        -> mode must be a QUOTED string, one of off|dry_run|on --
+                       got true of type bool. Unquoted on/off/yes/no are YAML
+                       booleans, so quote it.
+    mode: banana    -> mode must be one of off|dry_run|on; got "banana"
+    mode: "on"      -> renders
+
+
 ## chart 0.2.5 — 2026-09-01
 
 Stops the name doubling when the release is named after the chart. `helm

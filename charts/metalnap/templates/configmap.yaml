@@ -1,3 +1,17 @@
+{{- /*
+  `on`, `off`, `yes` and `no` are YAML 1.1 BOOLEANS. An unquoted `mode: on` in
+  a values file therefore arrives here as true, not "on" -- and the failure it
+  produces without this check is "incompatible types for comparison: bool and
+  string" from a template comparison, which points at the wrong thing entirely.
+  Worse, if it rendered it would emit MODE: "true", an invalid mode that makes
+  the controller refuse to start.
+*/ -}}
+{{- if not (kindIs "string" .Values.mode) }}
+{{- fail (printf "mode must be a QUOTED string, one of off|dry_run|on -- got %v of type %s. Unquoted on/off/yes/no are YAML booleans, so quote it." .Values.mode (kindOf .Values.mode)) }}
+{{- end }}
+{{- if not (has .Values.mode (list "off" "dry_run" "on")) }}
+{{- fail (printf "mode must be one of off|dry_run|on; got %q" .Values.mode) }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
