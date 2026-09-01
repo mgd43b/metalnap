@@ -284,6 +284,20 @@ class Controller:
         states = {n: self.node_source.state(n) for n in self.nodes}
         shortfall = self.signal.shortfall()
 
+        # Drop protected nodes before anything else looks at them, so no code
+        # path further down can act on one by accident. Configuration is the
+        # weakest link here -- the node list comes from a ConfigMap or a Helm
+        # value, and a typo must not be able to power off a control plane.
+        protected = [n for n in self.nodes
+                     if states[n] is not None and states[n].protected]
+        if protected:
+            if protected != st.get("_protected_last"):
+                self.log("error", "REFUSING to manage protected nodes; remove "
+                                  "them from the node list", nodes=protected)
+                st["_protected_last"] = protected
+            for n in protected:
+                states[n] = None
+
         present = [n for n in self.nodes if states[n] is not None]
         absent = [n for n in self.nodes if states[n] is None]
         if absent:

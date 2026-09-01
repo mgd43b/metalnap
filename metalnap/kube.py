@@ -57,7 +57,17 @@ def mem_to_gib(v):
 class KubeNodeSource:
     """NodeState from the Kubernetes API, with cordon ownership by annotation."""
 
-    def __init__(self, kube, annotation, capacity_of=None):
+    #: Labels that mark a node as never power-manageable. A cluster does not
+    #: survive losing its control plane, and no configuration mistake should be
+    #: able to make that happen.
+    PROTECTED_LABELS = ("node-role.kubernetes.io/control-plane",
+                        "node-role.kubernetes.io/master")
+
+    def __init__(self, kube, annotation, capacity_of=None,
+                 protected_labels=None):
+        self.protected_labels = (protected_labels
+                                 if protected_labels is not None
+                                 else self.PROTECTED_LABELS)
         self.kube = kube
         #: Presence of this annotation marks a cordon as ours. Anything else is
         #: an operator's, and is never touched.
@@ -94,12 +104,14 @@ class KubeNodeSource:
                     anns[self.annotation].replace("Z", "+00:00")).timestamp()
             except Exception:                  # noqa: BLE001
                 ours_since = None
+        labels = n["metadata"].get("labels") or {}
         return NodeState(
             ready=ready,
             cordoned=bool(n["spec"].get("unschedulable")),
             ours=self.annotation in anns,
             ready_since=ready_since,
             capacity=self.capacity_of(n),
+            protected=any(l in labels for l in self.protected_labels),
             ours_since=ours_since,
         )
 

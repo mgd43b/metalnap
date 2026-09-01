@@ -17,10 +17,10 @@ from metalnap.types import NodeState             # noqa: E402
 
 
 def node(ready=True, cordoned=False, ours=False, ready_since=0.0,
-         capacity=100.0, ours_since=None):
+         capacity=100.0, ours_since=None, protected=False):
     return NodeState(ready=ready, cordoned=cordoned, ours=ours,
                      ready_since=ready_since, capacity=capacity,
-                     ours_since=ours_since)
+                     protected=protected, ours_since=ours_since)
 
 
 class Harness:
@@ -197,6 +197,37 @@ class TestDemandSignal(unittest.TestCase):
         c.st["want_high_since"] = 0.0
         c.tick()
         self.assertEqual(h.acted["on"], [])
+
+
+class TestProtectedNodes(unittest.TestCase):
+    """Configuration is the weakest link. A typo must not cost a control plane."""
+
+    def test_a_protected_node_is_never_powered_off(self):
+        h = Harness({"a": node(protected=True), "b": None})
+        c = h.controller()
+        c.st["a"] = {"phase": "sleeping", "phase_since": h.t}
+        c.st["want_low_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["off"], [], "powered off a protected node")
+        self.assertEqual(h.acted["cordon"], [], "cordoned a protected node")
+
+    def test_a_protected_node_is_never_woken(self):
+        h = Harness({"a": node(ready=False, protected=True), "b": None},
+                    shortfall=400.0)
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "powered on a protected node")
+
+    def test_its_healthy_peer_is_still_managed(self):
+        """Refusing one node must not disable the controller."""
+        h = Harness({"a": node(protected=True), "b": node(ready=False)},
+                    shortfall=400.0)
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"],
+                         "a protected node stopped its peer being managed")
 
 
 class TestFitGuard(unittest.TestCase):

@@ -21,6 +21,12 @@ class NodeState:
     ready_since: Optional[float]
     #: Schedulable capacity in whatever unit the demand signal reports.
     capacity: float
+    #: True if this node must never be power-managed, whatever the config
+    #: says. A control plane node is the obvious case. This exists because
+    #: configuration is the weakest link: the node list arrives from a
+    #: ConfigMap or a Helm value, and a typo there should not be able to power
+    #: off a machine the cluster cannot survive losing.
+    protected: bool = False
     #: When this controller applied the cordon, if it can be recovered. This is
     #: DURABLE state -- it lives on the node, not in the controller's memory --
     #: so a drain deadline measured from it survives a restart. Measured from

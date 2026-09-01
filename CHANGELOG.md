@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.1 — 2026-09-01
+
+Refuses to power-manage a **protected** node — one carrying
+`node-role.kubernetes.io/control-plane` or `.../master`. Protected nodes are
+dropped from consideration before any other code path sees them, so nothing
+downstream can act on one by accident, and its healthy peers keep being
+managed normally.
+
+The controller this was extracted from had a hardcoded allowlist for the same
+reason, with the comment *"a ConfigMap must never be able to aim this
+controller at a core node"*. metalnap takes its node list from a ConfigMap or a
+Helm value, which is the weakest link in the whole system: a typo there should
+not be able to power off a machine the cluster cannot survive losing.
+
+`NodeSource` implementations may set `NodeState.protected`; `KubeNodeSource`
+derives it from labels and the set is overridable.
+
+
 ## v0.2.0 — 2026-09-01
 
 Closes the three gaps between metalnap and the controller it was extracted
