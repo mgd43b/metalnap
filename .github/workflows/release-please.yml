@@ -23,6 +23,17 @@ permissions:
   contents: write
   pull-requests: write
 
+# release-please owns a long-lived branch and force-updates it every run. Two
+# runs in flight therefore race on the same ref, and the loser fails with
+# "Error updating ref heads/release-please--...". That is exactly what two
+# pushes three minutes apart produced on 2026-09-02.
+#
+# cancel-in-progress is FALSE on purpose: queue, do not cancel. Killing a run
+# midway through creating a tag and a release is a worse failure than waiting.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-please:
     runs-on: ubuntu-latest
