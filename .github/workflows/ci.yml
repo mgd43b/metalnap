@@ -14,6 +14,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+          # One runtime dependency, so this saves seconds rather than minutes.
+          # Worth it anyway: it is free, and it removes PyPI from the set of
+          # things that can redden a PR for reasons unrelated to the PR.
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Create venv and install
         run: |
@@ -54,3 +59,59 @@ jobs:
         # Wider sweep: several invariants are backstops that want more seeds to
         # be reliable. ~1s per 30k ticks, so this stays cheap.
         run: .venv/bin/python -B tests/sim.py --seeds 400 --ticks 900
+
+  image:
+    # ci did not build the image at all, so a broken Dockerfile stayed invisible
+    # until a release tried to publish it. amd64 only and never pushed -- this
+    # asks "does it build and run", which is what a PR can answer cheaply. The
+    # arm64 leg stays on the release path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: metalnap:ci
+          # Shared scope with the release build, so a merged PR has already
+          # warmed the layers the release rebuilds under QEMU -- which is the
+          # slow half of that job.
+          cache-from: type=gha,scope=metalnap
+          cache-to: type=gha,scope=metalnap,mode=max
+
+      - name: Smoke test
+        # Proves the interpreter, the package and ipmitool all survived the
+        # build. `import metalnap` alone would pass an image with no ipmitool,
+        # which is the one binary this controller cannot work without.
+        run: |
+          docker run --rm --entrypoint sh metalnap:ci -c '
+            python3 -c "import metalnap, metalnap.controller, metalnap.power.ipmi"
+            command -v ipmitool >/dev/null'
+
+      - name: Cache the Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Fail on anything with a fix available
+        # `ignore-unfixed` is the whole point of this gate. Unfixable base CVEs
+        # are noise you cannot act on -- gating on them trains you to ignore the
+        # job. A FIXABLE finding is different: it means a rebuild or a bump
+        # clears it, so it is always actionable.
+        #
+        # This is exactly the check that was missing when 0.3.0 shipped openssl
+        # 3.5.7-r0 while 3.5.8-r0 was already published: 20 findings, every one
+        # of them fixable, and nothing in CI said so.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: metalnap:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          cache-dir: ~/.cache/trivy

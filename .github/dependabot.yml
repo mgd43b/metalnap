@@ -22,11 +22,11 @@ updates:
       # changes how the artifact is built, not the artifact itself, so it does
       # not warrant a release of metalnap.
       prefix: "chore"
-      include-scope: true
+      include: "scope"
 
-  # The Debian base, plus the ipmitool and python3-requests it carries. It
-  # image is where CVEs actually accumulate for this project -- the Python
-  # surface is one dependency.
+  # The base image, plus the ipmitool and python3-requests it carries. The image
+  # is where CVEs actually accumulate for this project -- the Python surface is
+  # one dependency. Bumps the pinned digest in the Dockerfile.
   - package-ecosystem: docker
     directory: /
     schedule:
@@ -38,7 +38,7 @@ updates:
       # ipmitool it carries ARE the published image, so a bump changes what
       # users run and deserves a release they can see.
       prefix: "fix"
-      include-scope: true
+      include: "scope"
 
   # requests is the only runtime dependency. Ungrouped: with one package a
   # group adds nothing, and an individual PR is easier to read.
@@ -50,4 +50,4 @@ updates:
     commit-message:
       # Same reasoning: requests ships inside the image.
       prefix: "fix"
-      include-scope: true
+      include: "scope"

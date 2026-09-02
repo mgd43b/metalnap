@@ -46,6 +46,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Version consistency
         run: ./scripts/check-versions.sh
@@ -93,6 +95,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Same scope as ci, which has usually just built the amd64 half on the
+          # release PR. The arm64 leg runs under QEMU, so a cache hit on the apk
+          # layer is worth far more here than the amd64 saving suggests.
+          cache-from: type=gha,scope=metalnap
+          cache-to: type=gha,scope=metalnap,mode=max
 
   chart:
     # Separate job so a chart problem cannot half-publish an image, and so the
