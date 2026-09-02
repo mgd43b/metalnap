@@ -92,7 +92,7 @@ jobs:
             command -v ipmitool >/dev/null'
 
       - name: Cache the Trivy DB
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ github.run_id }}
@@ -107,7 +107,7 @@ jobs:
         # This is exactly the check that was missing when 0.3.0 shipped openssl
         # 3.5.7-r0 while 3.5.8-r0 was already published: 20 findings, every one
         # of them fixable, and nothing in CI said so.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: metalnap:ci
           format: table
