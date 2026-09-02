@@ -1,0 +1,41 @@
+# Dependabot for metalnap.
+#
+# Grouped and weekly on purpose. This is a single-maintainer project, and a
+# stream of one-PR-per-bump is how update PRs stop being read at all -- which
+# is worse than not having them, because the security ones arrive in the same
+# stream and get skimmed with the rest.
+version: 2
+updates:
+  # The workflows publish an image that runs with cluster credentials and BMC
+  # passwords, so a compromised action here reaches further than the code does.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # debian:12-slim, plus the ipmitool and python3-requests it carries. The base
+  # image is where CVEs actually accumulate for this project -- the Python
+  # surface is one dependency.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "image"
+
+  # requests is the only runtime dependency. Ungrouped: with one package a
+  # group adds nothing, and an individual PR is easier to read.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps"
