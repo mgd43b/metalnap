@@ -1,7 +1,7 @@
 # metalnap needs ipmitool to reach BMCs and python3 to run. Nothing
 # off-the-shelf carries both, so this is a thin debian layer rather than a
 # python base image.
-FROM debian:12-slim
+FROM debian:13-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
