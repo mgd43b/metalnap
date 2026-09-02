@@ -12,9 +12,26 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch: {}
+  # Called by release-please.yml when a release is actually created.
+  #
+  # It cannot be triggered by the tag: release-please tags using GITHUB_TOKEN,
+  # and GitHub does not trigger workflows from GITHUB_TOKEN events (a loop
+  # guard). Relying on `push: tags` produced release v0.2.9 with no image and
+  # no chart -- a release that existed only on the releases page.
+  #
+  # The alternative fix is a PAT for release-please, which trades a workflow
+  # wiring problem for a long-lived credential with write access. Not worth it.
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.2.9"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -46,9 +63,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=raw,value=latest
 
       - uses: docker/login-action@v4
         with:
