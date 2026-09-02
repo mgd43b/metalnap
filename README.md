@@ -147,7 +147,7 @@ kubectl create ns metalnap
 kubectl -n metalnap create secret generic metalnap-bmc \
   --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
 
-CHART_VERSION=0.2.10 # x-release-please-version
+CHART_VERSION=0.3.0 # x-release-please-version
 
 # A values file, not --set: `{node}` is Helm list syntax and the dots in a
 # hostname are read as key paths, so --set cannot express bmc.hostFormat.

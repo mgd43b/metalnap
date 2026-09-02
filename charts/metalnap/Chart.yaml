@@ -4,8 +4,8 @@ description: >-
   Suspend idle bare-metal Kubernetes nodes to save power, without killing
   running work
 type: application
-version: 0.2.10
-appVersion: 0.2.10
+version: 0.3.0
+appVersion: 0.3.0
 home: https://github.com/mgd43b/metalnap
 icon: >-
   https://raw.githubusercontent.com/mgd43b/metalnap/main/charts/metalnap/icon.svg
