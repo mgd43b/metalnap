@@ -50,7 +50,8 @@
         },
         {
           "type": "ci",
-          "section": "CI"
+          "section": "CI",
+          "hidden": true
         },
         {
           "type": "chore",
