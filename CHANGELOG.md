@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.8 — 2026-09-02
+
+Realigns the version, which had drifted, and makes drifting again a CI failure.
+
+The version lives in four places — `Chart.yaml` (`version` and `appVersion`),
+`pyproject.toml`, and `metalnap/__init__.py` — and they were bumped by hand
+eight times in a day. Image `0.2.4` shipped carrying `__version__ = "0.2.3"`.
+Nothing reads that value, so nothing broke; it is simply wrong, and the next
+person to trust it would be misled.
+
+- `scripts/release.sh app|chart <version>` is now the only supported way to
+  bump. The two kinds are genuinely different: an **app** release moves the
+  chart version *and* appVersion and rebuilds the image; a **chart** release
+  moves only the chart version, because the image it points at is unchanged.
+  It refuses a dirty tree, a non-`main` branch, an existing tag, or a version
+  with no CHANGELOG entry, and runs the full gates before tagging.
+- `scripts/check-versions.sh` asserts the invariant — `pyproject` ==
+  `__init__` == `appVersion` (all describe the same image), and chart version
+  ≥ appVersion (a chart-only fix may legitimately run ahead). Wired into both
+  CI and release.
+
+No functional change to the controller.
+
+
 ## chart 0.2.7 — 2026-09-02
 
 Makes the Artifact Hub listing actually useful. The package indexed fine and

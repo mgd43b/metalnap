@@ -24,6 +24,11 @@ jobs:
       - name: Byte-compile
         run: .venv/bin/python -m compileall -q metalnap tests
 
+      - name: Version consistency
+        # The version lives in four files. Image 0.2.4 shipped with
+        # __version__ = "0.2.3" because they were bumped by hand.
+        run: ./scripts/check-versions.sh
+
       - name: Chart annotations
         # helm lint does not know what Artifact Hub expects, so an invalid
         # annotation packages and publishes cleanly and only fails at INDEXING

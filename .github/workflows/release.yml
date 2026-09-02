@@ -26,6 +26,9 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Version consistency
+        run: ./scripts/check-versions.sh
+
       - name: Gate on the test suites
         # A tag must not publish an image the suites have not passed. Cheap
         # enough (~10s) that there is no excuse to skip it.
