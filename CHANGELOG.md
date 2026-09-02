@@ -1,5 +1,25 @@
 # Changelog
 
+## chart 0.2.7 — 2026-09-02
+
+Makes the Artifact Hub listing actually useful. The package indexed fine and
+showed as a verified publisher, but the page was nearly blank because the chart
+was missing everything the page renders from.
+
+- **README.md** — the package page body IS the chart README, and there wasn't
+  one. Covers install, the three values that are load-bearing, a values table,
+  the safety rules, and what the RBAC deliberately withholds.
+- **values.schema.json** — validated by `helm install/template`, so bad values
+  fail at the client rather than producing a broken Deployment. Verified it
+  rejects: an invalid mode, an *unquoted* mode (the YAML-boolean trap), a
+  non-list `nodes`, and an out-of-range timer.
+- **icon.svg** — three rack units, the bottom one powered down. Also clears
+  `helm lint`'s "icon is recommended".
+- **maintainers** now carry an email. Artifact Hub keys maintainers on email
+  and silently drops an entry that has only a name and url, which is why the
+  listing showed none despite Chart.yaml having one.
+
+
 ## chart 0.2.6 — 2026-09-01
 
 Fails readably when `mode` is not a valid quoted string.
