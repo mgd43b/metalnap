@@ -9,20 +9,57 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": false,
       "extra-files": [
-        "charts/metalnap/Chart.yaml",
+        {
+          "type": "yaml",
+          "path": "charts/metalnap/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "charts/metalnap/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        },
         "pyproject.toml",
         "metalnap/__init__.py"
       ],
       "changelog-sections": [
-        {"type": "feat",     "section": "Features"},
-        {"type": "fix",      "section": "Fixes"},
-        {"type": "safety",   "section": "Safety rules"},
-        {"type": "perf",     "section": "Performance"},
-        {"type": "docs",     "section": "Documentation"},
-        {"type": "test",     "section": "Testing"},
-        {"type": "ci",       "section": "CI"},
-        {"type": "chore",    "section": "Chores", "hidden": true},
-        {"type": "refactor", "section": "Refactoring"}
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Fixes"
+        },
+        {
+          "type": "safety",
+          "section": "Safety rules"
+        },
+        {
+          "type": "perf",
+          "section": "Performance"
+        },
+        {
+          "type": "docs",
+          "section": "Documentation"
+        },
+        {
+          "type": "test",
+          "section": "Testing"
+        },
+        {
+          "type": "ci",
+          "section": "CI"
+        },
+        {
+          "type": "chore",
+          "section": "Chores",
+          "hidden": true
+        },
+        {
+          "type": "refactor",
+          "section": "Refactoring"
+        }
       ]
     }
   }
