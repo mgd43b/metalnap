@@ -1,0 +1,33 @@
+# Release automation.
+#
+# release-please watches Conventional Commits on main and maintains a single
+# open "chore(main): release X.Y.Z" PR. Merging that PR IS the release: it
+# bumps every version location, writes the changelog, tags, and creates the
+# GitHub Release. The tag then triggers release.yml, which builds and publishes
+# the image and chart.
+#
+# So: merge the PR when you want to ship. Nothing else to run, nobody to ask.
+#
+# NOTE the version is now single. The chart version and appVersion move
+# together, so every release rebuilds the image even for a chart-only change.
+# That costs about two minutes of CI and removes the drift that came from
+# maintaining them separately.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

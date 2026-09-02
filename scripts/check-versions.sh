@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # The version lives in four places. Assert the invariant between them.
 #
-#   pyproject == __init__ == Chart.appVersion   (all describe the CODE)
-#   Chart.version >= Chart.appVersion           (chart may be ahead: a
-#                                                chart-only fix bumps the chart
-#                                                without rebuilding the image)
+#   pyproject == __init__ == Chart.appVersion == Chart.version
+#
+# release-please bumps all four together, so they are now always equal. This
+# check is not therefore redundant: it is what catches a release-please
+# misconfiguration (a missing extra-file, a renamed annotation) before a
+# release goes out carrying a version that only three of the four files agree
+# on. That drift shipped once already -- image 0.2.4 with __version__ 0.2.3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

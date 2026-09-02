@@ -1,5 +1,9 @@
-# Publishes a container image to ghcr.io. Runs on a version tag, and on manual
-# dispatch for a one-off build.
+# Publishes the container image and Helm chart to ghcr.io.
+#
+# TRIGGERED BY THE TAG that release-please creates when its release PR is
+# merged. release-please owns versioning, the changelog, the tag and the
+# GitHub Release; this workflow owns the artifacts. Creating the Release here
+# too would collide with it, so that job was removed.
 #
 # GITHUB_TOKEN's packages:write is enough -- no PAT, no repo secrets to
 # configure. PyPI publishing is deliberately NOT here: it needs a trusted
@@ -72,31 +76,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-  github-release:
-    # A tag with no GitHub Release is invisible: the repo's own release badge
-    # reads the latest RELEASE, not the latest tag. Eight tags were published
-    # while the badge still advertised v0.1.0 -- a version whose artifacts had
-    # since been deleted, so it pointed users at something uninstallable.
-    needs: [image, chart]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0        # annotated tag messages become the notes
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          # Runs after image AND chart, so a release never advertises an
-          # artifact that failed to publish.
-          gh release create "$TAG" --verify-tag \
-            --title "metalnap $TAG" \
-            --notes "$(git tag -l --format='%(contents)' "$TAG")"
 
   chart:
     # Separate job so a chart problem cannot half-publish an image, and so the

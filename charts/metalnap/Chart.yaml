@@ -2,8 +2,8 @@ apiVersion: v2
 name: metalnap
 description: Suspend idle bare-metal Kubernetes nodes to save power, without killing running work
 type: application
-version: 0.2.8
-appVersion: "0.2.8"
+version: 0.2.8 # x-release-please-version
+appVersion: "0.2.8" # x-release-please-version
 home: https://github.com/mgd43b/metalnap
 icon: https://raw.githubusercontent.com/mgd43b/metalnap/main/charts/metalnap/icon.svg
 sources:

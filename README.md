@@ -222,6 +222,34 @@ a layer of media type
 release workflow pushes it; `oras repo tags` should show both `artifacthub.io`
 and the chart version.
 
+## Releasing
+
+Releases are automated by
+[release-please](https://github.com/googleapis/release-please). There is no
+script to run and nobody to ask:
+
+1. Merge changes to `main` using **Conventional Commit** subjects
+   (`feat:`, `fix:`, `safety:`, `docs:`, `ci:`, `refactor:`, `test:`).
+2. release-please keeps one open PR titled `chore(main): release X.Y.Z`,
+   accumulating everything unreleased.
+3. **Merging that PR is the release.** It bumps every version location, writes
+   the changelog, tags, and creates the GitHub Release. The tag then triggers
+   the image and chart publish.
+
+The version bump derives from the commits: `fix:` → patch, `feat:` → minor, and
+`!` or a `BREAKING CHANGE:` footer → minor while pre-1.0.
+
+Two things worth knowing:
+
+- **Chart version and appVersion now move together.** Every release rebuilds
+  the image, even for a chart-only change. That costs ~2 minutes of CI and
+  removes the drift that came of maintaining them separately — image `0.2.4`
+  once shipped carrying `__version__ = "0.2.3"`.
+- **Write a real commit body.** The changelog takes the subject line, but the
+  body is where the reasoning lives, and in this project that reasoning *is*
+  the documentation. A subject alone tells the next person what changed and
+  never why.
+
 ## Contributing
 
 Two things make a change reviewable here:
