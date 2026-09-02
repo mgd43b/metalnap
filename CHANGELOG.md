@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/mgd43b/metalnap/compare/v0.2.10...v0.3.0) (2026-09-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* bmc.hostFormat must now be absolute (trailing dot) unless it is a single label or an IP literal. A dotted, non-absolute value fails schema validation at install instead of silently failing to reach BMCs.
+
+### Features
+
+* switch base image to alpine, requiring absolute BMC hostnames ([88a6cb5](https://github.com/mgd43b/metalnap/commit/88a6cb5b389c87f5b14084e7c69f2b8c3e9f1b1a))
+
+
+### Documentation
+
+* stop naming a Debian version that moved ([04229c1](https://github.com/mgd43b/metalnap/commit/04229c1f0022cb01c9c9cc084a7b028cfe23c381))
+
 ## [0.2.10](https://github.com/mgd43b/metalnap/compare/v0.2.9...v0.2.10) (2026-09-02)
 
 
