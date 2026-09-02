@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.9](https://github.com/mgd43b/metalnap/compare/v0.2.8...v0.2.9) (2026-09-02)
+
+
+### Fixes
+
+* stop release-please leaving appVersion behind on Chart.yaml ([d9325b6](https://github.com/mgd43b/metalnap/commit/d9325b6251a4bd6a24e807da4a3091f06a234555))
+
+
+### CI
+
+* automate releases with release-please ([937be51](https://github.com/mgd43b/metalnap/commit/937be51b59522d59f9b9938c2e1c81d9a838409f))
+* give Dependabot Conventional Commit prefixes release-please understands ([cef333e](https://github.com/mgd43b/metalnap/commit/cef333ee8a900fed47909127e9a153a0a8d53153))
+
 ## v0.2.8 — 2026-09-02
 
 Realigns the version, which had drifted, and makes drifting again a CI failure.

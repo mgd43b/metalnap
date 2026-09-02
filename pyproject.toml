@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metalnap"
-version = "0.2.8" # x-release-please-version
+version = "0.2.9" # x-release-please-version
 description = "Power bare-metal Kubernetes nodes down when the queue is empty, without killing running work"
 readme = "README.md"
 license = {text = "MIT"}
