@@ -8,7 +8,12 @@
 #
 # The repository ID is not a secret: it is shown in the Artifact Hub control
 # panel and is published precisely so ownership can be verified.
-repositoryID: 216105ba-adfd-4d17-9033-d654b10d01a1
+# NOTE: this ID is issued by Artifact Hub when the repository is ADDED, and a
+# new one is issued if the repository is deleted and recreated. A stale ID here
+# means the metadata file claims a repository that no longer exists -- so
+# ownership verification fails AND the ignore rules below are not honoured,
+# which looks exactly like "the ignore rule does not work".
+repositoryID: 10b4c793-b088-46d1-875f-4da419d356d3
 owners:
   - name: mgd43b
     email: matt+claude@reloadingtracker.com
