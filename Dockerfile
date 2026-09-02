@@ -22,9 +22,21 @@
 # Hence bmc.hostFormat must be ABSOLUTE (trailing dot). A trailing dot is
 # absolute under any ndots, so it is the only form that is correct in both
 # libcs. values.schema.json enforces it; do not relax that guard.
-FROM alpine:3.22
+# Pinned by digest, and Dependabot bumps it. A floating tag means the base can
+# change under a rebuild with nothing in git to say so -- and this image runs
+# with cluster credentials and BMC passwords.
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
-RUN apk add --no-cache \
+# `apk upgrade` FIRST, and it is not redundant. `apk add` installs the packages
+# named below; it does NOT touch what the base image already ships. libcrypto3
+# and libssl3 come WITH alpine, so without this line they stay at whatever the
+# base was built with and no rebuild ever moves them. That is exactly how 0.3.0
+# shipped openssl 3.5.7-r0 while 3.5.8-r0 was already in the repository, and
+# scored a D on 20 findings that were all "fixable" and none of which a rebuild
+# would have fixed. The whole argument for leaving Debian was that rebuilds
+# clear findings; this is the line that makes that true.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       ipmitool \
       python3 \
       py3-requests \
