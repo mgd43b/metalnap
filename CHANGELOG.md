@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/mgd43b/metalnap/compare/v0.2.9...v0.2.10) (2026-09-02)
+
+
+### Fixes
+
+* publish artifacts from release-please, not from the tag ([3a1be9b](https://github.com/mgd43b/metalnap/commit/3a1be9bbdfc25781ef267dceb0393fa350e856e7))
+
 ## [0.2.9](https://github.com/mgd43b/metalnap/compare/v0.2.8...v0.2.9) (2026-09-02)
 
 
