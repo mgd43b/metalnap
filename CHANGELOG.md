@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/mgd43b/metalnap/compare/v0.3.0...v0.3.1) (2026-09-02)
+
+
+### Fixes
+
+* **deps:** bump alpine from 3.22 to 3.24 ([#7](https://github.com/mgd43b/metalnap/issues/7)) ([f371639](https://github.com/mgd43b/metalnap/commit/f37163997ff5589cd85a3ab25363dcfd02374c91))
+* upgrade base packages at build time, and pin the base by digest ([947cf0d](https://github.com/mgd43b/metalnap/commit/947cf0df98a79c887d2e7414fd2e41b4b5f9e8eb))
+
 ## [0.3.0](https://github.com/mgd43b/metalnap/compare/v0.2.10...v0.3.0) (2026-09-02)
 
 
