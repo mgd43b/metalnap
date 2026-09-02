@@ -147,12 +147,32 @@ kubectl create ns metalnap
 kubectl -n metalnap create secret generic metalnap-bmc \
   --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
 
+CHART_VERSION=0.2.10 # x-release-please-version
+
+# A values file, not --set: `{node}` is Helm list syntax and the dots in a
+# hostname are read as key paths, so --set cannot express bmc.hostFormat.
+cat > metalnap.yaml <<'YAML'
+nodes: [node1, node2]
+bmc:
+  hostFormat: "{node}-ipmi.internal.example.org."   # trailing dot required
+prometheus:
+  url: http://prometheus-k8s.monitoring.svc:9090
+YAML
+
 helm install metalnap oci://ghcr.io/mgd43b/charts/metalnap \
-  -n metalnap --version 0.1.0 \
-  --set 'nodes={node1,node2}' \
-  --set bmc.hostFormat='{node}-ipmi.internal.example.org' \
-  --set prometheus.url=http://prometheus-k8s.monitoring.svc:9090
+  -n metalnap --version "$CHART_VERSION" -f metalnap.yaml
 ```
+
+> **The trailing dot on `bmc.hostFormat` is required, not stylistic.** The image
+> is Alpine, and musl's resolver does not fall back: glibc tries the search list
+> and *then* the absolute name, musl tries one and gives up. A dotted BMC
+> hostname without the trailing dot does not resolve, so metalnap cannot power
+> nodes on or read their power state — while the pod starts cleanly and every
+> test passes. `values.schema.json` rejects it at install time so you find out
+> then rather than during an incident. Setting `ndots` is not an alternative:
+> metalnap also resolves short service names (`prometheus-k8s.monitoring.svc`),
+> which need the search list, so no single `ndots` value serves both classes.
+> IP literals are exempt — they never touch DNS.
 
 It installs in **`dry_run`** and touches nothing. Watch what it decides:
 
@@ -208,6 +228,20 @@ operational knob you may need to turn during an incident (`metalnap/config.py`).
 `MODE` is `off` | `dry_run` | `on`. **`dry_run` observes and logs every decision
 it would take without touching anything** — run it there first, for as long as
 it takes to trust the numbers.
+
+## Base image
+
+`alpine:3.22`, carrying `ipmitool`, `python3` and `py3-requests` — 58MB and 45
+packages, against 159MB and 105 for the Debian equivalent.
+
+The size is incidental; the reason is that **Debian's CVEs are unfixable here**.
+Every finding against `debian:13-slim` reports no fix available, including three
+criticals in `perl-base`, which is `priority:required` and cannot be removed. A
+grade that rebuilding cannot improve makes rebuilding — and Dependabot — purely
+decorative. Alpine's findings all carry fixed versions, so a rebuild clears them
+and the dependency automation does real work.
+
+The cost is musl, and it is a real one: see the note on `bmc.hostFormat` above.
 
 ## Artifact Hub
 

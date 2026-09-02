@@ -20,7 +20,8 @@
           "jsonpath": "$.appVersion"
         },
         "pyproject.toml",
-        "metalnap/__init__.py"
+        "metalnap/__init__.py",
+        "README.md"
       ],
       "changelog-sections": [
         {

@@ -2,37 +2,84 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "metalnap values",
   "type": "object",
-  "required": ["nodes", "mode", "bmc"],
+  "required": [
+    "nodes",
+    "mode",
+    "bmc"
+  ],
   "properties": {
     "nodes": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "Nodes metalnap may manage. It touches nothing else."
     },
     "mode": {
       "type": "string",
-      "enum": ["off", "dry_run", "on"],
+      "enum": [
+        "off",
+        "dry_run",
+        "on"
+      ],
       "description": "Quote it. Unquoted on/off are YAML booleans and will fail."
     },
     "bmc": {
       "type": "object",
-      "required": ["hostFormat", "existingSecret"],
+      "required": [
+        "hostFormat",
+        "existingSecret"
+      ],
       "properties": {
-        "hostFormat": {"type": "string", "minLength": 1},
-        "existingSecret": {"type": "string", "minLength": 1}
+        "hostFormat": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^([^.]*|.*\\.|(\\d{1,3}|\\{node\\})(\\.(\\d{1,3}|\\{node\\})){3})$",
+          "description": "BMC hostname format; {node} is substituted. A dotted HOSTNAME must end in '.' (absolute) -- musl does not fall back from the search list to the absolute name, so a non-absolute dotted hostname silently fails to resolve and metalnap cannot reach the BMC. IP literals are exempt: they never touch DNS."
+        },
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
-    "prometheus": {"type": "object", "properties": {"url": {"type": "string"}}},
-    "alertmanager": {"type": "object", "properties": {"url": {"type": "string"}}},
+    "prometheus": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "alertmanager": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    },
     "warmup": {
       "type": "object",
       "properties": {
-        "image": {"type": "string"},
-        "pullSecrets": {"type": "array", "items": {"type": "string"}}
+        "image": {
+          "type": "string"
+        },
+        "pullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
-    "cordonAnnotation": {"type": "string", "minLength": 1},
-    "burstTaintKey": {"type": "string"},
+    "cordonAnnotation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "burstTaintKey": {
+      "type": "string"
+    },
     "tolerations": {
       "type": "array",
       "description": "Keep this empty. metalnap must never be schedulable onto a node it manages."
@@ -40,16 +87,46 @@
     "timers": {
       "type": "object",
       "properties": {
-        "intervalS": {"type": "integer", "minimum": 10},
-        "wakeSustainS": {"type": "integer", "minimum": 0},
-        "sleepSustainS": {"type": "integer", "minimum": 0},
-        "minUptimeS": {"type": "integer", "minimum": 0},
-        "wakeTimeoutS": {"type": "integer", "minimum": 60},
-        "drainTimeoutS": {"type": "integer", "minimum": 60},
-        "warmupTimeoutS": {"type": "integer", "minimum": 0},
-        "maxSleepAttempts": {"type": "integer", "minimum": 1},
-        "sleepCooldownS": {"type": "integer", "minimum": 0},
-        "defaultCapacityGib": {"type": "number", "exclusiveMinimum": 0}
+        "intervalS": {
+          "type": "integer",
+          "minimum": 10
+        },
+        "wakeSustainS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sleepSustainS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minUptimeS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wakeTimeoutS": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "drainTimeoutS": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "warmupTimeoutS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxSleepAttempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sleepCooldownS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "defaultCapacityGib": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
       }
     }
   }

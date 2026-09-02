@@ -19,7 +19,18 @@ mode: dry_run
 
 bmc:
   # Format string for a node's BMC hostname. {node} is substituted.
-  hostFormat: "{node}-ipmi.internal.example.org"
+  #
+  # MUST BE ABSOLUTE -- note the trailing dot. The image is Alpine, and musl's
+  # resolver does not fall back from the search list to the absolute name the
+  # way glibc does. Without the trailing dot a dotted BMC hostname does not
+  # resolve at all, and metalnap cannot power nodes on or even read their power
+  # state -- while every test still passes and the pod starts cleanly. Setting
+  # `ndots` does not fix this: metalnap also resolves SHORT names
+  # (prometheus-k8s.monitoring.svc), which need the search list, so no single
+  # ndots value serves both. A trailing dot is correct under any ndots.
+  #
+  # A single-label name (no dots) is fine as-is; the search list resolves it.
+  hostFormat: "{node}-ipmi.internal.example.org."
   # Existing Secret with keys `user` and `pass`. Created out of band -- BMC
   # credentials do not belong in values.yaml or in git.
   existingSecret: metalnap-bmc
