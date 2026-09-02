@@ -24,7 +24,7 @@ updates:
       prefix: "chore"
       include-scope: true
 
-  # debian:12-slim, plus the ipmitool and python3-requests it carries. The base
+  # The Debian base, plus the ipmitool and python3-requests it carries. It
   # image is where CVEs actually accumulate for this project -- the Python
   # surface is one dependency.
   - package-ecosystem: docker
@@ -34,7 +34,7 @@ updates:
       day: monday
     commit-message:
       # `fix(deps):` -- release-please treats this as a PATCH and lists it under
-      # Fixes. Correct here, unlike the action bumps: debian:12-slim and the
+      # Fixes. Correct here, unlike the action bumps: the Debian base and the
       # ipmitool it carries ARE the published image, so a bump changes what
       # users run and deserves a release they can see.
       prefix: "fix"
