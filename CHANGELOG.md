@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/mgd43b/metalnap/compare/v0.3.1...v0.4.0) (2026-09-04)
+
+
+### Features
+
+* scheduled maintenance wakeups for idle nodes ([bfa2b95](https://github.com/mgd43b/metalnap/commit/bfa2b956a6c95c5764bcb3e146e6f1018826cd95))
+* scheduled maintenance wakeups for idle nodes ([578ceb8](https://github.com/mgd43b/metalnap/commit/578ceb8a89e3fc08297b2269764b667c9a32b5ca))
+
+
+### Fixes
+
+* keep the stagger offset strictly inside [0, stagger) ([b1c5813](https://github.com/mgd43b/metalnap/commit/b1c5813f547a65c9d08286f8d1ae4204c8a02b94))
+
 ## [0.3.1](https://github.com/mgd43b/metalnap/compare/v0.3.0...v0.3.1) (2026-09-02)
 
 
