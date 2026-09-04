@@ -72,6 +72,10 @@ nodes stay asleep with nothing to explain why.
 | `warmup.image` | `""` | Pulled onto a node after waking, so the first jobs do not each pay for it. |
 | `cordonAnnotation` | `metalnap.io/cordoned` | Marks a cordon as metalnap's own. |
 | `burstTaintKey` | `ci-burst` | Taint keeping other work off sleepable nodes. |
+| `maintenance.intervalS` | `0` (off) | Wake a node asleep this long so it collects updates. `86400` is a sensible start. |
+| `maintenance.windowS` | `300` | How long it stays up, measured from Ready. |
+| `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
+| `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
 ## Safety rules it will not break
@@ -88,6 +92,13 @@ Each exists because breaking it cost something real.
   one non-blocking step per tick.
 - **Wake readily, sleep reluctantly**, and hold evidence of demand across the
   dips a noisy signal produces.
+- **A node nobody wants still has to be maintained.** Scheduled wakeups
+  (`maintenance.intervalS`) bring an idle node up briefly so it is not weeks
+  behind on updates when demand finally wants it. A visit yields to demand, to
+  an operator and to any operation in flight; the node stays cordoned
+  throughout; and a node that goes NotReady inside its window is waited for,
+  never powered off, because that is what a node rebooting into a kernel
+  update looks like.
 
 ## RBAC
 

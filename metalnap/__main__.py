@@ -30,6 +30,16 @@ Optional:
     CORDON_ANNOTATION       default metalnap.io/cordoned
     SHORTFALL_QUERY         override the default PromQL
     SATURATION_QUERY        override, or "" to disable the saturation term
+    MAINTENANCE_INTERVAL_S  wake a node that has been asleep this long, so it
+                            collects updates and config changes it would
+                            otherwise never see. 0 (the default) disables it;
+                            86400 is a sensible start. The node comes up
+                            CORDONED, stays for MAINTENANCE_WINDOW_S, and goes
+                            back down the ordinary way.
+    MAINTENANCE_WINDOW_S    how long it stays up, from Ready (default 300)
+    MAINTENANCE_STAGGER_S   per-node spread, so a rack does not power on in
+                            unison (default 3600)
+    MAINTENANCE_TIMEOUT_S   bound on one visit (default 3600)
     ... plus every timer in metalnap/config.py
 """
 import os

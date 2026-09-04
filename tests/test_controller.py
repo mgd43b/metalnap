@@ -13,14 +13,34 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from metalnap import Config, Controller          # noqa: E402
+from metalnap.controller import _hash_fraction   # noqa: E402
 from metalnap.types import NodeState             # noqa: E402
 
 
 def node(ready=True, cordoned=False, ours=False, ready_since=0.0,
-         capacity=100.0, ours_since=None, protected=False):
+         capacity=100.0, ours_since=None, protected=False, down_since=None):
     return NodeState(ready=ready, cordoned=cordoned, ours=ours,
                      ready_since=ready_since, capacity=capacity,
-                     protected=protected, ours_since=ours_since)
+                     protected=protected, ours_since=ours_since,
+                     down_since=down_since)
+
+
+#: A realistic wall clock. The maintenance schedule is measured in hours
+#: against unix timestamps, so a harness clock of 1000.0 would put "dark for a
+#: day" before the epoch -- which is not a shape the controller will ever meet.
+T0 = 1_700_000_000.0
+
+
+def asleep(dark_for=100_000.0, at=T0, **kw):
+    """A node metalnap itself put to sleep, dark for a while.
+
+    Cordoned AND ours is what "we slept it" looks like from the cluster, and it
+    is the only shape a maintenance visit will ever touch.
+    """
+    kw.setdefault("cordoned", True)
+    kw.setdefault("ours", True)
+    kw.setdefault("down_since", at - dark_for)
+    return node(ready=False, ready_since=None, **kw)
 
 
 class Harness:
@@ -384,6 +404,389 @@ class TestFlickeringDemand(unittest.TestCase):
             woken += h.acted["on"]
             h.acted["on"] = []
         self.assertEqual(woken, [], "a stale timer fired on a transient spike")
+
+
+class TestScheduledMaintenance(unittest.TestCase):
+    """A node nobody wants still has to be maintained.
+
+    The hazard this feature introduces is new in kind: every other power-off in
+    this controller happens to a node the cluster has finished with, whereas
+    these happen to a node that was woken specifically to change itself. Most
+    of what follows is about not cutting power to a machine in the middle of
+    doing that.
+    """
+
+    MAINT = dict(maintenance_interval_s=3600, maintenance_window_s=300,
+                 maintenance_stagger_s=0, maintenance_timeout_s=3600)
+
+    @staticmethod
+    def harness(*a, **kw):
+        h = Harness(*a, **kw)
+        h.t = T0
+        return h
+
+    def test_a_node_dark_past_the_interval_is_woken(self):
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"], "an overdue node never woke")
+        self.assertEqual(c.st["a"]["phase"], "maintaining")
+
+    def test_a_node_not_yet_due_is_left_alone(self):
+        h = self.harness({"a": asleep(dark_for=60.0), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "woke a node that was not due")
+
+    def test_disabled_by_default(self):
+        """The feature powers hardware on when nothing asked for it."""
+        h = self.harness({"a": asleep(dark_for=10_000_000.0), "b": None})
+        c = h.controller()                      # no maintenance config at all
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+
+    def test_the_node_is_never_put_into_service_by_a_visit(self):
+        """A visit holds the node OUT of service, deliberately.
+
+        Uncordoning would advertise capacity that is about to be taken away
+        again, so every visit would end by draining real work under a
+        five-minute deadline -- and that drain would then be the thing keeping
+        the node up.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()                                            # begin
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        c.tick()                                            # observed Ready
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "a maintenance visit made the node schedulable")
+
+    def test_the_window_ends_in_an_ordinary_sleep(self):
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()                                            # begin
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        c.tick()                                            # window opens
+        self.assertEqual(h.acted["off"], [], "cut the visit short")
+        h.t += 301
+        c.tick()                                            # window closes
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        c.tick()                                            # drain, power off
+        self.assertEqual(h.acted["off"], ["a"], "node never went back down")
+
+    def test_min_uptime_does_not_extend_the_window(self):
+        """min_uptime exists to stop DEMAND thrashing a node up and down.
+
+        A visit is not demand: the whole point is a short stay, and a node held
+        up for the 45 minutes min_uptime defaults to would cost more power than
+        the updates it collected are worth.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(min_uptime_s=100_000, **self.MAINT)
+        c.tick()
+        h.states["a"] = node(ready=True, cordoned=True, ours=True,
+                             ready_since=h.t)
+        c.tick()
+        h.t += 301
+        c.tick()
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"],
+                         "min uptime held a maintenance visit open")
+
+    def test_a_node_that_reboots_mid_window_is_not_powered_off(self):
+        """THE failure this feature could introduce.
+
+        A node that goes NotReady inside its own maintenance window is, far
+        more often than not, a node rebooting into the kernel it just
+        installed. Cutting power to it is how a scheduled update turns into an
+        unbootable machine.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        c.tick()                                            # window opens
+        h.t += 301                                          # window elapses...
+        h.states["a"] = node(ready=False, cordoned=True, ours=True)  # rebooting
+        c.tick()
+        self.assertEqual(h.acted["off"], [],
+                         "powered off a node that was rebooting into an update")
+        self.assertEqual(c.st["a"]["phase"], "maintaining", "abandoned it")
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)   # back
+        c.tick()
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"],
+                         "never finished the visit after the node came back")
+
+    def test_the_visit_is_bounded(self):
+        """A visit may not hold a node forever, whatever the node does."""
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.t += 3601                                  # never became Ready
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"], "the bound never fired")
+
+    def test_a_node_still_notready_at_the_bound_is_not_powered_off(self):
+        """The bound releases the VISIT. It does not power off the NODE.
+
+        A node still NotReady when the bound fires is either partway through
+        the updates it was woken to collect or it is broken, and nothing the
+        controller can observe tells it which. Leaving a machine powered costs
+        watts; cutting power to one writing its own firmware costs the machine.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.t += 3601
+        c.tick()
+        self.assertEqual(h.acted["off"], [],
+                         "cut power to a node that might be mid-update")
+        # ...and it is not abandoned: the ordinary stranded repair finishes the
+        # job the moment the node comes back.
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping",
+                         "nothing picked the node back up when it returned")
+
+    def test_a_node_that_is_up_at_the_bound_is_slept_normally(self):
+        """Flapped in and out of Ready long enough to burn the bound, but
+        observable and healthy right now -- so end the visit the usual way."""
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        h.t += 3601
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_failed_visit_is_not_retried_every_tick(self):
+        """`down_since` never moves for a node that will not come back Ready.
+
+        Scheduling on that alone reads as due on every tick forever, which is a
+        power cycle every reconcile interval.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"maintenance_at": h.t - 100}   # attempted a moment ago
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "retried a failed visit at once")
+
+    def test_a_node_an_operator_powered_off_is_never_woken(self):
+        """Dark, but not ours: somebody has it open on the bench.
+
+        An operator's cordon outranks the controller; so does an operator's
+        screwdriver. The cordon we placed when we slept a node is the only
+        evidence that powering it on is ours to do.
+        """
+        for shape in (asleep(cordoned=False, ours=False),   # simply pulled
+                      asleep(cordoned=True, ours=False)):   # operator cordon
+            h = self.harness({"a": shape, "b": None})
+            c = h.controller(**self.MAINT)
+            c.tick()
+            self.assertEqual(h.acted["on"], [],
+                             "powered on a node an operator had taken")
+
+    def test_a_protected_node_is_never_visited(self):
+        h = self.harness({"a": asleep(protected=True), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "visited a protected node")
+
+    def test_dry_run_powers_nothing_on(self):
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(mode="dry_run", **self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+        self.assertIsNone(c.st.get("a", {}).get("phase"))
+
+    def test_dry_run_still_shows_the_whole_schedule(self):
+        """A shadow has to show you what it WOULD do, all of it.
+
+        dry_run advances the schedule in its own memory even though it touches
+        nothing outside the process. Without that it re-picks the same overdue
+        node on every tick, forever, and never once names the second machine.
+        """
+        h = self.harness({"a": asleep(dark_for=200_000.0),
+                          "b": asleep(dark_for=150_000.0)})
+        c = h.controller(mode="dry_run", **self.MAINT)
+        seen = []
+        c._log = lambda lvl, msg, **kv: (seen.append(kv.get("node"))
+                                         if "MAINTENANCE begin" in msg else None)
+        c.tick()
+        c.tick()
+        self.assertEqual(seen, ["a", "b"],
+                         "the shadow named one node twice instead of both once")
+        self.assertEqual(h.acted["on"], [], "dry_run powered a node on")
+
+    def test_a_restart_mid_visit_leaves_the_node_recoverable(self):
+        """In-memory state does not survive a restart, and must not need to.
+
+        A visit interrupted that way ends early rather than resuming -- the
+        node is Ready, carries our cordon and is in no operation, which is the
+        stranded shape the controller already knows how to resolve. What must
+        never happen is a machine left powered with nobody owning it.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.states["a"] = node(ready=True, cordoned=True, ours=True)
+        c.tick()
+        c.st = {}                                   # the process restarted
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping",
+                         "nothing picked up a node left powered and cordoned")
+
+    def test_only_one_node_is_visited_at_a_time(self):
+        """A rack that powers on in unison is a current spike."""
+        h = self.harness({"a": asleep(), "b": asleep()})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        self.assertEqual(len(h.acted["on"]), 1, "woke a herd")
+        c.tick()
+        self.assertEqual(len(h.acted["on"]), 1,
+                         "started a second visit while one was in flight")
+
+    def test_demand_outranks_the_schedule(self):
+        h = self.harness({"a": asleep(), "b": None}, shortfall=400.0)
+        c = h.controller(**self.MAINT)
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "waking",
+                         "a maintenance visit pre-empted a demand wake")
+
+    def test_a_visit_does_not_start_while_demand_is_unmet(self):
+        """Including the gap before a wake's sustain window has elapsed.
+
+        The guard cannot lean on "something else already took this tick": the
+        whole shape of a sustain window is a run of ticks where demand is unmet
+        and nothing has been started about it yet, and a visit slipping into
+        one of those spends the node the wake was about to want.
+        """
+        h = self.harness({"a": asleep(), "b": asleep()}, shortfall=400.0)
+        c = h.controller(wake_sustain_s=600, **self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], [],
+                         "started a maintenance visit while demand was unmet")
+
+    def test_demand_during_a_visit_puts_the_node_into_service(self):
+        """It is booted and cordoned: the cheapest capacity anywhere."""
+        h = self.harness({"a": node(ready=True, cordoned=True, ours=True),
+                          "b": None}, shortfall=400.0)
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
+                     "maintenance_until": h.t + 300}
+        c.tick()
+        self.assertIn(("a", False), h.acted["cordon"],
+                      "left a booted node cordoned while demand went unmet")
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertNotIn("maintenance_until", c.st["a"])
+
+    def test_an_operator_cordon_abandons_a_visit(self):
+        h = self.harness({"a": node(ready=True, cordoned=True, ours=False),
+                          "b": None})
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
+                     "maintenance_until": h.t - 1}
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertEqual(h.acted["off"], [], "slept a node an operator holds")
+        self.assertNotIn("maintenance_until", c.st["a"],
+                         "a stale deadline would end the next visit instantly")
+
+    def test_being_uncordoned_mid_visit_hands_the_node_over(self):
+        """An operator putting the node into service outranks the schedule."""
+        h = self.harness({"a": node(ready=True, cordoned=False, ours=False),
+                          "b": None})
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
+                     "maintenance_until": h.t - 1}
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertEqual(h.acted["off"], [],
+                         "powered off a node an operator had just put back")
+
+    def test_the_drain_deadline_is_refreshed_before_the_drain(self):
+        """The cordon is weeks old; the drain it now anchors is seconds old.
+
+        sleep() measures its drain deadline from the cordon timestamp, so a
+        visit that ended without re-stamping would abandon its own drain on the
+        first busy unit -- against a deadline that expired before the drain
+        existed.
+        """
+        h = self.harness({"a": asleep(), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        h.states["a"] = node(ready=True, cordoned=True, ours=True,
+                             ours_since=h.t - 500_000)
+        c.tick()
+        h.t += 301
+        c.tick()
+        self.assertIn(("a", True), h.acted["cordon"],
+                      "handed a fresh drain a deadline that expired weeks ago")
+
+    def test_the_stagger_spreads_nodes_and_survives_a_restart(self):
+        """Random-looking across a fleet, identical across a redeploy.
+
+        A freshly seeded RNG would re-roll every offset on every restart, so a
+        controller that redeploys often would keep re-bunching the very nodes
+        the stagger exists to spread apart.
+        """
+        h = self.harness({"a": asleep(), "b": asleep()})
+        cfg = dict(self.MAINT, maintenance_stagger_s=3600)
+        c = h.controller(nodes=("a", "b", "c", "d"), **cfg)
+        offsets = [c._maintenance_offset(n) for n in ("a", "b", "c", "d")]
+        self.assertEqual(len(set(offsets)), 4, "every node got the same slot")
+        self.assertTrue(all(0 <= o < 3600 for o in offsets), offsets)
+        fresh = h.controller(nodes=("a", "b", "c", "d"), **cfg)
+        self.assertEqual([fresh._maintenance_offset(n)
+                          for n in ("a", "b", "c", "d")], offsets,
+                         "a restart re-rolled the schedule")
+
+    def test_the_offset_cannot_reach_a_whole_stagger(self):
+        """The half-open end of [0, stagger) is load-bearing, and the way it
+        breaks is ARITHMETIC, not statistical.
+
+        A 64-bit numerator does not fit a double's mantissa, so the widest
+        digests round the ratio up to exactly 1.0 and the node is pushed a
+        whole stagger late. That is about one name in 2**54 -- no sweep over
+        plausible node names finds it, which is why the boundary is tested
+        directly instead of hunted for.
+        """
+        self.assertLess(_hash_fraction(b"\xff" * 32), 1.0,
+                        "the widest possible digest rounded up to a full slot")
+        self.assertEqual(_hash_fraction(b"\x00" * 32), 0.0)
+
+    def test_a_source_without_down_since_still_schedules(self):
+        """Falls back to the controller's own start time: late, never early."""
+        h = self.harness({"a": asleep(down_since=None), "b": None})
+        c = h.controller(**self.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], [],
+                         "treated an unknown dark time as infinitely overdue")
+        h.t += 3601
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"], "never came due at all")
+
+
+class TestMaintenanceConfig(unittest.TestCase):
+    """A schedule that cannot fire looks exactly like a disabled one."""
+
+    def test_a_window_longer_than_the_interval_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Config(mode="on", maintenance_interval_s=300,
+                   maintenance_window_s=600).validate()
+
+    def test_a_bound_that_cannot_cover_a_boot_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Config(mode="on", maintenance_interval_s=86400,
+                   maintenance_window_s=300, wake_timeout_s=900,
+                   maintenance_timeout_s=600).validate()
+
+    def test_the_disabled_default_validates(self):
+        self.assertIsNotNone(Config(mode="on").validate())
 
 
 if __name__ == "__main__":

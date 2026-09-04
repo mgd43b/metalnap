@@ -40,9 +40,14 @@ Supermicro Twin serving GitHub Actions CI.
 ## What it does
 
 ```
-       demand signal              this controller              your hardware
-  unmet work + saturated  ──▶  should N nodes be awake?  ──▶  IPMI / Redfish
-        queues                  drain safely, then power        WoL / PDU
+     demand signal ──┐
+  unmet work, and a  │          this controller            your hardware
+   queue at its cap  ├──▶  should N nodes be awake?  ──▶  IPMI / Redfish
+                     │     drain safely, then power          WoL / PDU
+     the calendar ───┘
+  asleep long enough
+   to have missed a
+   month of updates
 ```
 
 Each tick: observe every node, work out how many should be awake, and take **at
@@ -71,6 +76,11 @@ Every one of these exists because breaking it cost something real.
 - **Wake readily, sleep reluctantly** — and hold evidence of demand across the
   dips a noisy signal produces. A queue sitting at its ceiling makes demand
   flicker; a timer that resets on every dip never fires.
+- **A node nobody wants still has to be maintained.** One that sleeps for
+  weeks misses every package update and config run, then has to catch all of
+  it up at the exact moment demand finally wanted it. Scheduled wakeups fix
+  that — and they are the lowest-priority thing the controller does, yielding
+  to demand, to an operator, and to any operation already in flight.
 
 ## The three seams
 
@@ -102,6 +112,61 @@ own ceiling admits nothing further, so real demand becomes invisible *exactly*
 when extra capacity is most needed. This bit us in production: a runner pool
 pinned at its cap with jobs waiting, and the controller reporting zero unmet
 demand and preparing to sleep the last awake node.
+
+## Scheduled wakeups
+
+A node that sleeps for three weeks comes back three weeks behind: unattended
+upgrades, config management, a new CA bundle, firmware. All of it lands at once
+on the machine that just woke because something was waiting for it — which is
+the worst possible moment for a forty-minute upgrade run.
+
+So bring idle nodes up briefly, on a schedule, when nothing is waiting:
+
+```yaml
+maintenance:
+  intervalS: 86400      # a node asleep this long gets a visit
+  windowS: 300          # it stays up five minutes, measured from Ready
+  staggerS: 3600        # spread across an hour so a rack does not wake in unison
+```
+
+**Off unless you set `intervalS`.** It powers hardware on when nothing asked
+for it, and that should be a decision somebody made.
+
+What a visit actually does, and why:
+
+- **The node comes up cordoned and stays cordoned.** Uncordoning would
+  advertise capacity that is about to be taken away again, so every visit would
+  end by draining real work under a five-minute deadline — and that drain would
+  then be the thing keeping the node up. Host-level updates, config management
+  and anything running as a DaemonSet all proceed regardless of a cordon. If
+  you need the node *schedulable*, you want a longer ordinary wake, not this.
+- **One node at a time, staggered.** Nodes fall asleep in a herd — a cluster
+  goes quiet and they follow each other down — so an unstaggered schedule
+  brings the same herd back up in unison, which is a current spike your PSUs
+  did not agree to. Each node's offset comes from a hash of its name: random
+  across a fleet, identical across a redeploy, so a controller that restarts
+  often cannot keep re-bunching the nodes the stagger exists to spread.
+- **It yields to everything.** Unmet demand, an operator's cordon, any wake,
+  sleep, drain or warmup already in flight — all of them win. A visit deferred
+  by a tick, or by a thousand, costs nothing when the schedule is measured in
+  days.
+- **Demand mid-visit takes the node.** It is already booted and one uncordon
+  away, which makes it the cheapest capacity available anywhere.
+- **A node that goes NotReady inside its window is waited for, not powered
+  off.** That state is, far more often than not, a node rebooting into the
+  kernel it just installed, and cutting power to it is how a routine update
+  becomes an unbootable machine. If it is *still* not back when the bound
+  fires, metalnap lets go of the visit and leaves the machine **powered**,
+  logging an error: it cannot tell "mid-update" from "broken", and leaving a
+  node powered costs watts where cutting power to one writing its own firmware
+  costs the machine. The ordinary stranded repair finishes the job the moment
+  it comes back.
+- **`MIN_UPTIME_S` does not apply.** It exists to stop *demand* thrashing a
+  node up and down; a visit is not demand, and the whole point is a short stay.
+
+The schedule is measured from Kubernetes' own `Ready` condition transition
+time, so it survives a controller restart — a process that forgot a node had
+been dark for a fortnight would visit it a fortnight late.
 
 ## Testing
 
@@ -228,6 +293,9 @@ operational knob you may need to turn during an incident (`metalnap/config.py`).
 `MODE` is `off` | `dry_run` | `on`. **`dry_run` observes and logs every decision
 it would take without touching anything** — run it there first, for as long as
 it takes to trust the numbers.
+
+`MAINTENANCE_INTERVAL_S` enables [scheduled wakeups](#scheduled-wakeups) and is
+`0` — off — by default.
 
 ## Base image
 

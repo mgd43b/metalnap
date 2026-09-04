@@ -12,6 +12,24 @@
 {{- if not (has .Values.mode (list "off" "dry_run" "on")) }}
 {{- fail (printf "mode must be one of off|dry_run|on; got %q" .Values.mode) }}
 {{- end }}
+{{- /*
+  A maintenance schedule that cannot fire is indistinguishable from the feature
+  being switched off, so catch the two combinations that produce one at INSTALL
+  time rather than in a controller log nobody is reading. The same checks live
+  in metalnap/config.py, which is what actually enforces them -- these only
+  move the discovery earlier.
+*/ -}}
+{{- with .Values.maintenance }}
+{{- if gt (int .intervalS) 0 }}
+{{- if le (int .intervalS) (int .windowS) }}
+{{- fail (printf "maintenance.intervalS (%v) must exceed maintenance.windowS (%v), or a node is never asleep long enough to come due" .intervalS .windowS) }}
+{{- end }}
+{{- $floor := add (int .windowS) (int $.Values.timers.wakeTimeoutS) }}
+{{- if lt (int .timeoutS) $floor }}
+{{- fail (printf "maintenance.timeoutS (%v) must be at least maintenance.windowS + timers.wakeTimeoutS (%d), or the bound fires before a node that booted slowly has had its window" .timeoutS $floor) }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -45,6 +63,18 @@ data:
   MAX_SLEEP_ATTEMPTS: {{ .Values.timers.maxSleepAttempts | quote }}
   SLEEP_COOLDOWN_S: {{ .Values.timers.sleepCooldownS | quote }}
   DEFAULT_CAPACITY: {{ .Values.timers.defaultCapacityGib | quote }}
+  {{- with .Values.maintenance }}
+  {{- /*
+    No `| default` on any of these. Sprig's default fires on any EMPTY value
+    and 0 is empty, so `staggerS: 0` -- a deliberate "give me no spread" --
+    would silently come back as an hour. values.yaml supplies all four, and
+    Helm merges maps, so overriding one key leaves the others in place.
+  */}}
+  MAINTENANCE_INTERVAL_S: {{ .intervalS | quote }}
+  MAINTENANCE_WINDOW_S: {{ .windowS | quote }}
+  MAINTENANCE_STAGGER_S: {{ .staggerS | quote }}
+  MAINTENANCE_TIMEOUT_S: {{ .timeoutS | quote }}
+  {{- end }}
   {{- with .Values.queries.shortfall }}
   SHORTFALL_QUERY: {{ . | quote }}
   {{- end }}

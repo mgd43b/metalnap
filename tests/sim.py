@@ -19,6 +19,10 @@ The cluster model is faithful on the points a controller gets wrong:
     powered and Ready-but-cordoned intermediate states.
   * an operator periodically takes a node for maintenance, cordoning it
     WITHOUT the controller's annotation.
+  * a node woken for a SCHEDULED maintenance visit sometimes reboots into the
+    update it just installed, going NotReady in the middle of its own window.
+    Cutting power there is how a routine update becomes an unbootable
+    machine, so it is modelled and asserted rather than assumed.
   * demand is phased and, in one mode, deliberately shaped to flicker: parked
     just below one node's worth while saturation toggles around a ceiling.
 
@@ -45,6 +49,23 @@ MEASURED DETECTION, by reintroducing each real bug and counting failing seeds
     saturation signal ignored               3/60
     wake timer reset by a flickering signal  2/60
     in-flight operation ignores a cordon     1/60
+
+and for scheduled maintenance, on the 30 of those 60 seeds that run it:
+
+    power cut to a node rebooting mid-visit 30/30
+    a maintenance window that never closes  30/30
+    the schedule silently stops firing      28/30
+    visits run in parallel                   0/30
+    visits ignore unmet demand               0/30
+    a failed visit is retried every tick     0/30
+    a visit leaves the node schedulable      0/30
+
+The four zeroes are not gaps in cover, they are gaps in THIS harness: each is
+caught deterministically in test_controller.py, and each describes a
+priority or scheduling mistake rather than a safety one -- the sim would need a
+model of what the fleet ought to be doing, not just what it is doing, to see
+them. The two 30/30 rows are the ones that destroy hardware, and they are the
+ones this harness is good at.
 
 The low-rate rows are BACKSTOPS, not primary cover. Anything guarding running
 work or an operator's cordon also has a deterministic test in
@@ -93,6 +114,14 @@ class Node:
         self.name, self.powered, self.ready = name, powered, ready
         self.cordoned, self.ours, self.change_at = False, None, None
         self.ready_since = 0.0
+        # Unknown to begin with, on purpose: a node that was already dark when
+        # the controller started has no recoverable transition time, and the
+        # fallback that covers it is worth exercising rather than assuming.
+        self.down_since = None
+        #: Set while the node is rebooting into an update it just installed.
+        #: Powering a node off in this state is how a scheduled update turns
+        #: into an unbootable machine.
+        self.updating = None
 
 
 class Sim:
@@ -102,7 +131,7 @@ class Sim:
         self.rnd = random.Random(seed)
         self.seed, self.ticks = seed, ticks
         self.t = 1_000_000.0
-        self.cfg = cfg or Config(mode="on")
+        self.cfg = cfg or self.default_cfg(seed)
         self.nodes = {"a": Node("a"), "b": Node("b", powered=False, ready=False)}
         self.workers, self.next_id = [], 0
         self.demand, self.saturated = 0.0, 0
@@ -113,11 +142,41 @@ class Sim:
         # invariant violations, collected rather than raised so the tick that
         # caused them finishes and the report shows full context
         self.killed_work, self.powered_off_busy, self.stomped = [], [], []
+        self.interrupted_update = []
         self.blocked = None
         self.zombie_since = {}
         self.sleepable_since = {}
+        self.unvisited_since = {}
+        self.visit_since = {}
         self.notified = {}
         self.warming = {}
+        #: Set once run() builds it. The reboot model reads the controller's
+        #: own phase, which is the only honest way to tell a maintenance visit
+        #: apart from a drain that happens to look identical from outside.
+        self.controller = None
+
+    @staticmethod
+    def default_cfg(seed):
+        """Half the seeds run scheduled maintenance, half do not.
+
+        Both halves are worth having. The maintenance half exercises a node
+        that is powered, Ready and cordoned for minutes at a time on purpose,
+        which is the exact shape the zombie invariant hunts for -- so it has to
+        be reachable, and it has to stay bounded. The other half keeps the
+        tighter budgets honest: a feature that widened every budget for every
+        seed would quietly disarm the checks it was not supposed to touch.
+
+        The interval is half an hour rather than a day so a 900-tick run spans
+        thirty of them; real deployments set days. It is short for a reason
+        beyond speed: the liveness budget below is dominated by the things a
+        visit YIELDS to, so a long interval buries the schedule's own
+        contribution under them and the check stops being able to see it.
+        """
+        if seed % 2 == 0:
+            return Config(mode="on")
+        return Config(mode="on", maintenance_interval_s=1800,
+                      maintenance_window_s=300, maintenance_stagger_s=600,
+                      maintenance_timeout_s=1200)
 
     # -- clock -----------------------------------------------------------
     def now(self):
@@ -131,6 +190,9 @@ class Sim:
                 n.ready = n.powered
                 if n.ready and not was:
                     n.ready_since = self.t
+                    n.updating = None            # it came back on its own
+                elif was and not n.ready:
+                    n.down_since = self.t
                 n.change_at = None
 
     # -- NodeSource ------------------------------------------------------
@@ -144,7 +206,8 @@ class Sim:
                          capacity=CAPACITY,
                          # durable: survives the controller restarts injected
                          # below, which is the whole point of it
-                         ours_since=n.ours)
+                         ours_since=n.ours,
+                         down_since=None if n.ready else n.down_since)
 
     def set_cordon(self, name, cordoned):
         n = self.nodes[name]
@@ -166,6 +229,9 @@ class Sim:
     def soft_off(self, name):
         if name in self.human_held:
             self.stomped.append((self.t, name, "powered off while held"))
+        if self.nodes[name].updating:
+            self.interrupted_update.append((self.t, name))
+            self.nodes[name].updating = None
         for w in self.workers:
             if w.node == name and w.work:
                 self.powered_off_busy.append((self.t, name, w.name, w.work))
@@ -288,6 +354,35 @@ class Sim:
                     ticks_left=(self.rnd.randint(150, 400) if stuck
                                 else self.rnd.randint(1, 6)) if busy else 0))
 
+        # A node that just installed a kernel reboots into it, and is NotReady
+        # for several ticks in the middle of its own maintenance window. This
+        # is the state the whole feature has to survive, and without modelling
+        # it the harness ran 181 visits across 20 seeds and never once produced
+        # it.
+        #
+        # Injected ONLY while the controller believes it is mid-visit, read
+        # from its own phase rather than guessed from the cluster. The first
+        # version guessed -- powered, Ready, cordoned and ours -- which is also
+        # exactly what a node halfway through an ORDINARY drain looks like, so
+        # it injected reboots into demand-driven sleeps and then reported the
+        # controller for finishing them. A model that cannot tell those two
+        # apart cannot assert anything about either.
+        for n in self.nodes.values():
+            if n.updating is not None:
+                continue                         # advance() brings it back
+            if (self.cfg.maintenance_interval_s and n.powered and n.ready
+                    and self.controller is not None
+                    and self.controller.st.get(n.name, {}).get("phase")
+                            == "maintaining"
+                    and self.rnd.random() < 0.15):
+                n.ready = False
+                n.down_since = self.t
+                n.updating = self.t
+                # Down for a couple of ticks, then a full POST -- comfortably
+                # inside the visit's bound, so anything that cuts it short is
+                # the controller deciding to, not the clock running out.
+                n.change_at = self.t + 2 * self.cfg.interval_s + BOOT_S
+
         # An operator takes a node for maintenance, and later releases it.
         for n in self.nodes.values():
             if n.name in self.human_held:
@@ -360,6 +455,9 @@ class Sim:
         if self.stomped:
             fail("overrode an operator's maintenance cordon: %s"
                  % (self.stomped[0],))
+        if self.interrupted_update:
+            fail("powered off a node that was rebooting into an update it had "
+                 "just installed: %s" % (self.interrupted_update[0],))
         if self.blocked is not None:
             fail("tick() called time.sleep(%s) -- the reconcile loop must "
                  "never block" % self.blocked)
@@ -382,6 +480,13 @@ class Sim:
                 held = self.t - self.zombie_since[n.name]
                 budget = (self.cfg.drain_timeout_s
                           + self.cfg.sleep_cooldown_s + 600)
+                if self.cfg.maintenance_interval_s:
+                    # A maintenance visit is powered, Ready and cordoned ON
+                    # PURPOSE -- that is precisely its shape -- so the budget
+                    # has to cover a whole window plus the drain that ends it.
+                    # Added only when the feature is on: widening a budget for
+                    # every seed would quietly disarm the check everywhere else.
+                    budget += self.cfg.maintenance_window_s
                 if held > budget:
                     fail("%s cordoned+powered+Ready for %.0fs (budget %.0fs)"
                          % (n.name, held, budget))
@@ -418,7 +523,11 @@ class Sim:
         # how you end up with a suite nobody trusts.
         settle = ((self.cfg.min_uptime_s + self.cfg.sleep_sustain_s
                    + self.cfg.sleep_cooldown_s
-                   + len(self.nodes) * self.cfg.drain_timeout_s)
+                   + len(self.nodes) * self.cfg.drain_timeout_s
+                   # a node powered on for a visit is legitimately awake for a
+                   # window before it may start going down again
+                   + (self.cfg.maintenance_window_s
+                      if self.cfg.maintenance_interval_s else 0))
                   / self.cfg.interval_s) + 25
         for n in self.nodes.values():
             sleepable = (self.busy_phase is False
@@ -435,6 +544,78 @@ class Sim:
                 fail("%s has been continuously sleepable for %d ticks "
                      "(budget %d) and is still powered"
                      % (n.name, held_for, settle))
+
+        # A visit must not hold a node past the window it was promised. The
+        # bound in maintenance_timeout_s is a backstop for a node that keeps
+        # flapping, not a licence to sit on a healthy one -- and a budget built
+        # from the backstop would accept a window that never closes at all,
+        # which is a whole broken feature passing quietly.
+        #
+        # Measured against CONTINUOUS Ready time inside the visit, read from
+        # the controller's own phase: a node that reboots resets the clock,
+        # because waiting for it to come back is the correct behaviour and must
+        # not read as overstaying.
+        for n in self.nodes.values():
+            visiting = (self.controller is not None
+                        and (self.controller.st.get(n.name) or {}).get("phase")
+                            == "maintaining")
+            if not (visiting and n.ready):
+                self.visit_since.pop(n.name, None)
+                continue
+            self.visit_since.setdefault(n.name, self.t)
+            held = self.t - self.visit_since[n.name]
+            # Two ticks of slack: the window is set on the tick the controller
+            # first observes Ready and closed on the first tick past it, so a
+            # correct visit lands on the window itself plus measurement grain.
+            budget = self.cfg.maintenance_window_s + 2 * self.cfg.interval_s
+            if held > budget:
+                fail("%s has been up and cordoned inside its maintenance "
+                     "window for %.0fs (window %.0fs, budget %.0fs)"
+                     % (n.name, held, self.cfg.maintenance_window_s, budget))
+
+        # A node metalnap put to sleep must eventually be visited. This is the
+        # ONLY check that fails if the schedule silently stops firing, and a
+        # schedule that never fires is indistinguishable from the feature being
+        # switched off -- which is the failure mode a config knob is most
+        # likely to produce.
+        #
+        # Measured only while a node is a legitimate candidate: dark, carrying
+        # OUR cordon, and not in an operator's hands. A node an operator pulled
+        # is one metalnap must never power on, so counting it here would demand
+        # exactly the behaviour the safety rules forbid.
+        if self.cfg.maintenance_interval_s:
+            # Every term is reachable together, and each is a thing maintenance
+            # yields to -- it is the lowest-priority work in the loop:
+            #   interval + stagger   the schedule itself
+            #   busy phase           visits wait for demand to be met, and a
+            #                        busy phase runs up to 90 ticks
+            #   N x (window+drain)   visits are serialised, so the last node
+            #                        waits behind every other one
+            #   timeout              one visit may burn its whole bound first
+            #
+            # sleep_cooldown is deliberately NOT here. It backs off a sleep
+            # that was abandoned; it sets no phase, so it delays nothing about
+            # a visit -- and a term that cannot fire only makes the budget
+            # looser than the thing it is meant to bound.
+            budget = (self.cfg.maintenance_interval_s
+                      + self.cfg.maintenance_stagger_s
+                      + self.cfg.maintenance_timeout_s
+                      + 90 * self.cfg.interval_s
+                      + len(self.nodes) * (self.cfg.maintenance_window_s
+                                           + self.cfg.drain_timeout_s))
+            for n in self.nodes.values():
+                candidate = (not n.powered and n.cordoned
+                             and n.ours is not None
+                             and n.name not in self.human_held)
+                if not candidate:
+                    self.unvisited_since.pop(n.name, None)
+                    continue
+                self.unvisited_since.setdefault(n.name, self.t)
+                dark = self.t - self.unvisited_since[n.name]
+                if dark > budget:
+                    fail("%s has been asleep and due for %.0fs (budget %.0fs) "
+                         "without a maintenance visit -- the schedule has "
+                         "stopped firing" % (n.name, dark, budget))
 
         # Sustained demand must actually produce a node. A WINDOWED MAJORITY,
         # not a run length: the signal flickers by nature, so a counter that
@@ -462,6 +643,7 @@ class Sim:
                        log=lambda lvl, msg, **kv: self.log.append(
                            (self.t, lvl, msg)),
                        clock=self.now)
+        self.controller = c
         import time as _time
         real_sleep = _time.sleep
         # Recording rather than raising: the controller wraps its phase steps

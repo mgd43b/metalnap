@@ -64,6 +64,26 @@ arc:
 # running install orphans any cordon it currently holds.
 cordonAnnotation: metalnap.io/cordoned
 
+# Bring idle nodes up on a schedule so they collect package updates, config
+# management runs and firmware they would otherwise never see. A node that
+# sleeps for weeks has to catch all of that up the moment demand finally wants
+# it, which is the worst possible time for a forty-minute upgrade run.
+#
+# OFF by default: it powers hardware on when nothing asked for it, and that
+# should be a decision somebody made. Set intervalS to enable -- 86400 is a
+# sensible start.
+#
+# The node stays CORDONED for the whole visit, on purpose. Uncordoning would
+# advertise capacity about to be taken away again, so every visit would end by
+# draining real work under a five-minute deadline. Host-level updates and
+# anything running as a DaemonSet proceed regardless of a cordon; if you need
+# the node schedulable, you want a longer ordinary wake, not this.
+maintenance:
+  intervalS: 0            # 0 disables. 86400 = once a day per node.
+  windowS: 300            # how long it stays up, measured from Ready
+  staggerS: 3600          # per-node spread, so a rack does not power on in unison
+  timeoutS: 3600          # bound on one visit; must exceed windowS + wakeTimeoutS
+
 # Every timer, in seconds. Defaults match metalnap/config.py.
 timers:
   intervalS: 60

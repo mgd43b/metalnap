@@ -83,18 +83,24 @@ class KubeNodeSource:
             if e.response is not None and e.response.status_code == 404:
                 return None          # not racked yet is not an error
             raise
-        ready, ready_since = False, None
+        ready, ready_since, down_since = False, None, None
         for c in n["status"].get("conditions", []):
             if c["type"] == "Ready":
+                # Note "True", not truthiness: a node whose kubelet has stopped
+                # heartbeating goes to "Unknown", not "False", and that is the
+                # state a powered-off node actually sits in.
                 ready = c["status"] == "True"
-                if ready:
-                    from datetime import datetime
-                    try:
-                        ready_since = datetime.fromisoformat(
-                            c["lastTransitionTime"].replace("Z", "+00:00")
-                        ).timestamp()
-                    except Exception:          # noqa: BLE001
-                        ready_since = None
+                from datetime import datetime
+                try:
+                    ts = datetime.fromisoformat(
+                        c["lastTransitionTime"].replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:              # noqa: BLE001
+                    ts = None
+                # One condition, one transition time: it is when the node
+                # became Ready, or when it stopped being. Which of the two it
+                # is depends entirely on where the condition stands now.
+                ready_since, down_since = (ts, None) if ready else (None, ts)
         anns = n["metadata"].get("annotations") or {}
         ours_since = None
         if anns.get(self.annotation):
@@ -113,6 +119,7 @@ class KubeNodeSource:
             capacity=self.capacity_of(n),
             protected=any(l in labels for l in self.protected_labels),
             ours_since=ours_since,
+            down_since=down_since,
         )
 
     def set_cordon(self, name, cordoned):
