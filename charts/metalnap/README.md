@@ -75,6 +75,7 @@ nodes stay asleep with nothing to explain why.
 | `maintenance.intervalS` | `0` (off) | Wake a node asleep this long so it collects updates. `86400` is a sensible start. |
 | `maintenance.windowS` | `300` | How long it stays up, measured from Ready. |
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
+| `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
 ## Safety rules it will not break

@@ -13,6 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from metalnap import Config, Controller          # noqa: E402
+from metalnap.controller import _hash_fraction   # noqa: E402
 from metalnap.types import NodeState             # noqa: E402
 
 
@@ -737,12 +738,26 @@ class TestScheduledMaintenance(unittest.TestCase):
         cfg = dict(self.MAINT, maintenance_stagger_s=3600)
         c = h.controller(nodes=("a", "b", "c", "d"), **cfg)
         offsets = [c._maintenance_offset(n) for n in ("a", "b", "c", "d")]
-        self.assertTrue(all(0 <= o < 3600 for o in offsets), offsets)
         self.assertEqual(len(set(offsets)), 4, "every node got the same slot")
+        self.assertTrue(all(0 <= o < 3600 for o in offsets), offsets)
         fresh = h.controller(nodes=("a", "b", "c", "d"), **cfg)
         self.assertEqual([fresh._maintenance_offset(n)
                           for n in ("a", "b", "c", "d")], offsets,
                          "a restart re-rolled the schedule")
+
+    def test_the_offset_cannot_reach_a_whole_stagger(self):
+        """The half-open end of [0, stagger) is load-bearing, and the way it
+        breaks is ARITHMETIC, not statistical.
+
+        A 64-bit numerator does not fit a double's mantissa, so the widest
+        digests round the ratio up to exactly 1.0 and the node is pushed a
+        whole stagger late. That is about one name in 2**54 -- no sweep over
+        plausible node names finds it, which is why the boundary is tested
+        directly instead of hunted for.
+        """
+        self.assertLess(_hash_fraction(b"\xff" * 32), 1.0,
+                        "the widest possible digest rounded up to a full slot")
+        self.assertEqual(_hash_fraction(b"\x00" * 32), 0.0)
 
     def test_a_source_without_down_since_still_schedules(self):
         """Falls back to the controller's own start time: late, never early."""

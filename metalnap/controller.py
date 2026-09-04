@@ -317,8 +317,8 @@ class Controller:
         spread = self.cfg.maintenance_stagger_s
         if spread <= 0:
             return 0.0
-        digest = hashlib.sha256(name.encode("utf-8")).digest()
-        return spread * (int.from_bytes(digest[:8], "big") / 2.0 ** 64)
+        return spread * _hash_fraction(
+            hashlib.sha256(name.encode("utf-8")).digest())
 
     def _dark_since(self, name, state):
         """When this node was last known to be up, best evidence first.
@@ -799,6 +799,21 @@ class Controller:
         # or to an operator; a maintenance visit is neither, so it gets what is
         # left over and nothing more.
         self._maybe_maintain(present, states, awake, want)
+
+
+def _hash_fraction(digest):
+    """A digest as a fraction in [0, 1) -- and the half-open end is load-bearing.
+
+    FOUR bytes, not eight. A 64-bit numerator does not fit a double's 53-bit
+    mantissa, so `(2**64 - 1) / 2.0**64` rounds UP to exactly 1.0 and the
+    caller's offset lands ON the full stagger rather than inside it. 32 bits
+    divides exactly, and four billion slots is more spread than a rack needs.
+
+    Its own function so the boundary is reachable from a test: the inputs that
+    break it are about one name in 2**54, which no sweep over plausible node
+    names will ever produce -- but an all-ones digest produces it every time.
+    """
+    return int.from_bytes(digest[:4], "big") / 2.0 ** 32
 
 
 def _default_log(level, msg, **kv):
