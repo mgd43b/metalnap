@@ -33,6 +33,16 @@ class NodeState:
     #: in-memory state instead, a process that restarts mid-drain resets its
     #: own deadline and can hold a node cordoned indefinitely.
     ours_since: Optional[float] = None
+    #: Unix timestamp the node last STOPPED being Ready, or None while it is
+    #: Ready. The mirror image of ready_since, and durable for the same reason:
+    #: it is how long a node has been dark, which is what the maintenance
+    #: schedule is measured against. Held in the controller's memory instead,
+    #: every restart would forget that a node had been asleep for a fortnight.
+    #:
+    #: A source that cannot recover it may leave it None -- the controller then
+    #: falls back to its own start time, which is safe but resets the
+    #: maintenance clock on every restart.
+    down_since: Optional[float] = None
 
 
 class NodeSource(Protocol):

@@ -128,6 +128,32 @@
           "exclusiveMinimum": 0
         }
       }
+    },
+    "maintenance": {
+      "type": "object",
+      "description": "Scheduled wakeups so idle nodes collect updates. Off unless intervalS is set. The node stays cordoned throughout: a visit holds it out of service on purpose.",
+      "properties": {
+        "intervalS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wake a node that has been asleep this long. 0 disables."
+        },
+        "windowS": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long it stays up, measured from Ready. Must be less than intervalS."
+        },
+        "staggerS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-node spread of the due time, so a rack does not power on in unison."
+        },
+        "timeoutS": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Bound on one visit, from power-on. Must be at least windowS + timers.wakeTimeoutS."
+        }
+      }
     }
   }
 }

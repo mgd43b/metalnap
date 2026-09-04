@@ -17,7 +17,13 @@ this against real hardware and real CI:
     the failure mode that hides longest.
   * Wake readily, sleep reluctantly, and hold evidence of demand across the
     dips a noisy signal produces.
+  * A node nobody wants still has to be maintained. One that sleeps for weeks
+    misses every package update and config run, and then has to catch up at
+    the exact moment demand finally wanted it. Scheduled visits are the answer,
+    and they are the LOWEST-priority thing here: they yield to demand, to an
+    operator, and to any operation already in flight.
 """
+import hashlib
 import math
 import time
 from typing import Dict, List, Optional
@@ -292,12 +298,262 @@ class Controller:
         s["awake_since"] = None
         self.log("info", "SLEEP complete -- powered off", node=name)
 
+    # -- scheduled maintenance -------------------------------------------
+    def _maintenance_offset(self, name):
+        """A stable per-node offset, so nodes do not all come due together.
+
+        Nodes fall asleep in a herd -- a cluster goes quiet and they follow
+        each other down within a tick or two -- so an unstaggered schedule
+        brings the same herd back up in unison. Serialising the visits stops
+        that being a power spike, but it also means the last node in a large
+        fleet waits behind every other, so spread them out as well.
+
+        Drawn from a hash of the node name rather than random(): it looks
+        random across a fleet, which is all that is wanted, but it is
+        IDENTICAL after a restart. A freshly seeded RNG re-rolls every offset
+        on every deploy, so a controller that redeploys often would keep
+        re-bunching the very nodes this exists to spread apart.
+        """
+        spread = self.cfg.maintenance_stagger_s
+        if spread <= 0:
+            return 0.0
+        digest = hashlib.sha256(name.encode("utf-8")).digest()
+        return spread * (int.from_bytes(digest[:8], "big") / 2.0 ** 64)
+
+    def _dark_since(self, name, state):
+        """When this node was last known to be up, best evidence first.
+
+        `down_since` is DURABLE -- it lives on the node, not in this process --
+        so a controller that restarts still knows the machine has been dark for
+        a fortnight. Falling back to our own start time is safe but resets the
+        clock on every restart, which is why KubeNodeSource takes the trouble
+        to report it.
+
+        The last ATTEMPT counts too, and it counts even when it failed. A node
+        that will not come back Ready never updates `down_since`, so without
+        this it would read as due on every single tick and be power-cycled
+        forever.
+        """
+        base = state.down_since
+        if base is None:
+            base = self.st.get("_started") or self.now()
+        last_try = (self.st.get(name) or {}).get("maintenance_at")
+        # Explicit comparison rather than max() against a zero floor: these are
+        # unix timestamps, and a floor is only ever wrong -- a clock the caller
+        # measures from an arbitrary origin lands below it and reads as "dark
+        # since the beginning of time", which is due on every tick forever.
+        return last_try if last_try is not None and last_try > base else base
+
+    def _maintenance_due(self, name, state):
+        return (self.now() - self._dark_since(name, state)
+                >= self.cfg.maintenance_interval_s
+                + self._maintenance_offset(name))
+
+    def maintain(self, name, state=None):
+        """One non-blocking step of a scheduled maintenance visit.
+
+        The node is left CORDONED throughout. Uncordoning it would advertise
+        capacity that is about to be taken away again, so every visit would end
+        by draining real work under a five-minute deadline -- and the drain
+        would then be the thing keeping the node up. Cordoned, the visit costs
+        nothing but power: host-level updates, config management and anything
+        running as a DaemonSet all proceed regardless of a cordon, and if
+        demand does turn up the node is already booted and one uncordon away.
+        """
+        s = self._node(name)
+        cfg = self.cfg
+
+        if s.get("phase") != "maintaining":
+            self.log("info", "MAINTENANCE begin -- waking for updates",
+                     node=name, window_s=cfg.maintenance_window_s,
+                     dark_s=int(self.now() - self._dark_since(name, state))
+                     if state is not None else None)
+            # Stamped BEFORE the power call, and on the attempt rather than
+            # on success: a node that never comes back Ready is exactly the
+            # node that must not be retried on every tick.
+            #
+            # Stamped in dry_run too. That is internal state, not the outside
+            # world, and a shadow that does not advance its own schedule picks
+            # the same overdue node every tick forever -- re-logging one line
+            # and never once showing you the second machine it would visit.
+            s["maintenance_at"] = self.now()
+            s.pop("maintenance_until", None)
+            if cfg.mode != "on":
+                self.log("info", "dry_run: would power on for a maintenance "
+                                 "window", node=name)
+                return
+            if self.power.state(name) == "off":
+                self.power.on(name)
+            s["phase"] = "maintaining"
+            s["phase_since"] = self.now()
+            return
+
+        if self.now() - s.get("phase_since", 0) > cfg.maintenance_timeout_s:
+            if state is not None and state.ready:
+                # Up, but the visit has outstayed its bound -- a node that
+                # flapped in and out of Ready long enough to burn it. It is
+                # observable and healthy right now, so end the visit the
+                # ordinary way.
+                self._end_visit(name, state,
+                                "MAINTENANCE TIMEOUT -- ending the visit",
+                                level="error")
+                return
+            # Still NotReady when the bound fired. Let go of it, but do NOT
+            # power it off. The node is either partway through the updates it
+            # was woken to collect or it is broken, and nothing the controller
+            # can observe distinguishes those -- which is the same shape as
+            # "cannot tell whether a node is busy", and takes the same answer:
+            # assume the reading that is expensive to get wrong. Leaving a
+            # machine powered costs watts. Cutting power to one writing its own
+            # firmware costs the machine, and no remote hands can undo it.
+            #
+            # It is not abandoned silently. The node is announced down for as
+            # long as it stays down, this logs at error, and the next scheduled
+            # visit re-checks it -- while the ordinary stranded repair finishes
+            # the job the moment it comes back Ready.
+            self.log("error", "MAINTENANCE TIMEOUT -- node is still not Ready; "
+                              "leaving it powered rather than cutting power to "
+                              "a node that may be mid-update", node=name,
+                     timeout_s=cfg.maintenance_timeout_s)
+            self._release_visit(name)
+            return
+
+        if state is not None and state.ready and not state.cordoned:
+            # Somebody uncordoned it. The cordon is how a visit holds a node
+            # out of service, so losing it means an operator has decided the
+            # node should be working -- and ending the visit the normal way
+            # would drain and power off the machine they just put back. Let go
+            # of it instead; it is in service now, and the ordinary demand
+            # logic owns it from here.
+            self.log("info", "node was uncordoned during its maintenance "
+                             "window; leaving it in service", node=name)
+            self._release_visit(name)
+            return
+
+        if not (state is not None and state.ready):
+            # Two cases, and NEITHER may cut power: still booting, or gone
+            # NotReady inside its own window -- which is precisely what a node
+            # applying a kernel update and rebooting looks like. Powering that
+            # off mid-flight is the failure this feature would otherwise
+            # introduce, so the window simply waits, bounded by the timeout
+            # above.
+            if s.get("maintenance_until"):
+                self.log("info", "node went NotReady inside its maintenance "
+                                 "window; waiting for it to come back",
+                         node=name)
+            return
+
+        until = s.get("maintenance_until")
+        if until is None:
+            # Measured from READY, not from power-on: a node that took eleven
+            # minutes to POST would otherwise get no window at all.
+            s["maintenance_until"] = self.now() + cfg.maintenance_window_s
+            self.log("info", "MAINTENANCE up -- holding the node",
+                     node=name, window_s=cfg.maintenance_window_s)
+            return
+        if self.now() < until:
+            return
+        self._end_visit(name, state, "MAINTENANCE window over -- sleeping")
+
+    def _release_visit(self, name):
+        """Let go of a visit without touching the node's power.
+
+        `maintenance_at` is stamped on the way OUT as well as on the way in, so
+        the schedule runs from whichever was later. Stamped only on the way in,
+        a visit that burned its whole bound would leave the node due again the
+        instant it let go, and retry back-to-back forever.
+        """
+        s = self._node(name)
+        s["phase"] = None
+        s["maintenance_at"] = self.now()
+        s.pop("maintenance_until", None)
+
+    def _end_visit(self, name, state, reason, level="info"):
+        """Finish a visit by handing the node to the ordinary sleep path.
+
+        Every safety rule that governs a sleep governs this one: it announces
+        the shutdown, it refuses to power off a node it could not announce, and
+        it will not touch running work.
+        """
+        self._release_visit(name)
+        self.log(level, reason, node=name)
+        # Re-stamp the cordon before the drain starts. This node has been
+        # cordoned since it was PUT TO SLEEP -- possibly weeks -- and sleep()
+        # anchors its drain deadline on that timestamp, so left alone the first
+        # busy unit would trip a deadline that expired long before this drain
+        # began, and the sleep would be abandoned instantly. Re-stamping is the
+        # exact thing that is WRONG when a sleep restarts mid-drain, and the
+        # exact thing that is right here: this drain genuinely starts now.
+        try:
+            self._set_cordon(name, True)
+        except Exception as e:                        # noqa: BLE001
+            self.log("warn", "could not refresh the cordon before draining; "
+                             "the drain deadline may be short", node=name,
+                     err=str(e))
+        self.sleep(name, state)
+
+    def _overdue(self, present, states):
+        """Nodes that are asleep, ours, and due -- longest dark first."""
+        due = []
+        for n in present:
+            state = states[n]
+            if state.ready:
+                continue          # already up, and already getting its updates
+            if not (state.cordoned and state.ours):
+                # A dark node WITHOUT our cordon is not one we put to sleep.
+                # Somebody pulled it for a disk swap or a firmware flash, and
+                # powering it on underneath them is the single worst thing this
+                # feature could do. An operator's cordon outranks the
+                # controller; so does an operator's screwdriver.
+                continue
+            if self._maintenance_due(n, state):
+                due.append((self._dark_since(n, state), n))
+        # Longest dark first, so a backlog drains oldest-first rather than
+        # letting one node at the end of the node list starve behind the rest.
+        return [n for _dark, n in sorted(due)]
+
+    def _maybe_maintain(self, present, states, awake, want):
+        """Start at most one visit, and only when nothing else is happening."""
+        if not self.cfg.maintenance_interval_s:
+            return
+        if want > len(awake):
+            # Demand is unmet. Whatever the tick just did about that, a
+            # maintenance visit would be competing with it for the same
+            # hardware -- and demand is the reason this controller exists.
+            return
+        if any(self.st.get(n, {}).get("phase") for n in present):
+            # ONE line, doing two jobs. It keeps visits serialised, so a fleet
+            # never powers on in unison; and it makes maintenance yield to
+            # every wake, sleep, drain and warmup already in flight, which is
+            # what "lowest priority" has to mean in a loop that takes one
+            # corrective action per tick. A visit deferred by a tick, or by a
+            # thousand, costs nothing: the schedule is measured in days.
+            return
+        overdue = self._overdue(present, states)
+        if not overdue:
+            return
+        node = overdue[0]                 # one node at a time, one per tick
+        if len(overdue) > 1:
+            self.log("info", "more nodes are due a maintenance visit; they "
+                             "wait their turn", node=node,
+                     waiting=overdue[1:])
+        try:
+            self.maintain(node, states[node])
+        except Exception as e:                        # noqa: BLE001
+            self.log("error", "could not begin a maintenance visit",
+                     node=node, err=str(e))
+
     # -- reconcile -------------------------------------------------------
     def tick(self):
         cfg, st = self.cfg, self.st
         if cfg.mode == "off":
             self.log("info", "mode=off; no observation, no action")
             return
+        # The floor under the maintenance schedule for a node source that
+        # cannot report when a node went dark. Seeded here rather than in
+        # __init__ so that a restart -- which is what wiping `st` models --
+        # re-seeds it, exactly as a real process restart would.
+        st.setdefault("_started", self.now())
 
         # Observe. ANY failure here means no action this tick -- fail toward
         # "everything stays on", which is the whole safety posture.
@@ -391,6 +647,33 @@ class Controller:
                 self.log("info", "operator cordoned a node mid-operation; "
                                  "abandoning the operation", node=n, phase=phase)
                 st[n]["phase"] = None
+                # The visit deadline goes with the phase. Left behind, the
+                # NEXT visit would read a window that expired while an
+                # operator held the node, and end the moment it began.
+                st[n].pop("maintenance_until", None)
+                continue
+            if phase == "maintaining" and want > len(awake):
+                # Demand turned up while the node was up for its own sake.
+                # It is already booted and cordoned, which makes it the
+                # cheapest capacity available anywhere -- far cheaper than
+                # cold-starting a peer. Take it, exactly as a sleep is
+                # abandoned when demand arrives mid-drain.
+                self.log("info", "demand arrived during a maintenance window; "
+                                 "putting the node into service", node=n,
+                         want=want, awake=len(awake))
+                st[n]["phase"] = None
+                st[n].pop("maintenance_until", None)
+                if not states[n].ready:
+                    # Still booting. The wake machine finishes it properly,
+                    # and its timeout runs from power-on either way.
+                    st[n]["phase"] = "waking"
+                    continue
+                try:
+                    self._set_cordon(n, False)
+                    st[n]["awake_since"] = self.now()
+                    awake.append(n)
+                except Exception as e:                # noqa: BLE001
+                    self.log("error", "could not uncordon", node=n, err=str(e))
                 continue
             if phase == "sleeping" and want > len(awake):
                 self.log("info", "demand arrived mid-sleep; keeping the node",
@@ -407,6 +690,8 @@ class Controller:
                     self.wake(n)
                 elif phase == "warming":
                     self.warm(n)
+                elif phase == "maintaining":
+                    self.maintain(n, states[n])
                 else:
                     self.sleep(n, states[n])
             except Exception as e:                    # noqa: BLE001
@@ -509,6 +794,11 @@ class Controller:
             if last_high and now - last_high > cfg.wake_sustain_s:
                 st["want_high_since"] = None
                 st["want_high_last"] = None
+
+        # LAST, and deliberately so. Everything above is a response to demand
+        # or to an operator; a maintenance visit is neither, so it gets what is
+        # left over and nothing more.
+        self._maybe_maintain(present, states, awake, want)
 
 
 def _default_log(level, msg, **kv):
