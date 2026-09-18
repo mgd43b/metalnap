@@ -5,7 +5,8 @@ serving CI, asleep most of the day.
 
 ```python
 from metalnap import Config, Controller
-from metalnap.kube import Kube, KubeNodeSource
+from metalnap.kube import Kube, KubeNodeSource, PendingPodFit
+from metalnap.notify import AlertmanagerNotifier
 from metalnap.power import IpmiPower
 from metalnap.signal import PrometheusSignal
 from metalnap.drain import ArcDrain
@@ -32,8 +33,16 @@ Controller(
                     user=os.environ["BMC_USER"],
                     password=os.environ["BMC_PASS"]),
     signal=PrometheusSignal(os.environ["PROM_URL"], SHORTFALL,
-                            ARC_SATURATION_QUERY),
+                            ARC_SATURATION_QUERY,
+                            # Without it, "does the waiting work fit here?"
+                            # always answers yes.
+                            fit_check=PendingPodFit(kube, "arc-runners",
+                                                    toleration_key="ci-burst")),
     drain=ArcDrain(kube, namespace="arc-runners"),
+    # Optional in the protocol, not in practice: without it every sleep looks
+    # like a node dying. It mutes only nodes metalnap put down, and raises
+    # MetalnapNodeNeedsAttention when one needs a human.
+    notifier=AlertmanagerNotifier(os.environ["ALERTMANAGER_URL"]),
     config=Config(),
 ).run_forever()
 ```

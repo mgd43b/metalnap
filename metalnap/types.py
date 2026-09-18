@@ -43,6 +43,28 @@ class NodeState:
     #: falls back to its own start time, which is safe but resets the
     #: maintenance clock on every restart.
     down_since: Optional[float] = None
+    # -- durable notes ----------------------------------------------------
+    # What this controller has to remember about a node across its own
+    # restarts. Each lives ON THE NODE (see NodeSource.note), because each one
+    # held in memory was a way for a restart to undo a safety decision.
+    #
+    #: When this controller last power-cycled the node. It bounds cycles to
+    #: one per node per POWER_CYCLE_COOLDOWN_S; in memory, a controller that
+    #: restarted more often than a broken machine fails to boot would cycle it
+    #: indefinitely.
+    power_cycled_at: Optional[float] = None
+    #: When a maintenance visit last powered the node on. A node dark soon
+    #: after one may be rebooting into firmware it just installed, and must
+    #: not be power-cycled; in memory, a restart mid-update forgot that.
+    visited_at: Optional[float] = None
+    #: When a soft shutdown was requested and not yet confirmed. The kubelet
+    #: reports Ready for most of a minute after the OS starts going down; in
+    #: memory, a restart in that minute read the node as stranded and sent a
+    #: second soft-off into the shutdown.
+    shutdown_at: Optional[float] = None
+    #: Why this controller handed the node to a human, or None. In memory, a
+    #: restart re-muted a node it had given up on and resolved its alert.
+    trouble: Optional[str] = None
 
 
 class NodeSource(Protocol):
@@ -53,6 +75,23 @@ class NodeSource(Protocol):
 
     def set_cordon(self, name: str, cordoned: bool) -> None:
         """Cordon/uncordon, stamping or clearing this controller's ownership."""
+
+    def note(self, name: str, key: str, value) -> None:
+        """Durably record one of the notes above; None removes it.
+
+        OPTIONAL. `key` is "power-cycled", "visited" or "shutdown" with a
+        unix timestamp, or "trouble" with a reason. Without it the controller
+        never power-cycles -- a cycle it cannot put on record is one the bound
+        cannot see -- and remembers the rest only until it restarts.
+        """
+
+    def disown(self, name: str) -> None:
+        """Remove this controller's ownership mark WITHOUT touching the cordon.
+
+        OPTIONAL; set_cordon(name, False) is the fallback. Used when the mark
+        has outlived its cordon, where writing the cordon at all would undo an
+        operator who re-cordoned the node a moment ago.
+        """
 
 
 class PowerBackend(Protocol):
@@ -66,6 +105,17 @@ class PowerBackend(Protocol):
 
     def soft_off(self, name: str) -> None:
         """Request a graceful shutdown. Never a hard cut."""
+
+    def cycle(self, name: str) -> None:
+        """Hard power cycle: off, then on again. OPTIONAL.
+
+        Without it a wedged node is alerted on rather than cycled. The one
+        hard cut in this protocol, and it is reserved for a single
+        case: a node that is powered, has not been Ready for a full wake
+        timeout, and that no operator holds. A machine whose kernel has locked
+        up ignores a soft shutdown and reads "on" to its BMC for as long as
+        anyone cares to wait, so without this the only remedy is a human.
+        """
 
 
 class DemandSignal(Protocol):
@@ -183,10 +233,29 @@ class Notifier(Protocol):
     """
 
     def going_down(self, node: str) -> None:
-        """Called before a node is powered off, and while it stays down."""
+        """Called before a node is powered off, and while it stays down.
+
+        ONLY for a node this controller put down. A managed node that crashed
+        looks exactly like one that was slept -- dark, unreachable -- and
+        muting it as though it were routine is the one mistake a notifier must
+        never make, because the more reliable the sleeps are, the more routine
+        a crash looks.
+        """
 
     def back_up(self, node: str) -> None:
-        """Called once a node is serving again. Must clear `going_down`."""
+        """Called for every node NOT deliberately down. Must clear
+        `going_down`: a node that is up, or that is down for any reason other
+        than this controller, must not be left muted."""
+
+    def alert(self, node: str, reason: str) -> None:
+        """A managed node needs a human, and the controller has stopped trying.
+
+        Called every tick while it holds -- a node that stayed powered but not
+        Ready through a power cycle, one that could not be cycled, one that
+        would not power off. Never for a node that is merely asleep."""
+
+    def clear_alert(self, node: str) -> None:
+        """Called every tick the node is NOT in trouble. Must clear `alert`."""
 
 
 class Warmup(Protocol):
@@ -221,6 +290,12 @@ class NullNotifier:
         pass
 
     def back_up(self, node):
+        pass
+
+    def alert(self, node, reason):
+        pass
+
+    def clear_alert(self, node):
         pass
 
 

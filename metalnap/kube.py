@@ -1,7 +1,8 @@
 """Minimal Kubernetes client and a NodeSource over it.
 
-Deliberately not the official client: this needs six calls, and a REST client
-with no dependency surface keeps the image small and the failure modes legible.
+Deliberately not the official client: this needs a few verbs on a few
+resources, and a REST client with no dependency surface keeps the image small
+and the failure modes legible.
 """
 import json
 import requests
@@ -63,8 +64,14 @@ class KubeNodeSource:
     PROTECTED_LABELS = ("node-role.kubernetes.io/control-plane",
                         "node-role.kubernetes.io/master")
 
+    #: Where the controller's durable notes live: `<prefix><key>`, so
+    #: metalnap.io/power-cycled and friends. Not derived from the cordon
+    #: annotation: that one is configurable so a predecessor's name can be
+    #: kept, and these have no predecessor.
+    NOTE_PREFIX = "metalnap.io/"
+
     def __init__(self, kube, annotation, capacity_of=None,
-                 protected_labels=None):
+                 protected_labels=None, note_prefix=None):
         self.protected_labels = (protected_labels
                                  if protected_labels is not None
                                  else self.PROTECTED_LABELS)
@@ -72,6 +79,7 @@ class KubeNodeSource:
         #: Presence of this annotation marks a cordon as ours. Anything else is
         #: an operator's, and is never touched.
         self.annotation = annotation
+        self.note_prefix = note_prefix or self.NOTE_PREFIX
         self.capacity_of = capacity_of or (
             lambda n: mem_to_gib(n["status"].get("allocatable", {})
                                  .get("memory", "0")))
@@ -90,27 +98,15 @@ class KubeNodeSource:
                 # heartbeating goes to "Unknown", not "False", and that is the
                 # state a powered-off node actually sits in.
                 ready = c["status"] == "True"
-                from datetime import datetime
-                try:
-                    ts = datetime.fromisoformat(
-                        c["lastTransitionTime"].replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:              # noqa: BLE001
-                    ts = None
+                ts = _timestamp(c.get("lastTransitionTime"))
                 # One condition, one transition time: it is when the node
                 # became Ready, or when it stopped being. Which of the two it
                 # is depends entirely on where the condition stands now.
                 ready_since, down_since = (ts, None) if ready else (None, ts)
         anns = n["metadata"].get("annotations") or {}
-        ours_since = None
-        if anns.get(self.annotation):
-            from datetime import datetime
-            try:
-                ours_since = datetime.fromisoformat(
-                    anns[self.annotation].replace("Z", "+00:00")).timestamp()
-            except Exception:                  # noqa: BLE001
-                ours_since = None
         labels = n["metadata"].get("labels") or {}
+        notes = {k[len(self.note_prefix):]: v for k, v in anns.items()
+                 if k.startswith(self.note_prefix) and k != self.annotation}
         return NodeState(
             ready=ready,
             cordoned=bool(n["spec"].get("unschedulable")),
@@ -118,20 +114,59 @@ class KubeNodeSource:
             ready_since=ready_since,
             capacity=self.capacity_of(n),
             protected=any(l in labels for l in self.protected_labels),
-            ours_since=ours_since,
+            ours_since=_timestamp(anns.get(self.annotation)),
             down_since=down_since,
+            power_cycled_at=_timestamp(notes.get("power-cycled")),
+            visited_at=_timestamp(notes.get("visited")),
+            shutdown_at=_timestamp(notes.get("shutdown")),
+            trouble=notes.get("trouble") or None,
         )
 
     def set_cordon(self, name, cordoned):
-        from datetime import datetime, timezone
         # Ownership and the cordon move together, in ONE patch. Split across
         # two calls, a crash between them leaves a cordon nobody claims.
         self.kube.request("PATCH", "/api/v1/nodes/" + name, {
             "spec": {"unschedulable": bool(cordoned)},
             "metadata": {"annotations": {
-                self.annotation: (datetime.now(timezone.utc).isoformat()
-                                  if cordoned else None)}},
+                self.annotation: _now_iso() if cordoned else None}},
         })
+
+    def note(self, name, key, value):
+        # Metadata only. The cordon is not ours to touch here: the node noted
+        # is as likely to be an uncordoned one that crashed in service as one
+        # we put to sleep. None deletes the annotation; a timestamp is written
+        # as RFC 3339, for whoever reads it off `kubectl describe node`.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            from datetime import datetime, timezone
+            value = datetime.fromtimestamp(value, timezone.utc).isoformat()
+        self.kube.request("PATCH", "/api/v1/nodes/" + name, {
+            "metadata": {"annotations": {self.note_prefix + key: value}},
+        })
+
+    def disown(self, name):
+        self.kube.request("PATCH", "/api/v1/nodes/" + name, {
+            "metadata": {"annotations": {self.annotation: None}},
+        })
+
+
+def _timestamp(value):
+    """An RFC 3339 string as unix time; None for absent or unparseable.
+
+    Unparseable reads as absent rather than raising: every caller treats None
+    as "no durable evidence", and the fallbacks for that are all safe.
+    """
+    if not value:
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:                          # noqa: BLE001
+        return None
+
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 class PendingPodFit:

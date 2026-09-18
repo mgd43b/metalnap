@@ -30,6 +30,16 @@
 {{- end }}
 {{- end }}
 {{- end }}
+{{- /*
+  Same reasoning, same duplication with metalnap/config.py: a cooldown shorter
+  than the wake it is judged by lets the next power cycle land before the last
+  one had a chance to work.
+*/ -}}
+{{- with .Values.timers }}
+{{- if and (gt (int .powerCycleCooldownS) 0) (lt (int .powerCycleCooldownS) (int .wakeTimeoutS)) }}
+{{- fail (printf "timers.powerCycleCooldownS (%v) must be 0 or at least timers.wakeTimeoutS (%v), or a node could be power-cycled again before the last cycle had a chance to work" .powerCycleCooldownS .wakeTimeoutS) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -45,13 +55,18 @@ data:
   {{- with .Values.alertmanager.url }}
   ALERTMANAGER_URL: {{ . | quote }}
   {{- end }}
+  ALERTMANAGER_SILENCE_LABELS: {{ join "," .Values.alertmanager.silenceLabels | quote }}
+  {{- with .Values.alertmanager.silenceMatchers }}
+  {{- /* One per line: a regex matcher may itself contain commas. */}}
+  ALERTMANAGER_SILENCE_MATCHERS: {{ join "\n" . | quote }}
+  {{- end }}
   {{- with .Values.warmup.image }}
   WARMUP_IMAGE: {{ . | quote }}
   {{- end }}
   {{- with .Values.warmup.pullSecrets }}
   WARMUP_PULL_SECRETS: {{ join "," . | quote }}
   {{- end }}
-  WARMUP_TIMEOUT_S: {{ .Values.timers.warmupTimeoutS | default 900 | quote }}
+  WARMUP_TIMEOUT_S: {{ .Values.timers.warmupTimeoutS | quote }}
   ARC_NAMESPACE: {{ .Values.arc.namespace | quote }}
   CORDON_ANNOTATION: {{ .Values.cordonAnnotation | quote }}
   INTERVAL_S: {{ .Values.timers.intervalS | quote }}
@@ -62,6 +77,9 @@ data:
   DRAIN_TIMEOUT_S: {{ .Values.timers.drainTimeoutS | quote }}
   MAX_SLEEP_ATTEMPTS: {{ .Values.timers.maxSleepAttempts | quote }}
   SLEEP_COOLDOWN_S: {{ .Values.timers.sleepCooldownS | quote }}
+  {{- /* No `| default`: 0 is meaningful (escalation off), and default eats 0. */}}
+  POWER_CYCLE_COOLDOWN_S: {{ .Values.timers.powerCycleCooldownS | quote }}
+  SHUTDOWN_TIMEOUT_S: {{ .Values.timers.shutdownTimeoutS | quote }}
   DEFAULT_CAPACITY: {{ .Values.timers.defaultCapacityGib | quote }}
   {{- with .Values.maintenance }}
   {{- /*

@@ -16,7 +16,11 @@ The cluster model is faithful on the points a controller gets wrong:
   * an idle worker NEVER exits by itself. Only finishing work, or an explicit
     release, removes one.
   * power transitions take time, so the controller observes NotReady-but-
-    powered and Ready-but-cordoned intermediate states.
+    powered and Ready-but-cordoned intermediate states -- and the kubelet is
+    reported Ready for a while after the BMC already reads off, sometimes past
+    the next tick, which is where a controller that trusts either signal
+    alone sends a second shutdown into the first.
+  * a node sometimes IGNORES a soft shutdown and stays up.
   * an operator periodically takes a node for maintenance, cordoning it
     WITHOUT the controller's annotation.
   * a node woken for a SCHEDULED maintenance visit sometimes reboots into the
@@ -25,6 +29,17 @@ The cluster model is faithful on the points a controller gets wrong:
     machine, so it is modelled and asserted rather than assumed.
   * demand is phased and, in one mode, deliberately shaped to flicker: parked
     just below one node's worth while saturation toggles around a ceiling.
+  * a node WEDGES: its kernel locks up while it is in service, or during a
+    boot, and it stays powered and NotReady -- ignoring a soft shutdown --
+    until something power-cycles it. Some are simply broken, and wedge again
+    after every cycle until an operator takes them away and fixes them. This
+    is the shape of the 2026-09-17 incident, and before it was modelled the
+    harness passed a controller that retried a wedged node's wake forever and
+    muted it the whole time.
+  * a node is PARTITIONED: NotReady to the cluster while its work carries on,
+    until the partition heals. From outside it looks exactly like a wedge, and
+    it is the case that makes "never interrupt running work" apply to a power
+    cycle too.
 
 Four things this harness got WRONG before it got them right, each of which made
 it report OK while testing nothing:
@@ -67,6 +82,31 @@ model of what the fleet ought to be doing, not just what it is doing, to see
 them. The two 30/30 rows are the ones that destroy hardware, and they are the
 ones this harness is good at.
 
+and for wedged, partitioned and shutdown-ignoring nodes (60 x 900):
+
+    a crashed node muted like a slept one (#14)          60/60
+    a power cycle made before it is on record            48/60
+    a wedged node's wake retried forever (#13)           29/60
+    recovery re-alerting from a stale note               23/60
+    a node handed to a human left muted                  14/60
+    the cycle cooldown forgotten across a restart        12/60
+    a shutdown not resumed after a restart                6/60
+    a hand-off forgotten across a restart                 4/60
+    a node dark mid-drain muted as asleep                 3/60
+    a power cycle over running work (a partition)         3/60
+    a power cycle mid-update after a visit                1/60
+    every visit renewing the mid-update grace             1/60
+    "would not power off" outliving the retry             1/60
+    a sleep "complete" at the soft-off request            0/60
+    a sleeping node never checked for power               0/60
+    no operator check at the moment of the cycle          0/60
+    a booting node not counted (one node per tick)        0/60
+
+Every row here -- the zeroes and the ones -- also fails a deterministic test.
+The low rows are the ones that need two rare things at once (a restart inside
+a shutdown, a partition that outlasts a wake timeout, a visit's reboot that
+wedges), which is exactly why the deterministic test comes first.
+
 The low-rate rows are BACKSTOPS, not primary cover. Anything guarding running
 work or an operator's cordon also has a deterministic test in
 test_controller.py, because a 1-in-60 chance is not a safety guarantee. Use
@@ -93,7 +133,11 @@ from metalnap import Config, Controller           # noqa: E402
 from metalnap.types import NodeState              # noqa: E402
 
 BOOT_S = 150.0
-SHUTDOWN_S = 60.0
+#: How long the kubelet is still reported Ready after the BMC reads off --
+#: drawn per shutdown, either side of one tick. Fixed at one tick, the harness
+#: flipped every node NotReady before the controller could look, and the
+#: window a real one sees for most of a minute was never observed at all.
+SHUTDOWN_S = (20.0, 110.0)
 CAPACITY = 125.7
 
 
@@ -122,6 +166,20 @@ class Node:
         #: Powering a node off in this state is how a scheduled update turns
         #: into an unbootable machine.
         self.updating = None
+        #: Powered and NotReady, and staying that way: a locked kernel. Only a
+        #: power cycle clears it, and a soft shutdown does nothing at all.
+        self.hung = False
+        #: Wedges again after every boot, until an operator repairs it.
+        self.broken = False
+        #: NotReady to the cluster, but running: work carries on and finishes.
+        #: The tick the partition heals at, or None.
+        self.partitioned = None
+        #: DURABLE notes, like `ours`: they live on the node and survive the
+        #: controller restarts injected below.
+        self.power_cycled_at = self.visited_at = self.shutdown_at = None
+        self.trouble = None
+        #: Ignored the last soft shutdown, and is still up because of it.
+        self.ignored_off = False
 
 
 class Sim:
@@ -149,7 +207,13 @@ class Sim:
         self.unvisited_since = {}
         self.visit_since = {}
         self.notified = {}
+        self.alerted = {}
         self.warming = {}
+        self.cycles = {}
+        self.bad_cycle = []
+        self.muted_hung_since = {}
+        self.was_ours = {}
+        self.stuck_wake_since = {}
         #: Set once run() builds it. The reboot model reads the controller's
         #: own phase, which is the only honest way to tell a maintenance visit
         #: apart from a drain that happens to look identical from outside.
@@ -172,11 +236,15 @@ class Sim:
         visit YIELDS to, so a long interval buries the schedule's own
         contribution under them and the check stops being able to see it.
         """
+        # A third of the seeds shorten the power-cycle cooldown to an hour, so
+        # a broken node is cycled more than once in a run and the bound is
+        # actually tested rather than trivially satisfied by the default day.
+        esc = {} if seed % 3 else dict(power_cycle_cooldown_s=3600)
         if seed % 2 == 0:
-            return Config(mode="on")
+            return Config(mode="on", **esc)
         return Config(mode="on", maintenance_interval_s=1800,
                       maintenance_window_s=300, maintenance_stagger_s=600,
-                      maintenance_timeout_s=1200)
+                      maintenance_timeout_s=1200, **esc)
 
     # -- clock -----------------------------------------------------------
     def now(self):
@@ -188,6 +256,11 @@ class Sim:
             if n.change_at is not None and self.t >= n.change_at:
                 was = n.ready
                 n.ready = n.powered
+                if n.ready and (n.broken or self.rnd.random() < 0.02):
+                    # Wedged during boot: powered, and never comes up. An
+                    # update reboot that wedges has FINISHED rebooting -- into
+                    # a hang -- so there is no update left to interrupt.
+                    n.ready, n.hung, n.updating = False, True, None
                 if n.ready and not was:
                     n.ready_since = self.t
                     n.updating = None            # it came back on its own
@@ -207,7 +280,10 @@ class Sim:
                          # durable: survives the controller restarts injected
                          # below, which is the whole point of it
                          ours_since=n.ours,
-                         down_since=None if n.ready else n.down_since)
+                         down_since=None if n.ready else n.down_since,
+                         power_cycled_at=n.power_cycled_at,
+                         visited_at=n.visited_at,
+                         shutdown_at=n.shutdown_at, trouble=n.trouble)
 
     def set_cordon(self, name, cordoned):
         n = self.nodes[name]
@@ -215,6 +291,15 @@ class Sim:
             self.stomped.append((self.t, name, "uncordoned an operator"))
         n.cordoned = cordoned
         n.ours = self.t if cordoned else None
+
+    def note(self, name, key, value):
+        setattr(self.nodes[name], {"power-cycled": "power_cycled_at",
+                                   "visited": "visited_at",
+                                   "shutdown": "shutdown_at",
+                                   "trouble": "trouble"}[key], value)
+
+    def disown(self, name):
+        self.nodes[name].ours = None
 
     # -- PowerBackend ----------------------------------------------------
     def power_state(self, name):
@@ -236,9 +321,48 @@ class Sim:
             if w.node == name and w.work:
                 self.powered_off_busy.append((self.t, name, w.name, w.work))
         n = self.nodes[name]
+        if n.hung:
+            return          # a locked kernel does not act on an ACPI request
+        if n.powered and not n.ignored_off and self.rnd.random() < 0.05:
+            n.ignored_off = self.t     # this once; the next request is heard
+            return
+        n.ignored_off = False
         if n.powered:
             n.powered = False
-            n.change_at = self.t + SHUTDOWN_S
+            n.change_at = self.t + self.rnd.uniform(*SHUTDOWN_S)
+        self.workers = [w for w in self.workers if w.node != name]
+
+    def power_cycle(self, name):
+        n = self.nodes[name]
+        if name in self.human_held:
+            self.stomped.append((self.t, name, "power-cycled while held"))
+        if n.updating:
+            self.interrupted_update.append((self.t, name))
+            n.updating = None
+        for w in self.workers:
+            if w.node == name and w.work:
+                self.bad_cycle.append((self.t, name, "power-cycled a node "
+                                       "running %s" % w.work))
+        if n.ready:
+            self.bad_cycle.append((self.t, name, "power-cycled a Ready node"))
+        if not n.powered:
+            self.bad_cycle.append((self.t, name, "power-cycled a node that "
+                                                 "was off"))
+        if n.power_cycled_at != self.t:
+            self.bad_cycle.append((self.t, name, "power-cycled without "
+                                                 "recording it first"))
+        last = self.cycles.get(name)
+        if (last is not None
+                and self.t - last < self.cfg.power_cycle_cooldown_s):
+            self.bad_cycle.append((self.t, name, "power-cycled %.0fs after "
+                                   "the last cycle (cooldown %ds)"
+                                   % (self.t - last,
+                                      self.cfg.power_cycle_cooldown_s)))
+        self.cycles[name] = self.t
+        n.hung, n.powered, n.ready = False, True, False
+        n.partitioned = None
+        n.ignored_off = False
+        n.change_at = self.t + BOOT_S
         self.workers = [w for w in self.workers if w.node != name]
 
     # -- DemandSignal ----------------------------------------------------
@@ -260,6 +384,12 @@ class Sim:
 
     def back_up(self, node):
         self.notified[node] = "up"
+
+    def alert(self, node, reason):
+        self.alerted[node] = reason
+
+    def clear_alert(self, node):
+        self.alerted.pop(node, None)
 
     # -- Warmup ----------------------------------------------------------
     def start(self, node):
@@ -383,6 +513,43 @@ class Sim:
                 # the controller deciding to, not the clock running out.
                 n.change_at = self.t + 2 * self.cfg.interval_s + BOOT_S
 
+        # A node wedges. In service, mostly -- that is the incident -- but
+        # anywhere it is powered and up, an operator's node included, because
+        # the guard against cycling a node someone is working on has to be
+        # exercised by one that genuinely needs cycling.
+        for n in self.nodes.values():
+            if (n.powered and n.ready and n.updating is None
+                    and self.rnd.random() < 0.003):
+                n.ready = False
+                n.down_since = self.t
+                if self.rnd.random() < 0.3:
+                    # Partitioned, not wedged. Its units stay, and so does their
+                    # work -- it carries on, and a power cycle would kill it.
+                    n.partitioned = self.t + self.rnd.randint(
+                        10, 40) * self.cfg.interval_s
+                    continue
+                n.hung = True
+                n.broken = self.rnd.random() < 0.3
+                # Its work died with it. Leaving the units behind would
+                # have the harness blame the controller for "interrupting"
+                # work the machine had already lost.
+                self.workers = [w for w in self.workers if w.node != n.name]
+            elif n.partitioned is not None and self.t >= n.partitioned:
+                n.partitioned = None
+                n.ready, n.ready_since = n.powered, self.t
+
+        # An operator eventually takes a broken node away and repairs it. They
+        # remove metalnap's mark as they cordon, which is what taking a node
+        # from the controller means; and it is back in service when released.
+        for n in self.nodes.values():
+            if (n.broken and n.hung and n.name not in self.human_held
+                    and self.rnd.random() < 0.01):
+                self.human_held.add(n.name)
+                n.cordoned, n.ours = True, None
+                n.broken = n.hung = False
+                n.powered, n.ready = True, False
+                n.change_at = self.t + BOOT_S
+
         # An operator takes a node for maintenance, and later releases it.
         for n in self.nodes.values():
             if n.name in self.human_held:
@@ -436,15 +603,89 @@ class Sim:
         # its next real failure, which is worse than the noise it suppressed.
         for n in self.nodes.values():
             ann = self.notified.get(n.name)
+            ours = n.cordoned and n.ours is not None
             # `powered AND ready` -- not ready alone. A node mid-shutdown is
             # briefly still Ready while the OS goes down, and announcing it as
             # down is exactly right there.
-            if n.powered and n.ready and ann == "down":
+            # Save for one that ignored a shutdown: nothing can know that
+            # until the shutdown has had its bound, and it is muted meanwhile.
+            ignoring = (n.ignored_off and self.t - n.ignored_off
+                        <= self.cfg.shutdown_timeout_s + self.cfg.interval_s)
+            if n.powered and n.ready and ann == "down" and not ignoring:
                 fail("%s is Ready but still announced as down -- a real "
                      "failure of it would be silenced" % n.name)
-            if not n.powered and ann != "down":
+            if not n.powered and ours and ann != "down":
                 fail("%s was powered off without being announced as down "
                      "(announced=%r)" % (n.name, ann))
+            # The incident: a node that went down on its own, muted as though
+            # it had been slept. Only a node carrying OUR cordon may be muted.
+            if ann == "down" and not ours:
+                fail("%s is announced down without carrying our cordon -- it "
+                     "went down on its own, and its alerts are muted" % n.name)
+            # Never about a node that is fine -- save the one that ignored a
+            # shutdown, which is Ready and exactly what the alert is for.
+            # The ignored-shutdown exemption holds only while metalnap is still
+            # asking -- the node carries our cordon, or did a tick ago (the
+            # alert is raised before the stranded repair can uncordon it).
+            asking = n.ignored_off and (ours or self.was_ours.get(n.name))
+            if n.name in self.alerted and (
+                    (n.powered and n.ready and not asking)
+                    or (not n.powered and not n.ready)):
+                fail("%s is alerted on while %s" % (
+                    n.name, "Ready" if n.ready else "asleep"))
+            # A wedged node may be muted while metalnap is still entitled to
+            # believe it is shutting down or booting -- never beyond. Measured
+            # per controller lifetime: a restart wipes what it had learned,
+            # and re-learning it takes one more of the same windows.
+            if n.hung and ann == "down":
+                self.muted_hung_since.setdefault(n.name, self.t)
+                budget = (self.cfg.shutdown_timeout_s
+                          + 2 * self.cfg.wake_timeout_s
+                          + 4 * self.cfg.interval_s
+                          # A node that went dark during a maintenance visit
+                          # gets two visit bounds from the visit's power-on
+                          # before anything cuts its power: it may be
+                          # rebooting into an update.
+                          + (2 * self.cfg.maintenance_timeout_s
+                             if self.cfg.maintenance_interval_s else 0))
+                if self.t - self.muted_hung_since[n.name] > budget:
+                    fail("%s is wedged and has been muted for %.0fs "
+                         "(budget %.0fs)" % (
+                             n.name, self.t - self.muted_hung_since[n.name],
+                             budget))
+            else:
+                self.muted_hung_since.pop(n.name, None)
+
+        self.was_ours = {n.name: n.cordoned and n.ours is not None
+                         for n in self.nodes.values()}
+        if self.bad_cycle:
+            fail("unsafe power cycle: %s" % (self.bad_cycle[0],))
+        # Once a wake has found a wedged node, it must be cycled back to
+        # health or handed to a human within bound. The clock starts at the
+        # first wake and does NOT reset when that wake times out: timing out
+        # and being chosen again, silently, for 21 hours, is the incident --
+        # and a clock that restarted with each attempt never saw it.
+        for n in self.nodes.values():
+            waking = (self.controller is not None
+                      and (self.controller.st.get(n.name) or {}).get("phase")
+                      == "waking")
+            if not n.hung or n.name in self.alerted:
+                self.stuck_wake_since.pop(n.name, None)
+                continue
+            if waking:
+                self.stuck_wake_since.setdefault(n.name, self.t)
+            if n.name in self.stuck_wake_since:
+                budget = (2 * self.cfg.wake_timeout_s
+                          + self.cfg.wake_sustain_s + 4 * self.cfg.interval_s
+                          # the mid-update grace a visit's power-on buys
+                          + (2 * self.cfg.maintenance_timeout_s
+                             if self.cfg.maintenance_interval_s else 0))
+                if self.t - self.stuck_wake_since[n.name] > budget:
+                    fail("%s is wedged, was woken %.0fs ago, and has been "
+                         "neither cycled back nor handed to a human (budget "
+                         "%.0fs)" % (n.name,
+                                     self.t - self.stuck_wake_since[n.name],
+                                     budget))
 
         if self.powered_off_busy:
             fail("powered off a node running work: %s"
@@ -530,8 +771,12 @@ class Sim:
                       if self.cfg.maintenance_interval_s else 0))
                   / self.cfg.interval_s) + 25
         for n in self.nodes.values():
+            # A wedged node is not sleepable: a soft shutdown does nothing to
+            # it and a hard cut is not metalnap's to make. It is left loud or
+            # alerted, for a human -- which the notification checks assert.
             sleepable = (self.busy_phase is False
-                         and n.powered
+                         and n.powered and not n.hung
+                         and n.partitioned is None
                          and n.name not in self.human_held
                          and not any(w.node == n.name and w.work
                                      for w in self.workers))
@@ -622,10 +867,16 @@ class Sim:
         # resets on any dip measures the flicker -- which is the mistake the
         # controller itself once made -- and a +1/-1 decay cancels exactly
         # under a 50/50 oscillation and never fires either.
-        need = min(len(self.nodes),
+        # A wedged node is not capacity the controller can provide -- it has
+        # tried, cycled and handed it to a human -- so it does not raise the
+        # ceiling either. Whether it escalated at all is asserted separately.
+        need = min(sum(1 for n in self.nodes.values()
+                       if not n.hung and n.partitioned is None),
                    math.ceil((self.demand + self.saturated * CAPACITY)
                              / CAPACITY))
-        powered = sum(1 for n in self.nodes.values() if n.powered)
+        # A wedged node is powered and serves nothing, so it is not capacity.
+        powered = sum(1 for n in self.nodes.values()
+                      if n.powered and not n.hung and n.partitioned is None)
         self.need_window.append(need > powered)
         if len(self.need_window) > 40:
             self.need_window.pop(0)
@@ -654,6 +905,8 @@ class Sim:
                 self.step_workload()
                 if self.rnd.random() < restart_prob:
                     c.st = {}          # a restart loses in-memory state
+                    self.muted_hung_since.clear()
+                    self.stuck_wake_since.clear()
                 self.blocked = None
                 c.tick()
                 self.check(i)
@@ -675,6 +928,9 @@ class _Power:
 
     def soft_off(self, name):
         self.sim.soft_off(name)
+
+    def cycle(self, name):
+        self.sim.power_cycle(name)
 
 
 def main():

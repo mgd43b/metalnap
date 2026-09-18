@@ -14,7 +14,8 @@ metadata:
 rules:
   # patch is for cordon/uncordon and the ownership annotation, which move
   # together in a single patch -- split across two calls, a crash between them
-  # leaves a cordon nobody claims.
+  # leaves a cordon nobody claims -- and for the metalnap.io/ notes it keeps
+  # across restarts (the power-cycle record among them), metadata-only.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "patch"]

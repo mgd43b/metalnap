@@ -17,9 +17,21 @@ Required:
 
 Optional:
     MODE                    off | dry_run | on          (default dry_run)
-    ALERTMANAGER_URL        silence a node's alerts while it is down.
-                            STRONGLY recommended -- without it every sleep
-                            looks like a node dying and pages someone.
+    ALERTMANAGER_URL        silence a node's alerts while it is down, and
+                            raise MetalnapNodeNeedsAttention when a node needs
+                            a human. STRONGLY recommended -- without it every
+                            sleep looks like a node dying and pages someone.
+    ALERTMANAGER_SILENCE_LABELS
+                            comma-separated labels a node's alerts name it by;
+                            one silence each (default instance,node).
+                            kube-state-metrics alerts use `node`, relabelled
+                            node-exporter alerts use `instance`.
+    ALERTMANAGER_SILENCE_MATCHERS
+                            extra matchers ANDed into every silence, one per
+                            LINE, in amtool syntax -- e.g.
+                            alertname=~"KubeNodeUnreachable|KubeletInstanceUnreachable"
+                            to mute only what a sleep is expected to trip.
+                            Lines, not commas: regexes contain commas.
     WARMUP_IMAGE            pull this onto a node after waking it, so the
                             first jobs do not each pay for it
     WARMUP_PULL_SECRETS     comma-separated imagePullSecrets for the above
@@ -40,6 +52,15 @@ Optional:
     MAINTENANCE_STAGGER_S   per-node spread, so a rack does not power on in
                             unison (default 3600)
     MAINTENANCE_TIMEOUT_S   bound on one visit (default 3600)
+    POWER_CYCLE_COOLDOWN_S  a node still powered but not Ready at its wake
+                            timeout is power-cycled, at most once per node per
+                            this long (default 86400); 0 disables it. Bounded
+                            by the metalnap.io/power-cycled annotation, so a
+                            restart cannot re-arm it; delete that annotation to
+                            re-arm it by hand.
+    SHUTDOWN_TIMEOUT_S      how long a soft shutdown may take before the node
+                            is reported as one that would not power off
+                            (default 600). Never forced.
     ... plus every timer in metalnap/config.py
 """
 import os
@@ -93,7 +114,20 @@ def main(argv=None):
     # Silencing is opt-in by URL, but strongly recommended: without it every
     # sleep looks like a node dying and pages someone.
     am = os.environ.get("ALERTMANAGER_URL")
-    notifier = AlertmanagerNotifier(am) if am else None
+    notifier = None
+    if am:
+        labels = [l.strip() for l in os.environ.get(
+            "ALERTMANAGER_SILENCE_LABELS", "instance,node").split(",")
+            if l.strip()]
+        matchers = [m.strip() for m in os.environ.get(
+            "ALERTMANAGER_SILENCE_MATCHERS", "").splitlines() if m.strip()]
+        try:
+            notifier = AlertmanagerNotifier(am, labels=labels,
+                                            matchers=matchers)
+        except ValueError as e:
+            # At start, not at the first sleep: a matcher that cannot parse
+            # would otherwise surface as a node that refuses to power off.
+            sys.exit("metalnap: bad Alertmanager silence config: %s" % e)
 
     # Warming is opt-in by image. Without it the first work after a wake pays
     # the pull.

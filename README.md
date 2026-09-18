@@ -33,7 +33,7 @@ full provisioning and inventory management (use Metal3).
 Extracted from a controller that has been sleeping and waking a two-node
 Supermicro Twin serving GitHub Actions CI.
 
-> **Status: v0.1, early.** The core is exercised hard — see [Testing](#testing)
+> **Status: pre-1.0, early.** The core is exercised hard — see [Testing](#testing)
 > — but the API is not stable and it has run in exactly one environment. The
 > safety rules below are the mature part; the packaging is not.
 
@@ -81,6 +81,15 @@ Every one of these exists because breaking it cost something real.
   it up at the exact moment demand finally wanted it. Scheduled wakeups fix
   that — and they are the lowest-priority thing the controller does, yielding
   to demand, to an operator, and to any operation already in flight.
+- **Mute only what you put down.** A node that crashed looks exactly like one
+  that was slept — dark, unreachable — and the more reliable the sleeps are,
+  the more routine a crash looks. Silencing every dark managed node once kept a
+  crashed one quiet for 21 hours.
+- **Escalate once, then hand it to a human.** A machine whose kernel has locked
+  up reads "on" to its BMC and ignores a soft shutdown indefinitely; one power
+  cycle is what a person would try first. One that needs a second inside the
+  cooldown needs the person — see [When a node will not come
+  back](#when-a-node-will-not-come-back).
 
 ## The three seams
 
@@ -91,18 +100,36 @@ Implement three small duck-typed interfaces (`metalnap/types.py`):
 |---|---|---|
 | `DemandSignal` | how much capacity is wanted, and would it fit here? | `PrometheusSignal` + `PendingPodFit` |
 | `DrainPolicy` | what is *busy* here, and how do I release an idle unit? | `ArcDrain` (GitHub ARC runners) |
-| `PowerBackend` | how do I turn this box on and off? | `IpmiPower` (ipmitool) |
-| `Notifier` *(optional)* | tell something a node is going away, and came back | `AlertmanagerNotifier` |
+| `PowerBackend` | how do I turn this box on and off — and power-cycle it when it wedges? | `IpmiPower` (ipmitool) |
+| `Notifier` *(optional)* | mute a node metalnap put down; raise an alert when one needs a human | `AlertmanagerNotifier` |
 | `Warmup` *(optional)* | prepare a node before it takes work | `ImagePrepull` |
 
 Plus `NodeSource` for reading node state and applying cordons — `KubeNodeSource`
 covers Kubernetes.
+
+`PowerBackend.cycle()`, `NodeSource.note()` / `disown()` and
+`Notifier.alert()` / `clear_alert()` are optional: a backend without them
+still works, and a wedged node is then alerted on rather than power-cycled.
 
 **Configure a `Notifier` even though it is optional.** A node powering off looks
 exactly like a node dying, so without one every sleep pages someone — and worse,
 it teaches people to ignore precisely the alerts that would tell them a node had
 genuinely failed. metalnap refuses to power off a node whose shutdown it could
 not announce, for the same reason.
+
+It mutes **only nodes metalnap put down**: dark and carrying its cordon. A node
+that crashed in service, one an operator holds, and one metalnap has stopped
+being able to account for all stay loud. `AlertmanagerNotifier` creates one
+silence per label in `ALERTMANAGER_SILENCE_LABELS` (default `instance,node`),
+because a node's alerts do not agree on one: kube-state-metrics alerts such as
+`KubeNodeUnreachable` name it in `node`, relabelled node-exporter alerts in
+`instance`. Muting `instance` alone let every sleep through as
+`KubeNodeUnreachable` — and a real `KubeNodeNotReady` arrived buried among
+them. Narrow the silences to what a sleep is *expected* to trip with
+`ALERTMANAGER_SILENCE_MATCHERS`, so anything else a sleeping node raises still
+arrives. Every silence also excludes metalnap's own alert, which carries the
+node's labels, so it is never muted by a silence on the node it is about —
+that exclusion is a negative matcher, and **needs Alertmanager 0.22 or later**.
 
 ### One thing worth stealing even if you use none of the above
 
@@ -112,6 +139,68 @@ own ceiling admits nothing further, so real demand becomes invisible *exactly*
 when extra capacity is most needed. This bit us in production: a runner pool
 pinned at its cap with jobs waiting, and the controller reporting zero unmet
 demand and preparing to sleep the last awake node.
+
+## When a node will not come back
+
+A wake waits `WAKE_TIMEOUT_S` for the node to become Ready. What happens then
+depends on what its BMC says:
+
+- **Chassis off.** The power-on did not take. The next wake tries again.
+- **Chassis on.** The machine is up and wedged — the state a locked kernel sits
+  in, reading "on" for as long as anyone waits. metalnap **power-cycles it
+  once** and gives it one more wake timeout. It will not, and says why, if:
+  - an operator's cordon is on it (checked on a fresh read, at the moment of
+    the cycle);
+  - the cluster still lists work running on it — NotReady is not dead, and a
+    kubelet cut off from the API server leaves its jobs running;
+  - it was cycled within `POWER_CYCLE_COOLDOWN_S` (default a day), per the
+    `metalnap.io/power-cycled` annotation on the node;
+  - a maintenance visit powered it on within two `MAINTENANCE_TIMEOUT_S`, and
+    it may be rebooting into an update — unless this wake found it off and
+    powered it on itself.
+
+A node that is still not Ready after its cycle, or that may not be cycled, is
+**handed to a human**: unmuted, alerted on as `MetalnapNodeNeedsAttention`
+(labels `node`, `instance`, `severity=critical` — route it to a page), and
+passed over by demand, which wakes other nodes instead, and by maintenance
+visits. The alert clears when the node becomes Ready or an operator takes it.
+
+**Taking a node from metalnap** means taking its mark off, not cordoning it: a
+node metalnap slept is already cordoned, so `kubectl cordon` changes nothing it
+can see. Keep the cordon and remove the mark, and it is yours:
+
+```bash
+kubectl annotate node <node> metalnap.io/cordoned-     # your cordonAnnotation
+```
+
+**Re-arming the power cycle** before the cooldown is out is removing its
+record; metalnap may try the node again from the next tick:
+
+```bash
+kubectl annotate node <node> metalnap.io/power-cycled-
+```
+
+Everything metalnap must remember about a node across its own restarts lives
+on the node as a `metalnap.io/` annotation — `power-cycled`, `visited` (a
+maintenance visit's power-on), `shutdown` (a shutdown requested and not yet
+confirmed) and `trouble` (why it was handed to a human). Each was once held in
+memory, and each time a restart could undo a safety decision with it.
+
+A soft shutdown is confirmed, not assumed: the node stays in flight, and muted,
+until its BMC reads off **and** it reads NotReady. One that has not gone down
+after `SHUTDOWN_TIMEOUT_S` is reported — never forced, because a hard cut is
+not a fix for a slow shutdown: if it is dark and powered, it is handed to a
+human like any wedged node; if it is still Ready, having ignored the request,
+it is alerted on while metalnap keeps asking, bounded by `MAX_SLEEP_ATTEMPTS`.
+A node carrying metalnap's cordon that is found powered with no operation to
+explain it — a shutdown that wedged, a wake a restart forgot — or whose BMC
+cannot be read at all, is given one wake timeout's grace and then reported
+too.
+
+A wake that metalnap starts from cold counts as capacity on its way, so one
+node's worth of demand boots one node rather than one per tick until the first
+comes up. A node found already powered does not count: it may be wedged, and
+never arrive.
 
 ## Scheduled wakeups
 
@@ -157,10 +246,10 @@ What a visit actually does, and why:
   kernel it just installed, and cutting power to it is how a routine update
   becomes an unbootable machine. If it is *still* not back when the bound
   fires, metalnap lets go of the visit and leaves the machine **powered**,
-  logging an error: it cannot tell "mid-update" from "broken", and leaving a
-  node powered costs watts where cutting power to one writing its own firmware
-  costs the machine. The ordinary stranded repair finishes the job the moment
-  it comes back.
+  unmuted and alerted on: it cannot tell "mid-update" from "broken", and
+  leaving a node powered costs watts where cutting power to one writing its
+  own firmware costs the machine. The ordinary stranded repair finishes the job
+  the moment it comes back.
 - **`MIN_UPTIME_S` does not apply.** It exists to stop *demand* thrashing a
   node up and down; a visit is not demand, and the whole point is a short stay.
 
@@ -185,8 +274,9 @@ python3 -B tests/sim.py --seeds 60 --ticks 900    # ~54k ticks, ~2s
 ```
 
 `tests/sim.py` drives the controller through thousands of ticks against a fake
-cluster and fake BMCs, with phased demand, hung work, operator maintenance and
-injected restarts, asserting **safety and liveness** after every tick. Liveness
+cluster and fake BMCs, with phased demand, hung work, operator maintenance,
+nodes whose kernels lock up, and injected restarts, asserting **safety and
+liveness** after every tick. Liveness
 matters more than it looks: safety alone is satisfied by a controller that does
 nothing, and the first version of this harness reported OK across 250 ticks
 while never once sleeping a node.
@@ -296,6 +386,16 @@ it takes to trust the numbers.
 
 `MAINTENANCE_INTERVAL_S` enables [scheduled wakeups](#scheduled-wakeups) and is
 `0` — off — by default.
+
+`POWER_CYCLE_COOLDOWN_S` bounds the [power cycle of a wedged
+node](#when-a-node-will-not-come-back) to one per node per this long (default
+`86400`); `0` disables the cycle and alerts straight away.
+`SHUTDOWN_TIMEOUT_S` (default `600`) is how long a soft shutdown may take before
+it is reported.
+
+`ALERTMANAGER_SILENCE_LABELS` (default `instance,node`) and
+`ALERTMANAGER_SILENCE_MATCHERS` (one amtool-syntax matcher per line) shape the
+silences; see [the seams](#the-three-seams).
 
 ## Base image
 

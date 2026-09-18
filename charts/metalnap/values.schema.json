@@ -56,6 +56,23 @@
       "properties": {
         "url": {
           "type": "string"
+        },
+        "silenceLabels": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "description": "Labels a node's alerts name it by; one silence per label, matching <label>=<node>."
+        },
+        "silenceMatchers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Extra matchers in amtool syntax (name=\"v\", name!=\"v\", name=~\"re\", name!~\"re\"), ANDed into every silence."
         }
       }
     },
@@ -126,6 +143,16 @@
         "defaultCapacityGib": {
           "type": "number",
           "exclusiveMinimum": 0
+        },
+        "powerCycleCooldownS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "At most one power cycle of a wedged node per node per this long. 0 disables. Must be 0 or at least wakeTimeoutS."
+        },
+        "shutdownTimeoutS": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long a soft shutdown may take before the node is reported as one that would not power off. Never forced."
         }
       }
     },
