@@ -29,7 +29,8 @@ def node(ready=True, cordoned=False, ours=False, ready_since=0.0,
 
 #: NodeSource.note() keys, as the NodeState fields they come back as.
 NOTE_FIELDS = {"power-cycled": "power_cycled_at", "visited": "visited_at",
-               "shutdown": "shutdown_at", "trouble": "trouble"}
+               "shutdown": "shutdown_at", "trouble": "trouble",
+               "maintenance-started": "maintenance_started_at"}
 
 
 def crashed(**kw):
@@ -909,6 +910,32 @@ class TestMaintenanceConfig(unittest.TestCase):
         self.assertIsNotNone(Config(mode="on").validate())
 
 
+class TestConfigFromEnvironment(unittest.TestCase):
+    """Read when a Config is built, not when the module is imported.
+
+    As plain default expressions every knob was read once, at import, and an
+    environment set any later was silently ignored -- by this suite, and by
+    anything embedding the controller.
+    """
+
+    def test_the_environment_is_read_at_construction(self):
+        saved = {k: os.environ.get(k) for k in ("INTERVAL_S", "MODE")}
+        os.environ.update(INTERVAL_S="7", MODE=" on ")
+        try:
+            cfg = Config()
+            self.assertEqual((cfg.interval_s, cfg.mode), (7, "on"))
+            self.assertEqual(Config(interval_s=3).interval_s, 3,
+                             "an explicit value lost to the environment")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+#: A short name for the notifier spy, for the classes below that are not
+#: about notification but still have to see what was muted and alerted.
 class Spy(TestNotifier.Spy):
     pass
 
@@ -1941,6 +1968,484 @@ class TestIpmiPower(unittest.TestCase):
                             is None)
 
 
+def held(state=None, reason="kernel 6.8", **kw):
+    """A node an operator has asked for maintenance, in whatever state.
+
+    `kw` applies either way: to asleep() when no state is given, and over the
+    state when one is. Dropped in the second case, `held(crashed(),
+    maintenance_started_at=...)` quietly built a request never taken up.
+    """
+    if state is None:
+        return dataclasses.replace(asleep(**kw), maintenance=reason)
+    return dataclasses.replace(state, maintenance=reason, **kw)
+
+
+class TestMaintenanceMode(unittest.TestCase):
+    """An operator asks for a node: powered on once, then left alone.
+
+    Every remedy this controller has for a node behaving oddly -- sleep it,
+    drain it, cycle it, mute it, alert on it -- is wrong for a node somebody
+    is upgrading, because that node reboots and powers off on purpose.
+    """
+
+    def harness(self, states, **kw):
+        h = Harness(states, **kw)
+        h.t = T0
+        return h
+
+    def test_an_asleep_node_is_powered_on_once(self):
+        h = self.harness({"a": held()})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"], "a request never woke the node")
+        h.t += 60
+        c.tick()                          # still dark: it is booting
+        self.assertEqual(h.acted["on"], ["a"], "powered on a second time")
+
+    def test_the_request_is_on_record_before_the_power_on(self):
+        """A power-on this process cannot see is one it makes again -- after
+        the operator has switched the machine off to work on it."""
+        h = self.harness({"a": held()})
+
+        class Checked(_Power):
+            def on(self, n):
+                assert self.h.states[n].maintenance_started_at is not None, \
+                    "powered on before the request was on record"
+                super().on(n)
+        c = h.controller(nodes=("a",), power=Checked(h))
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_no_record_means_no_power_on(self):
+        h = self.harness({"a": held()})
+        real = h.note
+
+        def failing(n, key, value):
+            if key == "maintenance-started":
+                raise RuntimeError("apiserver said no")
+            real(n, key, value)
+        h.note = failing
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "powered on without a record")
+        self.assertTrue(h.logged("could not record the maintenance request"))
+
+    def test_a_failed_power_on_comes_off_the_record_and_is_retried(self):
+        h = self.harness({"a": held()})
+
+        class Refusing(_Power):
+            fail = True
+
+            def on(self, n):
+                if Refusing.fail:
+                    raise RuntimeError("BMC unreachable")
+                super().on(n)
+        c = h.controller(nodes=("a",), power=Refusing(h))
+        c.tick()
+        self.assertIsNone(h.states["a"].maintenance_started_at,
+                          "a request that powered nothing on stayed on record, "
+                          "so it would never be tried again")
+        Refusing.fail = False
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_an_operator_who_powers_it_off_is_not_overruled(self):
+        """The screwdriver rule. Mid-maintenance, OFF is on purpose."""
+        h = self.harness({"a": held()})
+        c = h.controller(nodes=("a",))
+        c.tick()                                        # powered on, recorded
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=True,
+                                            ready_since=h.t, down_since=None)
+        c.tick()                                        # up
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=False,
+                                            ready_since=None, down_since=h.t)
+        h.chassis["a"] = "off"                          # operator: poweroff
+        for _ in range(5):
+            h.t += 600
+            c.tick()
+        self.assertEqual(h.acted["on"], ["a"],
+                         "powered back on a machine the operator switched off")
+
+    def test_removing_the_record_asks_again(self):
+        h = self.harness({"a": held(maintenance_started_at=T0 - 600)})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "a request on record was re-run")
+        h.states["a"] = dataclasses.replace(h.states["a"],
+                                            maintenance_started_at=None)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_a_source_that_cannot_record_never_powers_on(self):
+        """No record, no power-on -- including where there is nowhere to
+        keep one. A NodeSource without note() would otherwise power the node
+        on every tick it is dark, operator's screwdriver or not."""
+        h = self.harness({"a": held()})
+
+        class NoNotes:
+            def state(self, n):
+                return h.state(n)
+
+            def set_cordon(self, n, v):
+                h.set_cordon(n, v)
+        c = Controller(nodes=["a"], node_source=NoNotes(), power=h.power,
+                       signal=h, drain=h, config=Config(mode="on"),
+                       clock=lambda: h.t,
+                       log=lambda lvl, msg, **kv: h.logs.append((msg, kv)))
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "powered on with no record")
+        self.assertTrue(h.logged("could not record the maintenance request"))
+
+    def test_a_power_on_that_keeps_failing_is_given_up_on(self):
+        """Bound every retry, and say so when the bound is hit."""
+        h = self.harness({"a": held()})
+
+        class Dead(_Power):
+            def on(self, n):
+                self.h.acted["on"].append(n)
+                raise RuntimeError("BMC unreachable")
+        c = h.controller(nodes=("a",), power=Dead(h))
+        for _ in range(30):
+            c.tick()
+            h.t += 60
+        self.assertEqual(len(h.acted["on"]), 16,
+                         "not bounded by the wake timeout")
+        self.assertIsNotNone(h.states["a"].maintenance_started_at,
+                             "gave up but left nothing to stop a retry")
+        self.assertEqual(len(h.logged("giving up")), 1)
+
+    def test_a_visit_waits_a_tick_behind_a_maintenance_power_on(self):
+        """Serialised against each other, so one does not share a tick with
+        the other's power-on either."""
+        h = self.harness({"a": held(), "b": asleep(dark_for=90_000.0)})
+        c = h.controller(maintenance_interval_s=3600,
+                         maintenance_window_s=300, maintenance_stagger_s=0,
+                         maintenance_timeout_s=3600)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a", "b"])
+
+    def test_one_power_on_per_tick(self):
+        """Someone asking for the whole fleet is not asking for a rack to power
+        on in unison."""
+        h = self.harness({n: held() for n in "abc"})
+        c = h.controller(nodes=("a", "b", "c"))
+        for want in (["a"], ["a", "b"], ["a", "b", "c"]):
+            c.tick()
+            self.assertEqual(h.acted["on"], want)
+            h.t += 60
+
+    def test_a_node_already_up_is_recorded_and_does_not_queue(self):
+        h = self.harness({"a": held(), "b": held(node(ready=True)),
+                          "c": held()})
+        c = h.controller(nodes=("a", "b", "c"))
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        self.assertIsNotNone(h.states["b"].maintenance_started_at,
+                             "a node already up waited its turn to be recorded")
+        self.assertIsNone(h.states["c"].maintenance_started_at)
+
+    def test_a_node_already_up_is_never_powered_on_later(self):
+        """Recorded even though there was nothing to power on, so an operator
+        who later switches it off is not overruled either."""
+        h = self.harness({"a": held(node(ready=True))})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=False,
+                                            ready_since=None, down_since=h.t)
+        h.chassis["a"] = "off"
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+
+    def test_a_woken_node_stays_cordoned_and_is_never_slept(self):
+        """Up, carrying our cordon, doing nothing: the exact shape of a
+        stranded node, which the repair would put straight back to sleep."""
+        h = self.harness({"a": held()})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=True,
+                                            ready_since=h.t, down_since=None)
+        for _ in range(10):
+            h.t += 3600
+            c.tick()
+        self.assertEqual(h.acted["cordon"], [], "changed the cordon")
+        self.assertEqual(h.acted["off"], [], "powered off a held node")
+        self.assertIsNone(c.st["a"].get("phase"))
+
+    def test_a_node_in_service_is_never_slept(self):
+        h = self.harness({"a": held(node(ready=True)), "b": asleep()})
+        c = h.controller()
+        for _ in range(10):
+            h.t += 3600
+            c.tick()
+        self.assertEqual(h.acted["cordon"], [], "took a held node out of "
+                                                "service")
+        self.assertEqual(h.acted["off"], [])
+
+    def test_a_reboot_is_neither_cycled_nor_muted_nor_alerted_on(self):
+        """Dark, powered and ours for longer than a wake timeout is a wedge
+        to every other part of this controller. Here it is a reboot."""
+        spy = Spy()
+        h = self.harness({"a": held(maintenance_started_at=T0 - 60)},
+                         shortfall=400.0, chassis={"a": "on"})
+        c = h.controller(nodes=("a",), notifier=spy)
+        c.st["want_high_since"] = 0.0
+        for _ in range(6):
+            h.t += 900
+            c.tick()
+        self.assertEqual(h.acted["cycle"], [], "power-cycled a held node")
+        self.assertEqual(h.acted["on"], [], "demand woke a held node")
+        self.assertEqual(spy.down, [], "muted a node an operator is using")
+        self.assertIn("a", spy.up)
+        self.assertEqual(spy.alerts, {}, "alerted on a node an operator has")
+        self.assertIsNone(c.st["a"].get("phase"))
+
+    def test_trouble_is_handed_over_with_the_node(self):
+        """A human has it; they know."""
+        spy = Spy()
+        h = self.harness({"a": held(trouble="wedged",
+                                    maintenance_started_at=T0 - 60)})
+        c = h.controller(nodes=("a",), notifier=spy)
+        c.tick()
+        self.assertIsNone(h.states["a"].trouble)
+        self.assertEqual(spy.alerts, {})
+
+    def test_a_held_node_is_not_reported_as_crashed(self):
+        h = self.harness({"a": held(crashed(), maintenance_started_at=T0)})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertFalse(h.logged("metalnap did not put them down"))
+
+    def test_a_request_abandons_a_wake(self):
+        """Well inside the wake timeout, so it is the abandon that is tested
+        and not the timeout's own check: a cold boot left counted as capacity
+        on its way would hold demand back behind a node it can never have."""
+        h = self.harness({"a": held(), "b": asleep()}, shortfall=150.0,
+                         chassis={"a": "on"})
+        c = h.controller()
+        c.st["a"] = {"phase": "waking", "phase_since": h.t, "booting": True,
+                     "power_confirmed": True}
+        c.st["want_high_since"] = 0.0
+        h.t += 60
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"], "kept waking a held node")
+        self.assertFalse(c.st["a"]["booting"])
+        self.assertEqual(h.acted["on"], ["b"],
+                         "demand waited on a held node's boot")
+        self.assertEqual(h.acted["cordon"], [])
+
+    def test_a_request_abandons_a_sleep_without_backing_off(self):
+        h = self.harness({"a": held(node(ready=True, cordoned=True, ours=True,
+                                         ours_since=T0))},
+                         idle=["runner-1"])
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "sleeping", "phase_since": h.t}
+        for _ in range(3):
+            h.t += 60
+            c.tick()
+        self.assertEqual(h.acted["released"], [], "kept draining a held node")
+        self.assertEqual(h.acted["off"], [])
+        self.assertEqual(h.acted["cordon"], [], "changed the cordon")
+        self.assertNotIn("cooldown_until", c.st["a"])
+
+    def test_a_request_ends_a_visit(self):
+        h = self.harness({"a": held(node(ready=True, cordoned=True,
+                                         ours=True))})
+        c = h.controller(nodes=("a",), maintenance_interval_s=3600,
+                         maintenance_window_s=300, maintenance_timeout_s=3600)
+        c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
+                     "maintenance_until": h.t + 300}
+        c.tick()
+        h.t += 3600
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertEqual(c.st["a"]["maintenance_at"], T0,
+                         "the schedule was not advanced past the visit")
+        self.assertEqual(h.acted["off"], [], "the visit's window put a held "
+                                             "node to sleep")
+
+    def test_a_shutdown_already_requested_finishes_then_powers_on(self):
+        """A soft-off cannot be recalled. Seen through to OFF, then undone --
+        and not recorded on the stale Ready this tick began with."""
+        h = self.harness({"a": held(node(ready=True, cordoned=True,
+                                         ours=True))}, chassis={"a": "off"})
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "powering_off", "phase_since": h.t - 700}
+        c.tick()                                 # confirmed off at the bound
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertIsNone(h.states["a"].maintenance_started_at,
+                          "recorded as taken up on a Ready from before the "
+                          "shutdown finished")
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=False,
+                                            ready_since=None, down_since=h.t)
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_a_fresh_request_at_the_wake_timeout_stops_the_cycle(self):
+        """Checked where the operation finishes, on the read it finishes on."""
+        h = self.harness({"a": crashed()}, shortfall=400.0,
+                         chassis={"a": "on"})
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "waking", "phase_since": h.t}
+        h.fresh["a"] = held(crashed())
+        h.t += 901
+        c.tick()
+        self.assertEqual(h.acted["cycle"], [], "cycled a node just asked for")
+        self.assertIsNone(c.st["a"]["phase"])
+
+    def test_a_fresh_request_at_wake_completion_keeps_the_cordon(self):
+        h = self.harness({"a": asleep()}, shortfall=400.0)
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "waking", "phase_since": h.t}
+        h.fresh["a"] = held(node(ready=True, cordoned=True, ours=True))
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "put a node an operator had just asked for into "
+                         "service")
+
+    def test_demand_neither_wakes_nor_counts_a_held_node(self):
+        h = self.harness({"a": held(maintenance_started_at=T0 - 60),
+                          "b": asleep()}, shortfall=150.0,
+                         chassis={"a": "off"})
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"])
+
+    def test_a_busy_held_node_does_not_cap_the_pool(self):
+        """Counted as awake while it could not be slept, a busy held node
+        filled the only slot `want` had, and its peer never woke."""
+        h = self.harness({"a": held(node(ready=True),
+                                    maintenance_started_at=T0 - 60),
+                          "b": asleep()},
+                         shortfall=90.0, busy={"a": ["job-1"]})
+        c = h.controller()
+        c.st["want_high_since"] = 0.0
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"],
+                         "a held node's work kept demand from waking a peer")
+
+    def test_held_nodes_are_never_visited_and_block_no_one_else(self):
+        h = self.harness({"a": held(maintenance_started_at=T0 - 60),
+                          "b": asleep(dark_for=90_000.0)},
+                         chassis={"a": "off"})
+        c = h.controller(maintenance_interval_s=3600,
+                         maintenance_window_s=300, maintenance_stagger_s=0,
+                         maintenance_timeout_s=3600)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"])
+        self.assertEqual(c.st["b"]["phase"], "maintaining")
+        self.assertNotIn("phase", c.st["a"])
+
+    def test_giving_it_back_clears_the_record_and_hands_it_on(self):
+        h = self.harness({"a": held(node(ready=True, cordoned=True, ours=True,
+                                         ours_since=T0),
+                                    maintenance_started_at=T0 - 600)})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["off"], [])
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance=None)
+        c.tick()
+        self.assertIn(("a", "maintenance-started", None), h.acted["note"],
+                      "left a record that would stop the next request "
+                      "powering the node on")
+        self.assertTrue(h.logged("maintenance request withdrawn"))
+        # Up, ours, unwanted: the ordinary stranded repair puts it to sleep.
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_given_back_when_needed_it_goes_into_service(self):
+        h = self.harness({"a": node(ready=True, cordoned=True, ours=True,
+                                    maintenance_started_at=T0 - 600)},
+                         shortfall=400.0)
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertIn(("a", False), h.acted["cordon"])
+
+    def test_given_back_in_service_it_gets_a_whole_sleep_window(self):
+        """Held, it was idle for hours without the idle clock running.
+        Otherwise the tick it is given back is the tick it is slept."""
+        h = self.harness({"a": held(node(ready=True),
+                                    maintenance_started_at=T0 - 600)})
+        c = h.controller(nodes=("a",), sleep_sustain_s=600)
+        for _ in range(5):
+            h.t += 3600
+            c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance=None)
+        c.tick()
+        h.t += 300
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [], "slept the moment it was "
+                                                "given back")
+        h.t += 301
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [("a", True)])
+
+    def test_given_back_dark_its_power_is_checked_afresh(self):
+        """metalnap last knew it as OFF, from before the request. A person
+        may have switched it on since, so that is not taken on trust: it gets
+        the grace any dark node of ours does, and then is called what it is."""
+        spy = Spy()
+        h = self.harness({"a": held(maintenance_started_at=T0 - 600)},
+                         chassis={"a": "on"})
+        c = h.controller(nodes=("a",), notifier=spy)
+        c.st["a"] = {"off": True}
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance=None)
+        c.tick()
+        self.assertIn("dark_on_since", c.st["a"],
+                      "muted a node given back dark without checking its "
+                      "power")
+
+    def test_dry_run_touches_nothing_and_says_so_once(self):
+        h = self.harness({"a": held()})
+        c = h.controller(nodes=("a",), mode="dry_run")
+        for _ in range(3):
+            c.tick()
+            h.t += 60
+        self.assertEqual((h.acted["on"], h.acted["note"], h.acted["cordon"]),
+                         ([], [], []))
+        self.assertEqual(len(h.logged("dry_run: would take up")), 1)
+        # Once per REQUEST: the next one is said again.
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance=None)
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance="bios")
+        c.tick()
+        self.assertEqual(len(h.logged("dry_run: would take up")), 2)
+
+    def test_a_restart_mid_request_neither_powers_on_nor_sleeps(self):
+        h = self.harness({"a": held()})
+        c = h.controller(nodes=("a",))
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=True,
+                                            ready_since=h.t, down_since=None)
+        c.st = {}                                       # a restart
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        self.assertEqual(h.acted["cordon"], [])
+        self.assertIsNone(c.st["a"].get("phase"))
+
+
+class TestWakeFinishesOnAFreshRead(unittest.TestCase):
+    """An operator's cordon outranks a wake already in flight -- checked on
+    the read the wake finishes on, as the power cycle is."""
+
+    def test_an_operator_cordon_at_wake_completion_is_kept(self):
+        h = Harness({"a": asleep()}, shortfall=400.0)
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "waking", "phase_since": h.t}
+        h.fresh["a"] = node(ready=True, cordoned=True, ours=False)
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "uncordoned a node an operator had just cordoned")
+        self.assertIsNone(c.st["a"]["phase"])
+
+
 class TestKubeNodeSource(unittest.TestCase):
     class Kube:
         def __init__(self, anns):
@@ -1987,6 +2492,28 @@ class TestKubeNodeSource(unittest.TestCase):
                          {"metalnap.io/trouble": None})
         self.assertEqual(k.patches[2]["metadata"]["annotations"],
                          {"metalnap.io/cordoned": None})
+
+    def test_a_maintenance_request_is_read_back(self):
+        _k, src = self.source({"metalnap.io/maintenance": " kernel 6.8 ",
+                               "metalnap.io/maintenance-started":
+                               "2026-09-18T01:17:34Z"})
+        st = src.state("k8s15")
+        self.assertEqual((st.maintenance, st.maintenance_started_at),
+                         ("kernel 6.8", 1789694254.0))
+        self.assertIsNone(src.state("k8s15").trouble)
+
+    def test_a_request_without_a_reason_is_still_a_request(self):
+        """`kubectl annotate node x metalnap.io/maintenance=` asks, too."""
+        _k, src = self.source({"metalnap.io/maintenance": ""})
+        self.assertEqual(src.state("k8s15").maintenance, "no reason given")
+        _k, src = self.source({})
+        self.assertIsNone(src.state("k8s15").maintenance)
+
+    def test_parse_reads_a_listed_node_as_state_reads_a_fetched_one(self):
+        k, src = self.source({"metalnap.io/cordoned": "2026-09-18T01:17:34Z",
+                              "metalnap.io/maintenance": "firmware"})
+        self.assertEqual(src.parse(k.request("GET", "/api/v1/nodes/k8s15")),
+                         src.state("k8s15"))
 
     def test_every_note_is_read_back(self):
         _k, src = self.source({"metalnap.io/visited": "2026-09-18T01:17:34Z",

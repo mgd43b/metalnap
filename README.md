@@ -44,10 +44,14 @@ Supermicro Twin serving GitHub Actions CI.
   unmet work, and a  │          this controller            your hardware
    queue at its cap  ├──▶  should N nodes be awake?  ──▶  IPMI / Redfish
                      │     drain safely, then power          WoL / PDU
-     the calendar ───┘
-  asleep long enough
-   to have missed a
-   month of updates
+     the calendar ───┤
+  asleep long enough │
+   to have missed a  │
+   month of updates  │
+                     │
+       an operator ──┘
+   "I need k8s7 for
+    a kernel upgrade"
 ```
 
 Each tick: observe every node, work out how many should be awake, and take **at
@@ -94,6 +98,11 @@ Every one of these exists because breaking it cost something real.
   cycle is what a person would try first. One that needs a second inside the
   cooldown needs the person — see [When a node will not come
   back](#when-a-node-will-not-come-back).
+- **When a person asks for a node, give it to them and get out of the way.**
+  [Maintenance mode](#maintenance-mode) powers the node on once, then leaves it
+  alone until it is given back. Someone mid-upgrade reboots and powers off on
+  purpose, and every remedy this controller has for a node doing that — sleep
+  it, cycle it, mute it — is the wrong one.
 
 ## The three seams
 
@@ -122,8 +131,9 @@ genuinely failed. metalnap refuses to power off a node whose shutdown it could
 not announce, for the same reason.
 
 It mutes **only nodes metalnap put down**: dark and carrying its cordon. A node
-that crashed in service, one an operator holds, and one metalnap has stopped
-being able to account for all stay loud. `AlertmanagerNotifier` creates one
+that crashed in service, one an operator holds or has asked for in
+[maintenance mode](#maintenance-mode), and one metalnap has stopped being able
+to account for all stay loud. `AlertmanagerNotifier` creates one
 silence per label in `ALERTMANAGER_SILENCE_LABELS` (default `instance,node`),
 because a node's alerts do not agree on one: kube-state-metrics alerts such as
 `KubeNodeUnreachable` name it in `node`, relabelled node-exporter alerts in
@@ -187,8 +197,11 @@ kubectl annotate node <node> metalnap.io/power-cycled-
 Everything metalnap must remember about a node across its own restarts lives
 on the node as a `metalnap.io/` annotation — `power-cycled`, `visited` (a
 maintenance visit's power-on), `shutdown` (a shutdown requested and not yet
-confirmed) and `trouble` (why it was handed to a human). Each was once held in
-memory, and each time a restart could undo a safety decision with it.
+confirmed), `trouble` (why it was handed to a human) and `maintenance-started`
+(an operator's [maintenance request](#maintenance-mode) taken up). Each was
+once held in memory, and each time a restart could undo a safety decision with
+it. `metalnap.io/maintenance` is the one metalnap reads and never writes: it is
+the operator's.
 
 A soft shutdown is confirmed, not assumed: the node stays in flight, and muted,
 until its BMC reads off **and** it reads NotReady. One that has not gone down
@@ -205,6 +218,90 @@ A wake that metalnap starts from cold counts as capacity on its way, so one
 node's worth of demand boots one node rather than one per tick until the first
 comes up. A node found already powered does not count: it may be wedged, and
 never arrive.
+
+## Maintenance mode
+
+A node metalnap has put to sleep is dark, cordoned and ownerless as far as
+anyone at a terminal can tell, and powering it on by hand just hands it back to
+a controller that will put it to sleep again. So ask metalnap for it:
+
+```bash
+metalnap maintenance start k8s7 --reason "kernel 6.8"     # or --all
+metalnap status
+metalnap maintenance stop k8s7
+```
+
+or, with nothing but `kubectl`:
+
+```bash
+kubectl annotate --overwrite node k8s7 metalnap.io/maintenance="kernel 6.8"
+kubectl annotate node k8s7 metalnap.io/maintenance- metalnap.io/maintenance-started-
+```
+
+What metalnap does with a node while the request stands:
+
+- **Powers it on — once.** If the chassis is off, it is powered on, one node
+  per tick, so asking for a whole rack does not start it in unison. That
+  power-on is put on record on the node *before* it is made
+  (`metalnap.io/maintenance-started`), and a request carrying that record is
+  never powered on again: if you power the machine off to reseat a DIMM, it
+  stays off. `maintenance stop` then `start` asks for another (or remove the
+  record by hand). `start` on a node already asked for only updates the
+  reason, so `start --all` cannot power back on a machine somebody switched
+  off.
+- **Once, and bounded.** A power-on that keeps failing is retried for a wake
+  timeout, then given up on and said so; the node is yours to power at the
+  BMC.
+- **Then nothing else.** No sleep, no drain, no power cycle, however long it
+  sits dark and powered — that is a reboot here, not a wedge. No silence, and
+  no `MetalnapNodeNeedsAttention`: a node being worked on is loud to whoever is
+  working on it, and a silence is theirs to make.
+- **It leaves the cordon as it found it.** A node woken from sleep keeps
+  metalnap's cordon, so no work lands while you reboot it; host-level updates,
+  config management and DaemonSets run regardless. A node that was in service
+  stays in service. `kubectl cordon` and `uncordon` are yours throughout.
+- **It is out of the pool.** Demand neither wakes, sleeps nor counts it, the
+  way it does not count a node an operator cordoned; scheduled visits pass it
+  over. A wake, sleep or visit already under way is abandoned where it stands.
+  A shutdown already requested cannot be recalled, so it is seen through and
+  the node powered back on after it.
+
+**Give it back when it is Ready**, and it is metalnap's again from the next
+tick: put into service if demand wants it, or through the ordinary sleep — with
+every rule a sleep keeps — if not. A node given back dark under metalnap's
+cordon is checked like any it put to sleep: off is asleep, and powered but not
+Ready gets a wake timeout's grace and is then handed to a human. One given back
+dark and uncordoned reads as down, loudly, like any node that crashed.
+
+It is not a `MODE` and not a Helm value. It is per node, asked for on the node,
+so it needs no redeploy and nothing to remember to set back.
+
+## Operating it from your machine
+
+`metalnap` is also a small CLI for the person at the keyboard. It runs
+`kubectl` with your kubeconfig and your RBAC, and holds no credential of its
+own:
+
+```bash
+pipx install git+https://github.com/mgd43b/metalnap   # or: pip install -e .
+
+metalnap status                         # every managed node, and its state
+metalnap maintenance start k8s7 k8s12 --reason "firmware"
+metalnap maintenance stop k8s7 k8s12
+metalnap logs -f --node k8s7            # the controller's log, readable
+```
+
+It names the context it is acting on every time, and pins every call to it —
+`--context`, or `METALNAP_CONTEXT`, or your current context, named. It finds
+the controller by its Helm chart's labels (`--namespace` or `--release` if a
+cluster has several, `--selector` if the chart's `nameOverride` changed them)
+and reads the node list, cordon annotation and mode from it, so `status` reads
+a cordon exactly as the controller does. It refuses a
+node the controller does not manage: that annotation would do nothing, and a
+typo would look exactly like a request being ignored.
+
+What `status` cannot show is what the controller is *doing* — a wake or a
+drain in progress lives in its memory. `logs` is where it says so.
 
 ## Scheduled wakeups
 
@@ -232,15 +329,17 @@ What a visit actually does, and why:
   end by draining real work under a five-minute deadline — and that drain would
   then be the thing keeping the node up. Host-level updates, config management
   and anything running as a DaemonSet all proceed regardless of a cordon. If
-  you need the node *schedulable*, you want a longer ordinary wake, not this.
+  you need a node for longer, or schedulable, ask for it with [maintenance
+  mode](#maintenance-mode) and uncordon it yourself.
 - **One node at a time, staggered.** Nodes fall asleep in a herd — a cluster
   goes quiet and they follow each other down — so an unstaggered schedule
   brings the same herd back up in unison, which is a current spike your PSUs
   did not agree to. Each node's offset comes from a hash of its name: random
   across a fleet, identical across a redeploy, so a controller that restarts
   often cannot keep re-bunching the nodes the stagger exists to spread.
-- **It yields to everything.** Unmet demand, an operator's cordon, any wake,
-  sleep, drain or warmup already in flight — all of them win. A visit deferred
+- **It yields to everything.** Unmet demand, an operator's cordon or
+  maintenance request, any wake, sleep, drain or warmup already in flight —
+  all of them win. A visit deferred
   by a tick, or by a thousand, costs nothing when the schedule is measured in
   days.
 - **Demand mid-visit takes the node.** It is already booted and one uncordon
@@ -278,7 +377,7 @@ python3 -B tests/sim.py --seeds 60 --ticks 900    # ~54k ticks, ~2s
 ```
 
 `tests/sim.py` drives the controller through thousands of ticks against a fake
-cluster and fake BMCs, with phased demand, hung work, operator maintenance,
+cluster and fake BMCs, with phased demand, hung work, operator cordons,
 nodes whose kernels lock up, and injected restarts, asserting **safety and
 liveness** after every tick. Liveness
 matters more than it looks: safety alone is satisfied by a controller that does
@@ -342,6 +441,7 @@ It installs in **`dry_run`** and touches nothing. Watch what it decides:
 
 ```bash
 kubectl -n metalnap logs -l app.kubernetes.io/name=metalnap -f
+# or, with the CLI: metalnap logs -f
 ```
 
 When the decisions look right:
@@ -394,7 +494,8 @@ it would take without touching anything** — run it there first, for as long as
 it takes to trust the numbers.
 
 `MAINTENANCE_INTERVAL_S` enables [scheduled wakeups](#scheduled-wakeups) and is
-`0` — off — by default.
+`0` — off — by default. [Maintenance mode](#maintenance-mode) has no setting:
+it is asked for on the node.
 
 The pool is sized on **memory and CPU**, whichever needs more nodes
 (set `CPU_SHORTFALL_QUERY=""` to size on memory alone). Runners that run out

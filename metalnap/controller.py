@@ -30,12 +30,17 @@ this against real hardware and real CI:
     up reads "on" to its BMC and ignores a soft shutdown for ever; one power
     cycle is what a person would try first. A machine that needs a second
     inside the cooldown needs the person.
+  * When a person asks for a node, give it to them and get out of the way.
+    Maintenance mode powers the node on ONCE and then leaves it alone -- no
+    sleep, no drain, no power cycle, no mute -- until the request is
+    withdrawn. Someone mid-upgrade reboots, and powers off, on purpose, and
+    every one of this controller's remedies for a node doing that is wrong.
 """
 import dataclasses
 import hashlib
 import math
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 class Controller:
@@ -218,6 +223,18 @@ class Controller:
         except Exception as e:                        # noqa: BLE001
             self.log("warn", "readiness check failed; retrying next tick",
                      node=name, err=str(e))
+        if st and st.ready and (st.maintenance
+                                or (st.cordoned and not st.ours)):
+            # Taken by a person since this tick began. The uncordon below is
+            # where a wake FINISHES, and finishing it would put their node into
+            # service under them -- checked on this fresh read, as the cycle
+            # is, because that is the whole of the rule.
+            self.log("info", "WAKE abandoned -- an operator has the node; "
+                             "leaving it to them", node=name,
+                     maintenance=st.maintenance)
+            s["phase"] = None
+            s["booting"] = False
+            return False
         if st and st.ready:
             # Uncordon FIRST. Anything after this point is an optimisation, and
             # an optimisation must never be able to strand a node that is
@@ -292,6 +309,14 @@ class Controller:
         if st.cordoned and not st.ours:
             self.log("info", "WAKE TIMEOUT -- an operator has cordoned the "
                              "node; leaving it to them", node=name)
+            s["phase"] = None
+            return
+        if st.maintenance:
+            # Asked for since this tick began. A node being worked on is not
+            # Ready because somebody is working on it.
+            self.log("info", "WAKE TIMEOUT -- an operator has asked for the "
+                             "node for maintenance; leaving it to them",
+                     node=name, maintenance=st.maintenance)
             s["phase"] = None
             return
         try:
@@ -669,7 +694,7 @@ class Controller:
             self.log("error", "could not confirm the node powered off",
                      node=name, timeout_s=self.cfg.shutdown_timeout_s)
 
-    # -- scheduled maintenance -------------------------------------------
+    # -- scheduled maintenance visits ------------------------------------
     def _maintenance_offset(self, name):
         """A stable per-node offset, so nodes do not all come due together.
 
@@ -886,12 +911,15 @@ class Controller:
         self.sleep(name, state)
 
     def _overdue(self, present, states):
-        """Nodes that are asleep, ours, and due -- longest dark first."""
+        """Nodes asleep under our cordon, not handed to a human or backed
+        off, not asked for by an operator, and due -- longest dark first."""
         due = []
         for n in present:
             state = states[n]
             if state.ready:
                 continue          # already up, and already getting its updates
+            if state.maintenance:
+                continue          # an operator has it; see maintenance mode
             if not self._ours(state):
                 # A dark node WITHOUT our cordon is not one we put to sleep.
                 # Somebody pulled it for a disk swap or a firmware flash, and
@@ -941,6 +969,147 @@ class Controller:
         except Exception as e:                        # noqa: BLE001
             self.log("error", "could not begin a maintenance visit",
                      node=node, err=str(e))
+
+    # -- operator maintenance mode ---------------------------------------
+    def _maintenance_requests(self, present, states):
+        """The nodes an operator has asked for, tidying up after any given back.
+
+        Read off the node every tick, so there is nothing here for a restart
+        to lose: the request is the operator's annotation, and the one thing
+        metalnap adds to it -- that it has been taken up -- is on the node too.
+        """
+        st = self.st
+        maint = [n for n in present if states[n].maintenance]
+        for n in present:
+            state = states[n]
+            if state.maintenance:
+                # Whatever metalnap last knew of this machine's power, a person
+                # may since have changed it. Forgotten now, so that giving the
+                # node back has it checked afresh rather than muted on the
+                # strength of an "off" from before somebody switched it on.
+                for k in ("off", "dark_on_since"):
+                    self._node(n).pop(k, None)
+                continue
+            for k in ("maintenance_dry_run", "maintenance_power_failed_at"):
+                (st.get(n) or {}).pop(k, None)
+            if state.maintenance_started_at is not None:
+                # Given back. The record is what makes the power-on happen once
+                # per request, so it goes with the request: left behind, the
+                # NEXT request would find it and never power the node on.
+                self._try_note(n, "maintenance-started", None)
+        last = st.get("_maint_last") or []
+        if maint != last:
+            if maint:
+                self.log("info", "nodes asked for by an operator for "
+                                 "maintenance; powered on once, then left "
+                                 "alone until the request is withdrawn",
+                         maintenance={n: states[n].maintenance
+                                      for n in maint})
+            released = [n for n in last if n not in maint]
+            if released:
+                self.log("info", "maintenance request withdrawn; the nodes "
+                                 "are metalnap's again", released=released)
+            st["_maint_last"] = maint
+        return maint
+
+    def _take_up_maintenance(self, maint, states, in_flight):
+        """Power on, ONCE per request, each node an operator has asked for.
+
+        Once, not whenever it is dark. A person mid-maintenance powers the
+        machine off on purpose -- to reseat a DIMM, or flash firmware that
+        wants a cold start -- and powering it back on underneath them is the
+        screwdriver problem the visits are careful to avoid, arriving by the
+        front door. So the power-on goes on record on the node BEFORE it is
+        made, and a request carrying that record is never powered on again.
+        Removing the record is how an operator asks for another.
+
+        One maintenance power-on per tick, for the reason visits are
+        serialised: someone asking for the whole fleet at once is not asking
+        for a rack to power on in unison. A node that is already up is only
+        recorded, and does not wait its turn. True if it powered one on.
+
+        A power-on that keeps failing is retried for a wake timeout, then left
+        on record and said once -- bounded, like every retry here. The node is
+        the operator's, so it is theirs to power at the BMC, or to ask for
+        again with a fresh request.
+
+        Not while an operation of ours is still settling, either, nor on the
+        tick one ends. A shutdown already requested cannot be recalled, so it
+        is seen through to OFF and the node powered on after it -- and not on
+        the observation this tick began with, which predates it: that still
+        reads Ready, and the node would be recorded as taken up and left dark.
+        """
+        powered, now = False, self.now()
+        for n in maint:
+            state, s = states[n], self._node(n)
+            if (state.maintenance_started_at is not None or s.get("phase")
+                    or n in in_flight):
+                continue
+            if self.cfg.mode != "on":
+                # Remembered in memory only, so the shadow says it once per
+                # request rather than every tick for as long as it stands.
+                if not s.get("maintenance_dry_run"):
+                    self.log("info", "dry_run: would take up the maintenance "
+                                     "request, powering the node on if it is "
+                                     "off", node=n,
+                             maintenance=state.maintenance)
+                    s["maintenance_dry_run"] = True
+                continue
+            power = "on" if state.ready else None
+            if power is None:
+                if powered:
+                    continue          # its turn is next tick
+                try:
+                    power = self.power.state(n)
+                except Exception as e:                # noqa: BLE001
+                    self.log("warn", "could not read power state for a "
+                                     "maintenance request; retrying next "
+                                     "tick", node=n, err=str(e))
+                    continue
+            # On record BEFORE the power-on, and no record means no power-on:
+            # one this process cannot see is one it makes again after the
+            # operator has switched the machine off.
+            try:
+                if not self._note(n, "maintenance-started", self.now()):
+                    raise RuntimeError("the node source cannot record it")
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "could not record the maintenance request, "
+                                 "so the node was not powered on; retrying "
+                                 "next tick", node=n, err=str(e))
+                continue
+            if power != "off":
+                self.log("info", "MAINTENANCE MODE -- node is already "
+                                 "powered; leaving it alone until the request "
+                                 "is withdrawn", node=n,
+                         maintenance=state.maintenance, ready=state.ready)
+                continue
+            try:
+                self.power.on(n)
+            except Exception as e:                    # noqa: BLE001
+                first = s.setdefault("maintenance_power_failed_at", now)
+                if now - first >= self.cfg.wake_timeout_s:
+                    # Left ON the record, which is what stops the retries --
+                    # across a restart, too.
+                    s.pop("maintenance_power_failed_at", None)
+                    self.log("error", "MAINTENANCE MODE -- could not power "
+                                      "the node on for a whole wake timeout; "
+                                      "giving up. Power it on at the BMC, or "
+                                      "withdraw the request and ask again",
+                             node=n, err=str(e))
+                    continue
+                # Off the record again: a request that did not power the node
+                # on has not been taken up, and the next tick tries again.
+                self.log("error", "could not power the node on for "
+                                  "maintenance; retrying next tick", node=n,
+                         err=str(e))
+                self._try_note(n, "maintenance-started", None)
+                continue
+            s.pop("maintenance_power_failed_at", None)
+            powered = True
+            self.log("info", "MAINTENANCE MODE -- powering on for an operator; "
+                             "leaving it alone until the request is withdrawn",
+                     node=n, maintenance=state.maintenance)
+        return powered
 
     # -- sizing ----------------------------------------------------------
     def _size(self, shortfall, capacities):
@@ -1013,7 +1182,7 @@ class Controller:
     def _asleep(self, name, state):
         """Put down by us and still down the way we left it: the one kind of
         dark node whose alerts are noise rather than news."""
-        if not self._ours(state):
+        if not self._ours(state) or state.maintenance:
             return False        # crashed, or an operator's: either way, loud
         phase = (self.st.get(name) or {}).get("phase")
         if not state.ready:
@@ -1027,8 +1196,8 @@ class Controller:
         return phase == "powering_off"
 
     def _dark_trouble(self, name, state):
-        """Why this dark node needs a human, or None. Unmutes it: its own
-        alerts are exactly what should now arrive."""
+        """Why this dark node needs a human, or None. The caller unmutes a node
+        that has one: its own alerts are exactly what should now arrive."""
         return (self.st.get(name) or {}).get("trouble") or state.trouble
 
     def _trouble(self, name, state):
@@ -1170,6 +1339,8 @@ class Controller:
                 states[n] = dataclasses.replace(states[n], ours=False,
                                                 ours_since=None)
 
+        maint = self._maintenance_requests(present, states)
+
         # Reconcile notifications every tick rather than only on transitions.
         # A notification lost to a restart or an Alertmanager outage is then
         # re-asserted, and -- more importantly -- one left over on a node that
@@ -1182,20 +1353,23 @@ class Controller:
         for n in present:
             state, s = states[n], self._node(n)
             by_operator = state.cordoned and not state.ours
+            #: A person has this node, one way or the other: it is theirs to
+            #: watch, and nothing metalnap would say about it is news to them.
+            theirs = by_operator or bool(state.maintenance)
             if state.ready:
                 for k in ("dark_on_since", "off", "wake_backoff_until",
                           "backoff_record", "dark_after_visit"):
                     s.pop(k, None)
                 state = states[n] = self._clear_trouble(n, state)
-            elif by_operator:
+            elif theirs:
                 # A human has it; they know.
                 state = states[n] = self._clear_trouble(n, state)
-            if by_operator or not state.ready or not self._ours(state):
+            if theirs or not state.ready or not self._ours(state):
                 # Raised only while metalnap keeps asking a Ready node to go
                 # down. Going dark, or back to service, ends that.
                 s.pop("shutdown_failed", None)
             if (s.get("trouble") and s["trouble"] != state.trouble
-                    and not by_operator):
+                    and not theirs):
                 self._try_note(n, "trouble", s["trouble"])
             if ("backoff_record" in s
                     and state.power_cycled_at != s["backoff_record"]):
@@ -1218,9 +1392,9 @@ class Controller:
                     s["phase_since"] = state.shutdown_at
                 else:
                     self._try_note(n, "shutdown", None)
-            if not state.ready and not by_operator and self._ours(state):
+            if not state.ready and not theirs and self._ours(state):
                 state = states[n] = self._check_dark(n, state)
-            trouble = None if by_operator else self._trouble(n, state)
+            trouble = None if theirs else self._trouble(n, state)
             # Dark trouble unmutes the node, so its own alerts arrive. A node
             # that ignored a shutdown stays muted while it retries -- it is
             # going down -- and is alerted on all the same: our own alert is
@@ -1259,7 +1433,8 @@ class Controller:
         # alerts are left alone -- that is the point -- and it is said once
         # here, in case those alerts are not being read.
         crashed = [n for n in present
-                   if not states[n].ready and not states[n].cordoned]
+                   if not states[n].ready and not states[n].cordoned
+                   and not states[n].maintenance]
         if crashed != st.get("_crashed_last"):
             if crashed:
                 self.log("error", "managed nodes are down and metalnap did not "
@@ -1270,12 +1445,18 @@ class Controller:
                          recovered=st["_crashed_last"])
             st["_crashed_last"] = crashed
 
+        # A node asked for maintenance is out of the pool altogether, like one
+        # an operator cordoned: never woken, slept or counted for demand. Even
+        # in service -- counted as awake while it could not be slept, it capped
+        # `want` below at the nodes that can, and one busy held node would
+        # have kept a peer from ever being woken for the backlog beside it.
         awake = [n for n in present
-                 if states[n].ready and not states[n].cordoned]
+                 if states[n].ready and not states[n].cordoned
+                 and n not in maint]
         # A cordon this controller does not own belongs to an operator.
         held = [n for n in present
                 if states[n].cordoned and not states[n].ours]
-        wakeable = [n for n in present if n not in held]
+        wakeable = [n for n in present if n not in held and n not in maint]
         if held != st.get("_held_last"):
             if held:
                 self.log("info", "nodes cordoned by an operator; held out of "
@@ -1365,6 +1546,23 @@ class Controller:
                 # operator held the node, and end the moment it began.
                 st[n].pop("maintenance_until", None)
                 continue
+            if n in maint and phase in ("waking", "sleeping", "maintaining"):
+                # Asked for mid-operation. None of the three finishes the way
+                # the operator wants: a wake uncordons their node, a sleep
+                # powers it off, a visit does the latter on a timer. Let go of
+                # it where it stands -- cordon and power as they are -- and let
+                # maintenance mode take it from there. A shutdown already
+                # requested, and a warmup on a node already in service, are
+                # left to finish: neither can be recalled, nor needs to be.
+                self.log("info", "operator asked for the node for maintenance "
+                                 "mid-operation; abandoning the operation",
+                         node=n, phase=phase,
+                         maintenance=states[n].maintenance)
+                if phase == "maintaining":
+                    self._release_visit(n)
+                st[n]["phase"] = None
+                st[n]["booting"] = False
+                continue
             if phase == "maintaining" and want > len(awake):
                 # Demand turned up while the node was up for its own sake.
                 # It is already booted and cordoned, which makes it the
@@ -1441,13 +1639,22 @@ class Controller:
                 self.log("error", "phase step failed", node=n, phase=phase,
                          err=str(e))
 
+        # Before the stranded repair, which ends the tick: a request is an
+        # operator waiting, and must not queue behind a repair on another node.
+        took_up = self._take_up_maintenance(maint, states, in_flight)
+
         # A node powered on but cordoned is in NEITHER desired state: burning
         # power, serving nothing. It gets there when an operation is
-        # interrupted. Only cordons this controller owns are touched.
+        # interrupted. Only cordons this controller owns are touched -- and
+        # not on a node asked for maintenance, which is exactly that shape on
+        # purpose, and is the operator's until they give it back.
         stranded = [n for n in present
                     if states[n].ready and self._ours(states[n])
-                    and n not in in_flight]
+                    and n not in in_flight and n not in maint]
         for n in stranded:
+            if len(stranded) > 1:
+                self.log("info", "more nodes are stranded; they wait their "
+                                 "turn", node=n, waiting=stranded[1:])
             if len(awake) < unguarded:
                 self.log("warn", "stranded node needed; completing the wake",
                          node=n)
@@ -1552,8 +1759,11 @@ class Controller:
 
         # LAST, and deliberately so. Everything above is a response to demand
         # or to an operator; a maintenance visit is neither, so it gets what is
-        # left over and nothing more.
-        self._maybe_maintain(present, states, awake, want)
+        # left over and nothing more -- not even a tick in which an operator's
+        # request has just powered a node on, which serialisation would have
+        # stopped had the request been a phase.
+        if not took_up:
+            self._maybe_maintain(present, states, awake, want)
 
 
 #: Trouble raised from a power reading, which a later reading can take back.

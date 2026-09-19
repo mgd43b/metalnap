@@ -216,9 +216,10 @@ class KubeNodeSource:
                         "node-role.kubernetes.io/master")
 
     #: Where the controller's durable notes live: `<prefix><key>`, so
-    #: metalnap.io/power-cycled and friends. Not derived from the cordon
-    #: annotation: that one is configurable so a predecessor's name can be
-    #: kept, and these have no predecessor.
+    #: metalnap.io/power-cycled and friends -- and where an operator's
+    #: maintenance request is read from, metalnap.io/maintenance. Not derived
+    #: from the cordon annotation: that one is configurable so a predecessor's
+    #: name can be kept, and these have no predecessor.
     NOTE_PREFIX = "metalnap.io/"
 
     def __init__(self, kube, annotation, capacity_of=None,
@@ -242,6 +243,14 @@ class KubeNodeSource:
             if e.response is not None and e.response.status_code == 404:
                 return None          # not racked yet is not an error
             raise
+        return self.parse(n)
+
+    def parse(self, n):
+        """NodeState from a Node object as the API returns it.
+
+        Its own method so `metalnap status` reads a node exactly the way the
+        controller does, from a listing it fetched some other way.
+        """
         ready, ready_since, down_since = False, None, None
         for c in n["status"].get("conditions", []):
             if c["type"] == "Ready":
@@ -256,21 +265,33 @@ class KubeNodeSource:
                 ready_since, down_since = (ts, None) if ready else (None, ts)
         anns = n["metadata"].get("annotations") or {}
         labels = n["metadata"].get("labels") or {}
+        # Every annotation under the prefix, but only the keys mapped below
+        # reach NodeState. A new note has to be added there too, or it is
+        # written faithfully and never read back.
         notes = {k[len(self.note_prefix):]: v for k, v in anns.items()
                  if k.startswith(self.note_prefix) and k != self.annotation}
+        maintenance = notes.get("maintenance")
+        if maintenance is not None:
+            # Present is what asks. `kubectl annotate node x
+            # metalnap.io/maintenance=` is a request without a reason, not no
+            # request at all.
+            maintenance = maintenance.strip() or "no reason given"
         return NodeState(
             ready=ready,
             cordoned=bool(n["spec"].get("unschedulable")),
             ours=self.annotation in anns,
             ready_since=ready_since,
             capacity=self.capacity_of(n),
-            protected=any(l in labels for l in self.protected_labels),
+            protected=any(key in labels for key in self.protected_labels),
             ours_since=_timestamp(anns.get(self.annotation)),
             down_since=down_since,
             power_cycled_at=_timestamp(notes.get("power-cycled")),
             visited_at=_timestamp(notes.get("visited")),
             shutdown_at=_timestamp(notes.get("shutdown")),
             trouble=notes.get("trouble") or None,
+            maintenance=maintenance,
+            maintenance_started_at=_timestamp(
+                notes.get("maintenance-started")),
         )
 
     def set_cordon(self, name, cordoned):
