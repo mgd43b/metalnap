@@ -447,10 +447,17 @@ class Sim:
         # holds_work() still meets the race -- and destroys work, and is
         # caught. Injecting it inside the check made the missing check
         # invisible, which is a fine way to ship a harness that proves nothing.
+        #
+        # And some of it hangs. Only an idle node is ever put to sleep, so work
+        # landing in this window is the ONLY way a drain meets work it has to
+        # wait out -- and without some that outlives the drain timeout, that
+        # branch never ran here and ignoring busy work went unseen.
         for w in listed:
             if self.rnd.random() < 0.15:
                 w.work = "late-" + w.name
-                w.ticks_left = self.rnd.randint(2, 6)
+                w.ticks_left = (self.rnd.randint(150, 400)
+                                if self.rnd.random() < 0.1
+                                else self.rnd.randint(2, 6))
         return [w.name for w in listed]
 
     def residual(self, node):
