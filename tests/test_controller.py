@@ -2013,6 +2013,22 @@ class TestSizing(unittest.TestCase):
         c.tick()
         self.assertTrue(self.cordoned(h, "a"))
 
+    def test_the_longest_idle_node_goes_first_not_the_one_just_done(self):
+        """The pool has had too many nodes for a while, so the demand timer is
+        long satisfied. c finished its job a moment ago -- the likeliest to be
+        handed the next one -- and a has been idle all along."""
+        h = Harness({n: node() for n in "abc"},
+                    busy={"b": ["job-1"], "c": ["job-2"]})
+        c = h.controller(nodes="abc", sleep_sustain_s=600)
+        c.tick()
+        h.t += 500
+        h._busy = {"b": ["job-1"]}                # c's job ends
+        c.tick()
+        h.t += 150
+        c.tick()
+        self.assertFalse(self.cordoned(h, "c"), "slept a node idle for 150s")
+        self.assertTrue(self.cordoned(h, "a"))
+
     def test_a_node_whose_work_cannot_be_read_is_in_use(self):
         h = Harness({"a": node(), "b": node()},
                     busy=RuntimeError("arc api down"))

@@ -116,7 +116,13 @@ test_controller.py, because a 1-in-60 chance is not a safety guarantee. Use
 this harness for emergent, sequence-dependent failures; use the unit tests for
 precise scenarios you can already name.
 
-WHAT IT CANNOT REACH: any interleaving this generator does not produce. The
+WHAT IT CANNOT REACH: any interleaving this generator does not produce. One
+worth naming: demand here is EXOGENOUS. Nothing waiting is ever absorbed by a
+node that wakes, so the shape behind #16 -- a backlog the pool has just soaked
+up reading as no demand at all -- never arises, and neither does a full node
+beside a fresh backlog. Those are covered in test_controller.py's TestSizing;
+what this harness does add for them is the invariant that no node is ever
+taken out of service while it carries work. The
 signal model is shaped from real incidents -- phased demand, a capped-queue
 mode where shortfall parks just below one node's worth while saturation
 toggles, hung work that outlives the drain timeout, operator maintenance,
