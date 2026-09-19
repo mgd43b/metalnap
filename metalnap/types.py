@@ -45,6 +45,11 @@ class NodeState:
     #: falls back to its own start time, which is safe but resets the
     #: maintenance clock on every restart.
     down_since: Optional[float] = None
+    #: An operator's request that this node be held for maintenance -- their
+    #: reason, never empty -- or None. The one input on this list a PERSON
+    #: writes (`metalnap.io/maintenance`) and metalnap never does. See
+    #: Controller._take_up_maintenance() for what holding a node means.
+    maintenance: Optional[str] = None
     # -- durable notes ----------------------------------------------------
     # What this controller has to remember about a node across its own
     # restarts. Each lives ON THE NODE (see NodeSource.note), because each one
@@ -67,6 +72,11 @@ class NodeState:
     #: Why this controller handed the node to a human, or None. In memory, a
     #: restart re-muted a node it had given up on and resolved its alert.
     trouble: Optional[str] = None
+    #: When this controller took up the current maintenance request, powering
+    #: the node on if it was off. It makes that power-on happen ONCE per
+    #: request; in memory, a restart powered back on a machine the operator
+    #: had since switched off to work on.
+    maintenance_started_at: Optional[float] = None
 
 
 class NodeSource(Protocol):
@@ -81,10 +91,14 @@ class NodeSource(Protocol):
     def note(self, name: str, key: str, value) -> None:
         """Durably record one of the notes above; None removes it.
 
-        OPTIONAL. `key` is "power-cycled", "visited" or "shutdown" with a
-        unix timestamp, or "trouble" with a reason. Without it the controller
-        never power-cycles -- a cycle it cannot put on record is one the bound
-        cannot see -- and remembers the rest only until it restarts.
+        OPTIONAL. `key` is "power-cycled", "visited", "shutdown" or
+        "maintenance-started" with a unix timestamp, or "trouble" with a
+        reason. Without it the controller never power-cycles -- a cycle it
+        cannot put on record is one the bound cannot see -- never powers a node
+        on for maintenance, for the same reason, and remembers the rest only
+        until it restarts.
+
+        Never "maintenance" itself: that one is the operator's to write.
         """
 
     def disown(self, name: str) -> None:
@@ -290,6 +304,10 @@ class Warmup(Protocol):
     uncordoning means a slow warmup strands a node that is powered, Ready and
     serving nothing. Worst case here is a few early jobs paying the pull, which
     is exactly the behaviour you had before any warmup existed.
+
+    Only a wake runs it. A scheduled maintenance visit and an operator's
+    maintenance request both bring a node up without putting it into service,
+    so there is nothing for it to warm.
     """
 
     def start(self, node: str) -> None:

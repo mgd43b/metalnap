@@ -119,6 +119,26 @@ Each exists because breaking it cost something real.
   throughout; and a node that goes NotReady inside its window is waited for,
   never powered off, because that is what a node rebooting into a kernel
   update looks like.
+- **When a person asks for a node, give it to them and get out of the way.**
+  See [maintenance mode](#maintenance-mode).
+
+## Maintenance mode
+
+To work on a node, ask for it — no value to set, nothing to redeploy:
+
+```bash
+kubectl annotate --overwrite node k8s7 metalnap.io/maintenance="kernel 6.8"
+kubectl annotate node k8s7 metalnap.io/maintenance- metalnap.io/maintenance-started-
+```
+
+(or `metalnap maintenance start k8s7` / `stop k8s7` with the CLI — see the
+[project README](https://github.com/mgd43b/metalnap#operating-it-from-your-machine)).
+metalnap powers it on **once**, recording that as
+`metalnap.io/maintenance-started` before it does, and then leaves it alone
+until the request is removed: no sleep, no drain, no power cycle, no silence,
+no alert, and no change to its cordon. Power it off to work on it and it stays
+off. Removed, the node is metalnap's again — put into service or to sleep as
+demand says.
 
 ## RBAC
 
@@ -131,5 +151,12 @@ scheduler's API, which deregisters them before teardown.
 
 With `warmup.image` set it also gets `pods: create`, plus `delete` scoped by
 name to exactly its own warmup pods.
+
+None of that is needed by a person asking for a node — the controller's own
+account does the work. The person needs their own `patch` on `nodes` to
+annotate one; with the CLI, also `get`/`list` on the controller's Deployment
+and ConfigMap and on `nodes`, and `list` on `pods` plus `get` on `pods/log`
+for `metalnap logs` -- `kubectl logs deployment/...` has to find the pods
+before it can read them.
 
 [Source and full documentation](https://github.com/mgd43b/metalnap)

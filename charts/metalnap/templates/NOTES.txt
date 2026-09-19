@@ -20,6 +20,12 @@ Roll it back at any time without touching a node:
   helm upgrade {{ .Release.Name }} <chart> --reuse-values --set mode=off
 {{- end }}
 
+To work on a node, ask for it -- metalnap powers it on once and then leaves
+it alone until you give it back:
+
+  kubectl annotate --overwrite node <node> metalnap.io/maintenance="<reason>"
+  kubectl annotate node <node> metalnap.io/maintenance- metalnap.io/maintenance-started-
+
 {{ if not .Values.tolerations -}}
 No tolerations are set, which is correct: metalnap must not be scheduled onto a
 node it manages, or it will cordon and power off the machine it is running on.

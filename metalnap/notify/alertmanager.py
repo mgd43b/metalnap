@@ -138,6 +138,13 @@ class AlertmanagerNotifier:
                 for label in self.labels]
 
     def going_down(self, node):
+        """Silence a node metalnap itself is putting down, or has.
+
+        Never anything else, however dark it goes: a node an operator is
+        working on -- cordoned by them, or asked for in maintenance mode --
+        reboots and powers off on purpose, and a silence over that is theirs
+        to make, not ours.
+        """
         wanted = {_key(ms): ms for ms in self._wanted(node)}
         stale = []
         for s in self._find(node):

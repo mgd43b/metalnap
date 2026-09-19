@@ -3,6 +3,14 @@ Runnable reference deployment: GitHub ARC runners, Kubernetes, IPMI, Prometheus.
 
     python -m metalnap
 
+With a command instead, it is the operator's tool, run on your own machine
+against the controller in a cluster -- see `metalnap status --help`:
+
+    metalnap status                 every managed node, and its state
+    metalnap maintenance start k8s7 --reason "kernel 6.8"
+    metalnap maintenance stop k8s7  ask for a node to work on; give it back
+    metalnap logs -f --node k8s7    the controller's log, readable
+
 Everything comes from the environment so the container image is useful without
 a code change. If your stack differs, import Controller and pass your own
 seams -- that is the point of them, and this module is only one wiring of many.
@@ -66,6 +74,11 @@ Optional:
                             by the metalnap.io/power-cycled annotation, so a
                             restart cannot re-arm it; delete that annotation to
                             re-arm it by hand.
+    MAINTENANCE MODE        not a setting: an operator asks for a node by
+                            annotating it metalnap.io/maintenance=<reason>
+                            (or `metalnap maintenance start`). It is powered
+                            on once, then left alone -- no sleep, drain,
+                            power cycle or mute -- until the annotation goes.
     SHUTDOWN_TIMEOUT_S      how long a soft shutdown may take before the node
                             is reported as one that would not power off
                             (default 600). Never forced.
@@ -74,7 +87,7 @@ Optional:
 import os
 import sys
 
-from . import Config, Controller
+from . import Config, Controller, cli
 from .drain import ArcDrain
 from .drain.arc import ARC_SATURATION_QUERY
 from .kube import (Kube, KubeNodeSource, PendingPodFit, PendingPodShortfall,
@@ -94,9 +107,22 @@ def require(name):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        # `metalnap --context prod status`: the kubectl and helm habit. The
+        # options are the command's, so hand them to it.
+        at = next((i for i, a in enumerate(argv) if a in cli.COMMANDS), None)
+        if at is not None:
+            argv = [argv[at]] + argv[:at] + argv[at + 1:]
+    if argv and argv[0] in cli.COMMANDS:
+        return cli.main(argv)
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
+    if argv:
+        # Anything else was meant as a command. Starting the controller on a
+        # laptop instead would only fail on a missing NODES.
+        sys.exit("metalnap: unknown command %r (see `metalnap --help`)"
+                 % argv[0])
 
     nodes = [n.strip() for n in require("NODES").split(",") if n.strip()]
     ns = os.environ.get("ARC_NAMESPACE", "arc-runners")
@@ -132,9 +158,9 @@ def main(argv=None):
     am = os.environ.get("ALERTMANAGER_URL")
     notifier = None
     if am:
-        labels = [l.strip() for l in os.environ.get(
+        labels = [label.strip() for label in os.environ.get(
             "ALERTMANAGER_SILENCE_LABELS", "instance,node").split(",")
-            if l.strip()]
+            if label.strip()]
         matchers = [m.strip() for m in os.environ.get(
             "ALERTMANAGER_SILENCE_MATCHERS", "").splitlines() if m.strip()]
         try:
