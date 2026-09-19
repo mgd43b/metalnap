@@ -766,6 +766,11 @@ class Controller:
             # Kept for the case where demand takes the visit over mid-boot:
             # the wake it becomes is then a cold boot we started, and counts.
             s["booting"] = power == "off"
+            #: Whether THIS visit could have started an update. One that found
+            #: the node already powered and dark is visiting a wedged node, and
+            #: must not renew the mid-update grace -- it would keep the node
+            #: from ever being cycled or alerted on, one visit at a time.
+            s["visit_powered_on"] = power == "off"
             s.pop("off", None)
             s["phase"] = "maintaining"
             s["phase_since"] = self.now()
@@ -800,7 +805,8 @@ class Controller:
                               "a node that may be mid-update", node=name,
                      timeout_s=cfg.maintenance_timeout_s)
             self._release_visit(name)
-            s.setdefault("dark_after_visit", self.now())
+            if s.get("visit_powered_on"):
+                s.setdefault("dark_after_visit", self.now())
             self._set_trouble(name, "still not Ready %ds into a maintenance "
                                     "visit" % cfg.maintenance_timeout_s, state)
             return
@@ -1290,9 +1296,7 @@ class Controller:
             self.log("warn", "saturation check failed; sizing on shortfall "
                              "alone", err=str(e))
             saturated = 0
-        # A saturated queue admits no more work, so its demand is invisible to
-        # shortfall(). Count each as one node's worth.
-        backlog += saturated
+        st["_tick"] = st.get("_tick", 0) + 1
         # `want` is how many nodes should be AWAKE, so it has to count the
         # ones already carrying work, not only the work still waiting. The
         # shortfall sees only what the scheduler cannot place; once awake nodes
@@ -1305,7 +1309,44 @@ class Controller:
                 self._node(n).setdefault("idle_since", self.now())
             else:
                 self._node(n).pop("idle_since", None)
-        want = max(0, min(len(wakeable), len(in_use) + backlog))
+        # A saturated queue admits no more work, so its demand is invisible to
+        # shortfall() -- and it is a FLOOR, not more demand. Its runners sit on
+        # nodes already counted in use; a node woken on top of them is one the
+        # capped queue can never use. Counted as an addend it did exactly
+        # that, and held the extra node awake and idle for as long as the cap
+        # held.
+        want = max(0, min(len(wakeable),
+                          max(len(in_use) + backlog, saturated)))
+        # Scale-up simulation: would the waiting work actually FIT here?
+        # shortfall() is a sum, which assumes everything waiting is waiting on
+        # capacity. Work blocked on a selector or a volume, or too big for a
+        # node, inflates it -- and would wake a node that cannot help, keep an
+        # idle one awake, and pull a draining one back into service.
+        #
+        # Skipped when saturation drove the demand: a saturated queue has
+        # nothing pending to inspect -- that is the entire problem.
+        #
+        # Decided here, BEFORE anything acts on `want`, so a mid-sleep rescue
+        # or a visit takeover cannot fire on demand that cannot land. The one
+        # exception is the stranded repair below, which keeps `unguarded`: a
+        # differential test against the controller this replaced found 40
+        # divergences in 3000 states, every one with fits=False, and every one
+        # a STRANDED node -- already powered, already cordoned -- put to sleep
+        # instead of returned to service. Both are safe, but returning it
+        # matches "wake readily, sleep reluctantly", and a transient fit-check
+        # failure cannot power off a node that was only ever mid-wake.
+        unguarded = want
+        if backlog > 0 and saturated == 0:
+            try:
+                if not self.signal.fits_node(capacity):
+                    self.log("info", "demand present but none of it could run "
+                                     "on a node this size; not counting it",
+                             shortfall=_show(shortfall))
+                    want = max(0, min(len(wakeable), len(in_use)))
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "fit check failed; holding the pool as it is",
+                         err=str(e))
+                want = len(awake)
 
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
@@ -1342,7 +1383,8 @@ class Controller:
                     # may be rebooting into an update, and must not be the one
                     # a wake timeout power-cycles.
                     st[n]["phase"] = "waking"
-                    st[n].setdefault("dark_after_visit", self.now())
+                    if st[n].get("visit_powered_on"):
+                        st[n].setdefault("dark_after_visit", self.now())
                     for k in ("cycled", "power_confirmed", "cold_start"):
                         st[n].pop(k, None)
                     continue
@@ -1350,6 +1392,7 @@ class Controller:
                     self._set_cordon(n, False)
                     st[n]["awake_since"] = self.now()
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
                 continue
@@ -1375,6 +1418,7 @@ class Controller:
                 try:
                     self._set_cordon(n, False)
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
                 continue
@@ -1384,6 +1428,7 @@ class Controller:
                         # Serving from this tick on. Counted now, or the
                         # decisions below see demand this node already meets.
                         awake.append(n)
+                        st["_joined_tick"] = st["_tick"]
                 elif phase == "warming":
                     self.warm(n)
                 elif phase == "maintaining":
@@ -1403,13 +1448,14 @@ class Controller:
                     if states[n].ready and self._ours(states[n])
                     and n not in in_flight]
         for n in stranded:
-            if len(awake) < want:
+            if len(awake) < unguarded:
                 self.log("warn", "stranded node needed; completing the wake",
                          node=n)
                 try:
                     self._set_cordon(n, False)
                     self._node(n)["awake_since"] = self.now()
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
             else:
@@ -1421,35 +1467,6 @@ class Controller:
                     self.log("error", "could not sleep", node=n, err=str(e))
             return  # one corrective action per tick; re-observe next
 
-        # Scale-up simulation: would the waiting work actually FIT here?
-        # shortfall() is a sum, which assumes everything waiting is waiting on
-        # capacity. Work blocked on a selector, a taint or a volume inflates it
-        # and powers on a machine that cannot help.
-        #
-        # Skipped when saturation drove the demand: a saturated queue has
-        # nothing pending to inspect -- that is the entire problem -- so
-        # applying the check there would veto every saturation-driven wake.
-        #
-        # POSITION MATTERS, and it is deliberately after the stranded reconcile
-        # rather than before it. A differential test against the controller
-        # this replaces found 40 divergences in 3000 states, every one of them
-        # here and every one with fits=False: guarding first meant a STRANDED
-        # node -- already powered, already cordoned -- got put to sleep instead
-        # of returned to service. Both are safe, but returning it matches the
-        # documented "wake readily, sleep reluctantly" bias, and it means a
-        # transient fit-check failure cannot power off a node that was only
-        # ever mid-wake.
-        if want > len(awake) and saturated == 0:
-            try:
-                if not self.signal.fits_node(capacity):
-                    self.log("info", "demand present but none of it could run "
-                                     "on a node this size; not waking",
-                             shortfall=_show(shortfall))
-                    want = len(awake)
-            except Exception as e:                    # noqa: BLE001
-                self.log("warn", "fit check failed; not waking", err=str(e))
-                want = len(awake)
-
         now = self.now()
         # Capacity already on its way. Only a cold boot WE started counts: one
         # found powered may be wedged, and counting it would hold demand back
@@ -1460,6 +1477,12 @@ class Controller:
         self.log("info", "observed", shortfall=_show(shortfall),
                  saturated=saturated, want=want, awake=awake, in_use=in_use,
                  coming=coming)
+        # A node that joined service last tick carries work a SCRAPED signal
+        # may not have seen placed yet: busy() counts it, and a shortfall
+        # from before the scrape counts it again. Hold new wakes for that one
+        # tick. The default signal reads pods live and cannot double-count,
+        # but a PromQL override scraped once a minute can.
+        just_joined = st.get("_joined_tick") == st["_tick"] - 1
 
         if want > len(awake):
             st["want_high_since"] = st.get("want_high_since") or now
@@ -1471,7 +1494,7 @@ class Controller:
             # came up -- measured in production at three and four nodes for
             # want=1, every demand episode, each then held up by min_uptime.
             if (now - st["want_high_since"] >= cfg.wake_sustain_s
-                    and want > len(awake) + len(coming)):
+                    and want > len(awake) + len(coming) and not just_joined):
                 for n in wakeable:
                     if n in awake or n in in_flight:
                         continue

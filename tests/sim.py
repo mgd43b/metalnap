@@ -529,6 +529,7 @@ class Sim:
             if n.updating is not None:
                 continue                         # advance() brings it back
             if (self.cfg.maintenance_interval_s and n.powered and n.ready
+                    and n.partitioned is None and not n.hung
                     and self.controller is not None
                     and self.controller.st.get(n.name, {}).get("phase")
                             == "maintaining"
@@ -564,7 +565,12 @@ class Sim:
                 self.workers = [w for w in self.workers if w.node != n.name]
             elif n.partitioned is not None and self.t >= n.partitioned:
                 n.partitioned = None
-                n.ready, n.ready_since = n.powered, self.t
+                if n.updating is None:
+                    # A reboot in flight decides readiness itself, when its
+                    # own change_at comes round. Declaring the node Ready here
+                    # had the harness blame the controller for ending a visit
+                    # on a node that only looked recovered.
+                    n.ready, n.ready_since = n.powered, self.t
 
         # An operator eventually takes a broken node away and repairs it. They
         # remove metalnap's mark as they cordon, which is what taking a node
@@ -598,16 +604,17 @@ class Sim:
         self.quiet_ticks = 0
         self.busy_ticks += 1
         if self.capped:
-            # The flicker shape. Demand parks just BELOW one node's worth, so
-            # it alone asks for one node and only saturation pushes it to two
-            # -- and saturation toggles, because a queue hovering at its
-            # ceiling crosses the threshold back and forth. That keeps every
-            # want=2 run to one or two ticks, which is what starves a timer
-            # needing three. Independent randomness produces long runs instead,
-            # and a broken controller wakes during them.
-            self.demand = self.rnd.uniform(0.55, 0.95) * CAPACITY
+            # The flicker shape. A queue hovering at its ceiling: saturation
+            # toggles, and the backlog straddles a node's worth with it --
+            # just below, then just above -- so `want` flips by one, tick by
+            # tick. That keeps every "wants more" run to one or two ticks,
+            # which is what starves a timer needing three. Independent
+            # randomness produces long runs instead, and a broken controller
+            # wakes during them.
             if self.rnd.random() < 0.75:
                 self.saturated = 0 if self.saturated else 1
+            self.demand = (self.rnd.uniform(0.55, 0.95)
+                           + self.saturated) * CAPACITY
         elif self.big:
             self.demand = self.rnd.choice([260.0, 300.0, 280.0])
             self.saturated = self.rnd.choice([0, 1, 1, 2])
@@ -905,9 +912,11 @@ class Sim:
         if self.per_resource:
             backlog = max(backlog, math.ceil(self.demand * self.cpu_per_gib
                                              / CPU_CAPACITY))
+        # Saturation is a floor on what is wanted, not more of it: a capped
+        # queue's runners are already on powered nodes.
         need = min(sum(1 for n in self.nodes.values()
                        if not n.hung and n.partitioned is None),
-                   backlog + self.saturated)
+                   max(backlog, self.saturated))
         # A wedged node is powered and serves nothing, so it is not capacity.
         powered = sum(1 for n in self.nodes.values()
                       if n.powered and not n.hung and n.partitioned is None)

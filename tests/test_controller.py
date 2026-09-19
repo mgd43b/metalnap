@@ -474,17 +474,21 @@ class TestNotifier(unittest.TestCase):
 
 
 class TestFlickeringDemand(unittest.TestCase):
-    """`want` oscillates when a queue sits exactly at its ceiling."""
+    """`want` oscillates when a backlog sits right at a node's worth.
+
+    a carries work, so it is one node wanted on its own; a backlog either side
+    of the boundary makes that one or two, tick by tick.
+    """
 
     def test_dip_to_equality_does_not_reset_the_wake_timer(self):
         h = Harness({"a": node(), "b": node(ready=False)},
-                    shortfall=60.0, saturated=1)
+                    shortfall=60.0, busy={"a": ["job-1"]})
         c = h.controller(wake_sustain_s=120)
-        # t, saturated: 2 ticks wanting more, a dip, then wanting more again.
+        # t, backlog: 2 ticks wanting more, a dip, then wanting more again.
         woken = []
-        for dt, sat in ((0, 1), (60, 1), (90, 0), (200, 1)):
+        for dt, short in ((0, 60.0), (60, 60.0), (90, 0.0), (200, 60.0)):
             h.t = 1000.0 + dt
-            h._saturated = sat
+            h._shortfall = short
             c.tick()
             woken += h.acted["on"]
             h.acted["on"] = []
@@ -493,12 +497,12 @@ class TestFlickeringDemand(unittest.TestCase):
 
     def test_a_one_off_spike_does_not_leave_a_primed_timer(self):
         h = Harness({"a": node(), "b": node(ready=False)},
-                    shortfall=60.0, saturated=1)
+                    shortfall=60.0, busy={"a": ["job-1"]})
         c = h.controller(wake_sustain_s=120)
         woken = []
-        for dt, sat in ((0, 1), (60, 0), (400, 0), (460, 1)):
+        for dt, short in ((0, 60.0), (60, 0.0), (400, 0.0), (460, 60.0)):
             h.t = 1000.0 + dt
-            h._saturated = sat
+            h._shortfall = short
             c.tick()
             woken += h.acted["on"]
             h.acted["on"] = []
@@ -1226,10 +1230,29 @@ class TestWakeEscalation(unittest.TestCase):
                          maintenance_window_s=300, maintenance_stagger_s=0,
                          maintenance_timeout_s=3600)
         c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
-                     "maintenance_at": h.t}
+                     "maintenance_at": h.t, "visit_powered_on": True}
         c.tick()
         self.assertEqual(c.st["a"]["phase"], "waking")
         self.assertIn("dark_after_visit", c.st["a"])
+
+    def test_a_visit_that_found_the_node_powered_grants_no_grace(self):
+        """Wedged since long before this visit, which powered nothing on:
+        taken over by demand, it must still be cycled at the wake timeout.
+        Renewing the grace here -- found by the long soak -- kept a wedged
+        node from ever being cycled, one visit at a time."""
+        h = Harness({"a": asleep(at=T0)}, shortfall=400.0,
+                    chassis={"a": "on"})
+        h.t = T0
+        c = h.controller(nodes=("a",), maintenance_interval_s=3600,
+                         maintenance_window_s=300, maintenance_stagger_s=0,
+                         maintenance_timeout_s=3600)
+        c.st["a"] = {"phase": "maintaining", "phase_since": h.t,
+                     "maintenance_at": h.t, "visit_powered_on": False}
+        c.tick()                                  # demand takes the visit
+        h.t += 901
+        c.tick()
+        self.assertEqual(h.acted["cycle"], ["a"], "a no-op visit renewed "
+                                                  "the mid-update grace")
 
     def test_dry_run_never_cycles(self):
         h = self.harness()
@@ -2058,6 +2081,83 @@ class TestSizing(unittest.TestCase):
             c.tick()
         self.assertEqual(h.acted["on"], [])
 
+    def test_saturation_is_a_floor_not_another_node(self):
+        """A capped queue's runners are on the busy nodes already. A node
+        woken on top is one the cap will never let it use."""
+        h = Harness({"a": node(), "b": node(), "c": node(),
+                     "d": asleep(at=1000.0)}, saturated=1,
+                    busy={n: ["job"] for n in "abc"})
+        c = h.controller(nodes="abcd")
+        for _ in range(3):
+            c.tick()
+            h.t += 60
+        self.assertEqual(h.acted["on"], [], "woke a node a capped queue "
+                                            "cannot use")
+
+    def test_saturation_still_keeps_a_node(self):
+        h = Harness({"a": node()}, saturated=1)
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [], "slept the last node of a "
+                                                "saturated pool")
+
+    def test_work_that_cannot_land_holds_no_idle_node(self):
+        h = Harness({"a": node(), "b": node()}, shortfall=60.0, fits=False,
+                    busy={"a": ["job-1"]})
+        c = h.controller()
+        c.tick()
+        self.assertIn(("b", True), h.acted["cordon"],
+                      "an idle node held awake for work it cannot run")
+
+    def test_work_that_cannot_land_rescues_no_drain(self):
+        h = Harness({"a": node(), "b": node(cordoned=True, ours=True)},
+                    shortfall=60.0, fits=False, busy={"a": ["job-1"]})
+        c = h.controller()
+        c.st["b"] = {"phase": "sleeping", "phase_since": h.t}
+        c.tick()
+        self.assertNotIn(("b", False), h.acted["cordon"],
+                         "pulled a drain back for work it cannot run")
+
+    def test_a_fit_check_that_fails_holds_the_pool(self):
+        h = Harness({"a": node(), "b": asleep(at=1000.0)}, shortfall=60.0,
+                    busy={"a": ["job-1"]})
+        h.fits_node = lambda cap: (_ for _ in ()).throw(RuntimeError("api"))
+        c = h.controller()
+        c.tick()
+        self.assertEqual((h.acted["on"], h.acted["cordon"]), ([], []))
+
+    def test_a_stranded_node_is_still_returned_on_unfit_demand(self):
+        """The one deliberate exception, pinned by a differential test
+        against the controller this replaced."""
+        h = Harness({"a": node(cordoned=True, ours=True), "b": None},
+                    shortfall=400.0, fits=False)
+        c = h.controller()
+        c.tick()
+        self.assertIn(("a", False), h.acted["cordon"])
+
+    def test_no_new_wake_the_tick_after_a_node_joins(self):
+        """A scraped shortfall can still count the pods that just landed on
+        it, which busy() now counts too."""
+        booting = {"phase": "waking", "phase_since": 1000.0,
+                   "booting": True, "power_confirmed": True}
+        h = Harness({"a": node(), "b": node(cordoned=True, ours=True),
+                     "c": asleep(at=1000.0),
+                     "d": asleep(at=1000.0)}, shortfall=200.0,
+                    busy={"a": ["job-1"]})
+        h.chassis["c"] = "on"
+        c = h.controller(nodes="abcd")
+        c.st["b"], c.st["c"] = dict(booting), dict(booting)
+        c.tick()          # b joins: 1 in use + 2 waiting = 2 awake + c coming
+        self.assertEqual(h.acted["on"], [])
+        h.states["b"] = node()
+        h._busy = {"a": ["job-1"], "b": ["job-2"]}
+        h.t += 60
+        c.tick()          # b's pods are busy AND still in a stale shortfall
+        self.assertEqual(h.acted["on"], [], "double-counted a joining node")
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["d"], "held the wake too long")
+
     def test_a_resource_no_node_reports_is_not_sized_on(self):
         h = Harness({"a": asleep(at=1000.0, capacity={"memory": 110.0}),
                      "b": asleep(at=1000.0, capacity={"memory": 110.0})},
@@ -2212,21 +2312,29 @@ class TestPerResourceSeams(unittest.TestCase):
         env = {"NODES": "a,b", "BMC_HOST_FMT": "{node}-bmc.", "BMC_USER": "u",
                "BMC_PASS": "p", "PROM_URL": "http://prom",
                "ALERTMANAGER_URL": "http://am", "MODE": "dry_run"}
-        built = {}
-        saved = dict(os.environ)
-        real = entry.Controller.run_forever
-        entry.Controller.run_forever = lambda c: built.update(c=c)
-        try:
-            os.environ.update(env)
-            self.assertEqual(entry.main([]), 0)
-        finally:
-            entry.Controller.run_forever = real
-            os.environ.clear()
-            os.environ.update(saved)
-        c = built["c"]
-        self.assertEqual(set(c.signal.shortfall_query), {"memory", "cpu"})
-        self.assertEqual(c.signal.shortfall_query["cpu"].__qualname__,
-                         "PendingPodShortfall.of.<locals>.shortfall")
+
+        def build(**extra):
+            built = {}
+            saved = dict(os.environ)
+            real = entry.Controller.run_forever
+            entry.Controller.run_forever = lambda c: built.update(c=c)
+            try:
+                os.environ.update(env, **extra)
+                self.assertEqual(entry.main([]), 0)
+            finally:
+                entry.Controller.run_forever = real
+                os.environ.clear()
+                os.environ.update(saved)
+            return built["c"].signal.shortfall_query
+
+        live = "PendingPodShortfall.of.<locals>.shortfall"
+        q = build()
+        self.assertEqual(set(q), {"memory", "cpu"})
+        self.assertEqual(q["cpu"].__qualname__, live)
+        self.assertEqual(set(build(CPU_SHORTFALL_QUERY="")), {"memory"},
+                         '"" did not size on memory alone')
+        q = build(CPU_SHORTFALL_QUERY="sum(cpu)", SHORTFALL_QUERY="sum(mem)")
+        self.assertEqual(q, {"memory": "sum(mem)", "cpu": "sum(cpu)"})
 
     def test_a_source_may_be_a_callable(self):
         from metalnap.signal import prometheus
