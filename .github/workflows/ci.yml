@@ -31,8 +31,9 @@ jobs:
 
       - name: Lint
         # Nothing linted the tree, and it showed: an unused import and two
-        # ambiguous names had accumulated by the time anyone ran ruff. Its
-        # default rules only -- pyflakes and the unambiguous pycodestyle ones.
+        # ambiguous names had accumulated by the time anyone ran ruff. The
+        # rules are pinned in pyproject.toml, not left to whichever ruff this
+        # installs.
         run: |
           .venv/bin/pip install --quiet ruff
           .venv/bin/ruff check .
