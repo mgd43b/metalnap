@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.5.0](https://github.com/mgd43b/metalnap/compare/v0.4.0...v0.5.0) (2026-09-19)
+
+
+### Features
+
+* a `metalnap` CLI for the person at the keyboard ([390cbe9](https://github.com/mgd43b/metalnap/commit/390cbe9bf01b37e28635e67b985913fff697a992))
+* maintenance mode -- ask metalnap for a node to work on ([339b75c](https://github.com/mgd43b/metalnap/commit/339b75c31c4db03a32034caffc1b80dc3113fcd8))
+* maintenance mode, and a metalnap CLI to drive it ([f56754a](https://github.com/mgd43b/metalnap/commit/f56754abdbee70596b3ca328c6e33416e00648d9))
+
+
+### Fixes
+
+* a maintenance hold forgets a wake given up on, and does not wait out a warmup ([3345954](https://github.com/mgd43b/metalnap/commit/334595472a70af72f1fcc086d1718b76c6fc8c9d))
+* read configuration when a Config is built, not at import ([3429444](https://github.com/mgd43b/metalnap/commit/3429444814849dd09cda8feef5c3821c90a2ca07))
+
+
+### Documentation
+
+* use placeholder node names and annotation domains throughout ([00b4d16](https://github.com/mgd43b/metalnap/commit/00b4d1644be186d3b29a2b904f330f67f6f0b84d))
+* use placeholder node names and annotation domains throughout ([55436ee](https://github.com/mgd43b/metalnap/commit/55436eef94d5f791592475d21c9085887cbe25ed))
+
+
+### Testing
+
+* keep the closed-pipe test off the real stdout; name the pod list logs needs ([1ea9f6e](https://github.com/mgd43b/metalnap/commit/1ea9f6e86cd82742a530b7e348d3c7fa60d82921))
+* model operator maintenance requests in the simulation harness ([70ef834](https://github.com/mgd43b/metalnap/commit/70ef834db404449392f448bf5d95b57e9eb2e81c))
+
 ## [0.4.0](https://github.com/mgd43b/metalnap/compare/v0.3.1...v0.4.0) (2026-09-19)
 
 
