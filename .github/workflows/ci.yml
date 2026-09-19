@@ -63,10 +63,10 @@ jobs:
 
       - name: Simulation harness
         # Thousands of ticks against a fake cluster with phased demand, hung
-        # work, operator cordons and maintenance requests, and injected restarts,
-        # asserting safety
-        # AND liveness after every tick. Every bug this project's ancestor
-        # shipped lived in a SEQUENCE, which single-call unit tests cannot see.
+        # work, operator cordons and maintenance requests, and injected
+        # restarts, asserting safety AND liveness after every tick. Every bug
+        # this project's ancestor shipped lived in a SEQUENCE, which
+        # single-call unit tests cannot see.
         run: .venv/bin/python -B tests/sim.py --seeds 60 --ticks 900
 
       - name: Simulation harness (soak)
