@@ -106,13 +106,7 @@ def require(name):
 
 
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
-        # `metalnap --context prod status`: the kubectl and helm habit. The
-        # options are the command's, so hand them to it.
-        at = next((i for i, a in enumerate(argv) if a in cli.COMMANDS), None)
-        if at is not None:
-            argv = [argv[at]] + argv[:at] + argv[at + 1:]
+    argv = cli.command_first(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in cli.COMMANDS:
         return cli.main(argv)
     if "--help" in argv or "-h" in argv:

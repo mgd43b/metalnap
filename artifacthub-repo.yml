@@ -16,7 +16,7 @@
 repositoryID: 10b4c793-b088-46d1-875f-4da419d356d3
 owners:
   - name: mgd43b
-    email: matt+claude@reloadingtracker.com
+    email: matt+github@alpha345.com
 ignore:
   # Chart 0.1.0 shipped an artifacthub.io/signKey annotation with a placeholder
   # fingerprint and no url. `url` is mandatory once that entry exists, so

@@ -798,6 +798,33 @@ class TestKubectlMissing(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestMainDispatch(unittest.TestCase):
+    def test_the_metalnap_command_alone_shows_the_commands(self):
+        """It used to fall through to the controller, which on a laptop only
+        ever said NODES was required."""
+        for argv in ([], ["--help"], ["help"]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.console(argv), 0)
+            self.assertIn("maintenance start|stop", out.getvalue())
+
+    def test_the_metalnap_command_refuses_an_unknown_one(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cli.console(["run"]), 2)
+        self.assertIn("unknown command 'run'", err.getvalue())
+
+    def test_the_metalnap_command_takes_options_first(self):
+        with mock.patch.object(cli, "main", return_value=0) as m:
+            cli.console(["--context", "prod", "status"])
+        m.assert_called_once_with(["status", "--context", "prod"])
+
+    def test_the_console_script_is_the_cli_not_the_controller(self):
+        import re as _re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        text = open(os.path.join(root, "pyproject.toml")).read()
+        self.assertRegex(text, _re.compile(
+            r'^metalnap = "metalnap\.cli:console"$', _re.M))
+
     def test_known_command_goes_to_the_cli(self):
         with mock.patch.object(main_mod.cli, "main",
                               return_value=0) as m:
