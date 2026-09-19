@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.4.0](https://github.com/mgd43b/metalnap/compare/v0.3.1...v0.4.0) (2026-09-19)
+
+
+### Features
+
+* scheduled maintenance wakeups for idle nodes ([bfa2b95](https://github.com/mgd43b/metalnap/commit/bfa2b956a6c95c5764bcb3e146e6f1018826cd95))
+* scheduled maintenance wakeups for idle nodes ([578ceb8](https://github.com/mgd43b/metalnap/commit/578ceb8a89e3fc08297b2269764b667c9a32b5ca))
+* silence a sleeping node by `node` as well as `instance` ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+
+
+### Fixes
+
+* confirm a soft shutdown before calling a sleep complete ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* count a cold boot as capacity on its way ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* count only pending work that tolerates the whole burst taint ([5adba48](https://github.com/mgd43b/metalnap/commit/5adba4883c1a1170500f5a0b3a8e1219c7838a83))
+* keep a failing BMC or demand signal from stalling the reconcile ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* keep the BMC password out of ipmitool's argv ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* keep the stagger offset strictly inside [0, stagger) ([b1c5813](https://github.com/mgd43b/metalnap/commit/b1c5813f547a65c9d08286f8d1ae4204c8a02b94))
+* parse every Kubernetes quantity, and count only demand that can land ([8574e14](https://github.com/mgd43b/metalnap/commit/8574e145eee07fc204ec116c900befeb5e8d4d8c))
+* power-cycle a node that wakes powered but wedged ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* power-cycle wedged nodes once, and mute only what metalnap put down ([33aa143](https://github.com/mgd43b/metalnap/commit/33aa1437ffa2a7128faa7e83a622297e2ebf4b81))
+* read unmet demand off the pods, with the scheduler's own formula ([82b5764](https://github.com/mgd43b/metalnap/commit/82b57640a522b2cb3a27aafd188d14f8f123f6cd))
+* saturation is a floor, and unplaceable work holds nothing ([106058f](https://github.com/mgd43b/metalnap/commit/106058f8814ec37c5b73b3839dbdc14dd792eb7f))
+* size the burst pool on the work it holds, and on CPU as well as memory ([276cc4c](https://github.com/mgd43b/metalnap/commit/276cc4c6761a6083f5132ea3f6696c2f7cd25c61))
+* stop treating an operator's cordon as ours after an uncordon ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+
+
+### Documentation
+
+* correct the notifier's comments, examples and chart docs ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* re-measure every detection table against the harness as it stands ([e867729](https://github.com/mgd43b/metalnap/commit/e86772959cc3c90d7175a1decba87fbe5411b5af))
+* use a placeholder BMC hostname in the Dockerfile's resolver note ([dab4c31](https://github.com/mgd43b/metalnap/commit/dab4c31a4d1850c96012ba642b6917dc68c5f4b9))
+* use a placeholder BMC hostname in the Dockerfile's resolver note ([f2cc550](https://github.com/mgd43b/metalnap/commit/f2cc5500102f69e50c8f1b0edfbf0c0fb28974bc))
+
+
+### Testing
+
+* a restarted sleep keeps the cordon it already holds ([6491fbf](https://github.com/mgd43b/metalnap/commit/6491fbfe27832a83e08d3dbd4014e1bc831a2a9e))
+* assert the BMC password is absent from the whole command line ([65b954b](https://github.com/mgd43b/metalnap/commit/65b954b369ddeab89d95b3bcd2c42e1dc4f97517))
+* clear a stale partition on power-off, and fix a docstring the review caught out ([88ddf75](https://github.com/mgd43b/metalnap/commit/88ddf750a7611aac9e9d68c334e621976339bfca))
+* let some work that lands mid-drain hang ([1123bdb](https://github.com/mgd43b/metalnap/commit/1123bdb5d99ef441cd1be26c168a2afb03c7c371))
+* model wedged and partitioned nodes in the simulation harness ([84640a9](https://github.com/mgd43b/metalnap/commit/84640a96fbb9738c12270e188f2f07fbef8f19ee))
+* pin the per-node idle window, and say what the harness cannot reach ([de6bb51](https://github.com/mgd43b/metalnap/commit/de6bb514cc891a4cd0df398b69dbbbad73ba5087))
+
 ## [0.3.1](https://github.com/mgd43b/metalnap/compare/v0.3.0...v0.3.1) (2026-09-02)
 
 
