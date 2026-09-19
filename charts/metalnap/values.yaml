@@ -69,10 +69,14 @@ warmup:
   image: ""
   pullSecrets: []
 
-# The taint that keeps other work off your sleepable nodes. Used for the warmup
-# pod's toleration and for the pending-work fit check -- work that does not
-# tolerate it can never land here, however much room the node has.
+# The taint that keeps other work off your sleepable nodes, exactly as they
+# carry it -- `kubectl taint node <node> ci-burst=true:NoSchedule`. The warmup
+# pod tolerates it, and only pending work tolerating it, by the scheduler's own
+# rule, counts as demand: work that does not can never land here, however much
+# room the node has. So a taint that differs from the nodes' reads as NO demand.
 burstTaintKey: ci-burst
+burstTaintValue: "true"
+burstTaintEffect: NoSchedule
 
 arc:
   namespace: arc-runners

@@ -97,6 +97,17 @@
     "burstTaintKey": {
       "type": "string"
     },
+    "burstTaintValue": {
+      "type": "string"
+    },
+    "burstTaintEffect": {
+      "type": "string",
+      "enum": [
+        "NoSchedule",
+        "PreferNoSchedule",
+        "NoExecute"
+      ]
+    },
     "tolerations": {
       "type": "array",
       "description": "Keep this empty. metalnap must never be schedulable onto a node it manages."

@@ -1179,8 +1179,7 @@ class TestWakeEscalation(unittest.TestCase):
         h = self.harness()
         h.states["a"] = crashed(cordoned=True, ours=True,
                                 visited_at=h.t - 600)
-        c = wedged(h, h.controller(nodes=("a",),
-                                   maintenance_timeout_s=3600))
+        wedged(h, h.controller(nodes=("a",), maintenance_timeout_s=3600))
         self.assertEqual(h.acted["cycle"], [], "cut power mid-update")
 
     def test_a_visit_to_a_powered_node_does_not_renew_the_grace(self):
@@ -2182,7 +2181,6 @@ class TestSizing(unittest.TestCase):
     def test_the_default_shortfall_is_read_off_the_pods(self):
         """PromQL cannot tell a sidecar from an init container for a pod that
         was never scheduled; the pod spec can."""
-        from metalnap.__main__ import main  # noqa: F401 -- wiring imports
         from metalnap.kube import PendingPodShortfall
         runner = {"containers": [{"resources": {"requests": {
             "cpu": "2", "memory": "4Gi"}}}],
@@ -2204,10 +2202,102 @@ class TestSizing(unittest.TestCase):
         self.assertEqual(pending.of("cpu")(), 4.0)
 
 
+BURST_TAINT = {"key": "ci-burst", "value": "true", "effect": "NoSchedule"}
+
+
+class TestTolerates(unittest.TestCase):
+    """The scheduler's rule, clause for clause: a pod that the scheduler
+    would keep off a burst node is no demand for one."""
+
+    def tolerates(self, *tolerations, taint=BURST_TAINT):
+        from metalnap.kube import tolerates
+        return tolerates({"spec": {"tolerations": list(tolerations)}}, taint)
+
+    def test_no_taint_lets_everything_land(self):
+        self.assertTrue(self.tolerates(taint=None))
+        from metalnap.kube import tolerates
+        self.assertTrue(tolerates({"spec": {}}, None))
+
+    def test_equal_needs_the_same_value(self):
+        self.assertTrue(self.tolerates(dict(BURST_TAINT, operator="Equal")))
+        self.assertFalse(self.tolerates(
+            {"key": "ci-burst", "operator": "Equal", "value": "false"}))
+        # No operator is Equal, and no value is "", not "anything".
+        self.assertTrue(self.tolerates({"key": "ci-burst", "value": "true"}))
+        self.assertFalse(self.tolerates({"key": "ci-burst"}))
+
+    def test_exists_takes_any_value_of_its_key(self):
+        self.assertTrue(self.tolerates({"key": "ci-burst",
+                                        "operator": "Exists"}))
+        self.assertFalse(self.tolerates({"key": "gpu", "operator": "Exists"}))
+
+    def test_an_empty_key_with_exists_tolerates_every_taint(self):
+        self.assertTrue(self.tolerates({"operator": "Exists"}))
+
+    def test_the_effect_must_match_when_named(self):
+        self.assertFalse(self.tolerates({"key": "ci-burst",
+                                         "operator": "Exists",
+                                         "effect": "NoExecute"}))
+        self.assertFalse(self.tolerates({"operator": "Exists",
+                                         "effect": "NoExecute"}))
+        self.assertTrue(self.tolerates({"key": "ci-burst",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule"}))
+        self.assertTrue(self.tolerates(
+            {"key": "ci-burst", "operator": "Exists", "effect": "NoExecute"},
+            taint=dict(BURST_TAINT, effect="NoExecute")))
+
+    def test_an_unknown_operator_tolerates_nothing(self):
+        self.assertFalse(self.tolerates({"key": "ci-burst", "operator": "Lt",
+                                         "value": "true"}))
+
+    def test_one_matching_toleration_is_enough(self):
+        self.assertTrue(self.tolerates({"key": "gpu", "operator": "Exists"},
+                                       dict(BURST_TAINT, operator="Equal")))
+        self.assertFalse(self.tolerates())
+
+    def test_a_preferred_taint_turns_nothing_away(self):
+        self.assertTrue(self.tolerates(
+            taint=dict(BURST_TAINT, effect="PreferNoSchedule")))
+
+    def test_an_effect_left_out_is_no_schedule(self):
+        taint = {"key": "ci-burst", "value": "true"}
+        self.assertFalse(self.tolerates(taint=taint))
+        self.assertTrue(self.tolerates(dict(BURST_TAINT, operator="Equal"),
+                                       taint=taint))
+
+    def test_a_bare_key_still_matches_on_the_key_alone(self):
+        """The older wiring, PendingPodFit(toleration_key=...), keeps its
+        meaning."""
+        self.assertTrue(self.tolerates({"key": "ci-burst"}, taint="ci-burst"))
+        self.assertTrue(self.tolerates({"key": "ci-burst", "value": "no"},
+                                       taint="ci-burst"))
+        self.assertTrue(self.tolerates({"operator": "Exists"},
+                                       taint="ci-burst"))
+        self.assertFalse(self.tolerates({"key": "gpu"}, taint="ci-burst"))
+
+    def test_the_fit_check_uses_the_whole_taint(self):
+        from metalnap.kube import PendingPodFit
+        wrong = {"spec": {"tolerations": [{"key": "ci-burst",
+                                           "value": "false"}],
+                          "containers": [{"resources": {"requests": {
+                              "memory": "1Gi"}}}]}}
+
+        class K:
+            def request(self, *a, **k):
+                return {"items": [wrong]}
+        self.assertFalse(PendingPodFit(K(), "ns", taint=BURST_TAINT)(100.0),
+                         "a pod tolerating ci-burst=false fits a "
+                         "ci-burst=true node?")
+        self.assertTrue(PendingPodFit(K(), "ns",
+                                      toleration_key="ci-burst")(100.0),
+                        "the key-only form changed its meaning")
+
+
 class TestPerResourceSeams(unittest.TestCase):
     def pod(self, cpu, mem, sidecar_cpu="0", init_cpu="1"):
         return {"spec": {
-            "tolerations": [{"key": "ci-burst"}],
+            "tolerations": [dict(BURST_TAINT, operator="Equal")],
             "containers": [{"resources": {"requests": {"cpu": cpu,
                                                        "memory": mem}}}],
             "initContainers": [
@@ -2222,7 +2312,7 @@ class TestPerResourceSeams(unittest.TestCase):
         class K:
             def request(self, *a, **k):
                 return {"items": pods}
-        return PendingPodFit(K(), "ns", toleration_key="ci-burst")(capacity)
+        return PendingPodFit(K(), "ns", taint=BURST_TAINT)(capacity)
 
     def test_a_pod_fits_only_if_every_resource_does(self):
         cap = {"memory": 110.0, "cpu": 40.0}
@@ -2300,11 +2390,14 @@ class TestPerResourceSeams(unittest.TestCase):
 
         class K:
             def request(self, *a, **k):
-                return {"items": [pod([{"key": "ci-burst"}]), pod([]),
-                                  pod([{"operator": "Exists"}])]}
+                return {"items": [
+                    pod([dict(BURST_TAINT, operator="Equal")]), pod([]),
+                    pod([{"operator": "Exists"}]),
+                    # The right key, the wrong value: it cannot land either.
+                    pod([{"key": "ci-burst", "value": "false"}])]}
         self.assertEqual(
-            PendingPodShortfall(K(), "ns", "ci-burst").of("memory")(), 8.0)
-        self.assertEqual(PendingPodShortfall(K(), "ns").of("memory")(), 12.0)
+            PendingPodShortfall(K(), "ns", BURST_TAINT).of("memory")(), 8.0)
+        self.assertEqual(PendingPodShortfall(K(), "ns").of("memory")(), 16.0)
 
     def test_the_reference_wiring_builds(self):
         """The whole of main(), short of the loop: a name used before it is
@@ -2315,7 +2408,7 @@ class TestPerResourceSeams(unittest.TestCase):
                "BMC_PASS": "p", "PROM_URL": "http://prom",
                "ALERTMANAGER_URL": "http://am", "MODE": "dry_run"}
 
-        def build(**extra):
+        def controller(**extra):
             built = {}
             saved = dict(os.environ)
             real = entry.Controller.run_forever
@@ -2327,7 +2420,10 @@ class TestPerResourceSeams(unittest.TestCase):
                 entry.Controller.run_forever = real
                 os.environ.clear()
                 os.environ.update(saved)
-            return built["c"].signal.shortfall_query
+            return built["c"]
+
+        def build(**extra):
+            return controller(**extra).signal.shortfall_query
 
         live = "PendingPodShortfall.of.<locals>.shortfall"
         q = build()
@@ -2337,6 +2433,28 @@ class TestPerResourceSeams(unittest.TestCase):
                          '"" did not size on memory alone')
         q = build(CPU_SHORTFALL_QUERY="sum(cpu)", SHORTFALL_QUERY="sum(mem)")
         self.assertEqual(q, {"memory": "sum(mem)", "cpu": "sum(cpu)"})
+
+        def taints(c):
+            pending = next(cell.cell_contents for cell
+                           in c.signal.shortfall_query["memory"].__closure__
+                           if hasattr(cell.cell_contents, "taint"))
+            return (pending.taint, c.signal.fit_check.taint,
+                    c.warmup.tolerations)
+        self.assertEqual(taints(controller(WARMUP_IMAGE="img")),
+                         (BURST_TAINT, BURST_TAINT,
+                          [dict(BURST_TAINT, operator="Equal")]),
+                         "the warmup, the shortfall and the fit check do not "
+                         "agree on the taint")
+        mine = {"key": "burst", "value": "yes", "effect": "NoExecute"}
+        self.assertEqual(taints(controller(
+            WARMUP_IMAGE="img", BURST_TAINT_KEY="burst",
+            BURST_TAINT_VALUE="yes", BURST_TAINT_EFFECT="NoExecute"))[:2],
+            (mine, mine))
+        self.assertEqual(taints(controller(WARMUP_IMAGE="img",
+                                           BURST_TAINT_KEY="")),
+                         (None, None, []), "an empty key is no taint")
+        with self.assertRaises(SystemExit):
+            controller(BURST_TAINT_EFFECT="NoScheduel")
 
     def test_a_source_may_be_a_callable(self):
         from metalnap.signal import prometheus

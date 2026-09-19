@@ -52,6 +52,8 @@ data:
   BMC_HOST_FMT: {{ .Values.bmc.hostFormat | quote }}
   PROM_URL: {{ .Values.prometheus.url | quote }}
   BURST_TAINT_KEY: {{ .Values.burstTaintKey | quote }}
+  BURST_TAINT_VALUE: {{ .Values.burstTaintValue | quote }}
+  BURST_TAINT_EFFECT: {{ .Values.burstTaintEffect | quote }}
   {{- with .Values.alertmanager.url }}
   ALERTMANAGER_URL: {{ . | quote }}
   {{- end }}

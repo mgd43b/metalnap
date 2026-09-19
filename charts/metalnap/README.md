@@ -78,7 +78,9 @@ nodes stay asleep with nothing to explain why.
 | `alertmanager.silenceMatchers` | `[]` | Extra amtool-syntax matchers ANDed into every silence, to mute only what a sleep is expected to trip. Silences also exclude `MetalnapNodeNeedsAttention` with a negative matcher, which **needs Alertmanager 0.22 or later**. |
 | `warmup.image` | `""` | Pulled onto a node after waking, so the first jobs do not each pay for it. |
 | `cordonAnnotation` | `metalnap.io/cordoned` | Marks a cordon as metalnap's own. |
-| `burstTaintKey` | `ci-burst` | Taint keeping other work off sleepable nodes. |
+| `burstTaintKey` | `ci-burst` | Taint keeping other work off sleepable nodes. Empty counts every pending pod. |
+| `burstTaintValue` | `"true"` | Its value. Only pending work tolerating the whole taint — key, value and effect, by the scheduler's rule — counts as demand, so all three must match the nodes' taint. |
+| `burstTaintEffect` | `NoSchedule` | Its effect. |
 | `maintenance.intervalS` | `0` (off) | Wake a node asleep this long so it collects updates. `86400` is a sensible start. |
 | `maintenance.windowS` | `300` | How long it stays up, measured from Ready. |
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |

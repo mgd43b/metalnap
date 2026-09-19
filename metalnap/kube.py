@@ -112,13 +112,46 @@ def effective_requests(spec, resources=("memory", "cpu")):
     return out
 
 
-def tolerates(pod, key):
-    """Could this pod land on a node carrying taint `key`? True with no key."""
-    if not key:
+def tolerates(pod, taint):
+    """Could this pod land on a node carrying `taint`? True with none.
+
+    `taint` is as it sits on the node -- {"key", "value", "effect"}, effect
+    NoSchedule unless given -- and a toleration matches it by the scheduler's
+    own rule: it names the taint's key or none, names its effect or none, and
+    takes any value (operator Exists) or exactly the taint's (Equal, the
+    default). Matching on the key alone counted a pod that tolerates only
+    `ci-burst=false`, or only NoExecute, as work a `ci-burst=true:NoSchedule`
+    node could run. A PreferNoSchedule taint turns nothing away.
+
+    A bare key string is the older, looser form, kept for existing wiring:
+    any toleration naming that key, whatever its value, operator and effect.
+    """
+    if not taint:
         return True
-    return any(t.get("key") == key
-               or (t.get("operator") == "Exists" and not t.get("key"))
-               for t in pod["spec"].get("tolerations", []))
+    tolerations = pod["spec"].get("tolerations") or []
+    if isinstance(taint, str):
+        return any(t.get("key") == taint
+                   or (t.get("operator") == "Exists" and not t.get("key"))
+                   for t in tolerations)
+    effect = taint.get("effect") or "NoSchedule"
+    if effect not in ("NoSchedule", "NoExecute"):
+        return True
+    return any(_tolerates_one(t, taint["key"], taint.get("value") or "",
+                              effect)
+               for t in tolerations)
+
+
+def _tolerates_one(t, key, value, effect):
+    # Toleration.ToleratesTaint in k8s.io/api, clause for clause: an operator
+    # it does not know tolerates nothing.
+    if t.get("effect") and t["effect"] != effect:
+        return False
+    if t.get("key") and t["key"] != key:
+        return False
+    op = t.get("operator") or "Equal"
+    if op == "Exists":
+        return True
+    return op == "Equal" and (t.get("value") or "") == value
 
 
 def _unschedulable(pod):
@@ -138,15 +171,14 @@ class PendingPodShortfall:
     `of(resource)` is one resource's shortfall -- memory in GiB, CPU in cores
     -- for PrometheusSignal to use as a source.
 
-    `toleration_key` as for PendingPodFit, and for the same reason: a pod that
-    does not tolerate the taint keeping work off these nodes can never land
-    on one, so it is no demand for them -- counted, it wakes nodes for work
-    they cannot run.
+    `taint` as for PendingPodFit, and for the same reason: a pod that does
+    not tolerate the taint keeping work off these nodes can never land on
+    one, so it is no demand for them -- counted, it wakes nodes for work they
+    cannot run.
     """
 
-    def __init__(self, kube, namespace, toleration_key=None):
-        self.kube, self.ns = kube, namespace
-        self.toleration_key = toleration_key
+    def __init__(self, kube, namespace, taint=None):
+        self.kube, self.ns, self.taint = kube, namespace, taint
 
     def of(self, resource):
         def shortfall():
@@ -156,7 +188,7 @@ class PendingPodShortfall:
             return sum(effective_requests(p["spec"], (resource,))[resource]
                        for p in pods.get("items", [])
                        if not p["spec"].get("nodeName") and _unschedulable(p)
-                       and tolerates(p, self.toleration_key))
+                       and tolerates(p, self.taint))
         return shortfall
 
 
@@ -298,17 +330,19 @@ class PendingPodFit:
     does not tolerate inflates that sum and powers on hardware that cannot help
     it.
 
-    `toleration_key` matters: a pod that does not tolerate the taint keeping
-    work off your sleepable nodes can never land there, however much room the
-    node has.
+    `taint` matters: a pod that does not tolerate the taint keeping work off
+    your sleepable nodes can never land there, however much room the node
+    has. Give it whole, {"key", "value", "effect"}, as the nodes carry it --
+    see tolerates(). `toleration_key` is the older key-only form.
 
     Capacity is a bare number of GiB, or {resource: amount} -- and then a pod
     fits only if EVERY resource named fits: a runner that needs 8 cores does
     not run on a node with 4, whatever its memory.
     """
 
-    def __init__(self, kube, namespace, toleration_key=None):
-        self.kube, self.ns, self.toleration_key = kube, namespace, toleration_key
+    def __init__(self, kube, namespace, toleration_key=None, taint=None):
+        self.kube, self.ns = kube, namespace
+        self.taint = taint or toleration_key
 
     def __call__(self, capacity):
         if not isinstance(capacity, dict):
@@ -319,7 +353,7 @@ class PendingPodFit:
         for p in pods.get("items", []):
             if p["spec"].get("nodeName"):
                 continue                      # already placed
-            if not tolerates(p, self.toleration_key):
+            if not tolerates(p, self.taint):
                 continue
             # The scheduler's effective request, init-phase floor and all: a pod
             # whose init container needs more than its steady state does not

@@ -35,10 +35,13 @@ Optional:
     WARMUP_IMAGE            pull this onto a node after waking it, so the
                             first jobs do not each pay for it
     WARMUP_PULL_SECRETS     comma-separated imagePullSecrets for the above
-    BURST_TAINT_KEY         taint keeping other work off sleepable nodes
-                            (default ci-burst); used for the warmup pod's
-                            toleration, and to count only pending work that
-                            could land on those nodes
+    BURST_TAINT_KEY         the taint keeping other work off sleepable
+    BURST_TAINT_VALUE       nodes, as they carry it (default
+    BURST_TAINT_EFFECT      ci-burst=true:NoSchedule). The warmup pod
+                            tolerates it, and only pending work tolerating
+                            all three parts counts as demand -- so a taint
+                            that differs from the nodes' reads as no demand.
+                            An empty key counts every pending pod.
     ARC_NAMESPACE           default arc-runners
     CORDON_ANNOTATION       default metalnap.io/cordoned
     SHORTFALL_QUERY         PromQL for unmet MEMORY in GiB, instead of reading
@@ -101,7 +104,15 @@ def main(argv=None):
     kube = Kube()
     # The taint keeping other work off the sleepable nodes: the warmup pod
     # tolerates it, and demand that does not tolerate it is no demand here.
-    taint = os.environ.get("BURST_TAINT_KEY", "ci-burst")
+    # An empty key means no taint: every pending pod counts.
+    taint = {"key": os.environ.get("BURST_TAINT_KEY", "ci-burst"),
+             "value": os.environ.get("BURST_TAINT_VALUE", "true"),
+             "effect": os.environ.get("BURST_TAINT_EFFECT", "NoSchedule")}
+    if taint["effect"] not in ("NoSchedule", "PreferNoSchedule", "NoExecute"):
+        sys.exit("metalnap: BURST_TAINT_EFFECT must be NoSchedule, "
+                 "PreferNoSchedule or NoExecute, not %r" % taint["effect"])
+    if not taint["key"]:
+        taint = None
 
     sat_q = os.environ.get("SATURATION_QUERY", ARC_SATURATION_QUERY)
     # Sized per resource: runners that run out of CPU before memory, sized on
@@ -109,7 +120,7 @@ def main(argv=None):
     # CPU_SHORTFALL_QUERY="" goes back to memory alone. By default each is read
     # off the unschedulable pods with the scheduler's own effective-request
     # formula -- see PendingPodShortfall for why PromQL cannot give it.
-    pending = PendingPodShortfall(kube, ns, toleration_key=taint)
+    pending = PendingPodShortfall(kube, ns, taint=taint)
     queries = {"memory": os.environ.get("SHORTFALL_QUERY")
                or pending.of("memory")}
     cpu_q = os.environ.get("CPU_SHORTFALL_QUERY")
@@ -139,8 +150,7 @@ def main(argv=None):
     warm_image = os.environ.get("WARMUP_IMAGE")
     warmup = ImagePrepull(
         kube, warm_image, namespace=ns,
-        tolerations=[{"key": taint, "operator": "Equal", "value": "true",
-                      "effect": "NoSchedule"}],
+        tolerations=[dict(taint, operator="Equal")] if taint else [],
         image_pull_secrets=[{"name": s} for s in
                             filter(None, os.environ.get(
                                 "WARMUP_PULL_SECRETS", "").split(","))],
@@ -160,7 +170,7 @@ def main(argv=None):
             require("PROM_URL"),
             queries,
             sat_q or None,
-            fit_check=PendingPodFit(kube, ns, toleration_key=taint)),
+            fit_check=PendingPodFit(kube, ns, taint=taint)),
         drain=ArcDrain(kube, namespace=ns),
         config=Config(),
     ).run_forever()
