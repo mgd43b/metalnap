@@ -593,10 +593,16 @@ class TestMaintenanceStart(unittest.TestCase):
         class Closed(io.StringIO):
             def write(self, s):
                 raise BrokenPipeError()
-        code = cli.main(["status", "--context", "ctx"], out=Closed(),
-                        kubectl=lambda ctx: cli.Kubectl(
-                            ctx, run=cluster.run, popen=cluster.popen))
+        # The handler points the real stdout at /dev/null. Left unpatched it
+        # did exactly that to this test process, and everything written to
+        # fd 1 after this test -- another test's failure, say -- vanished.
+        with mock.patch("os.dup2") as dup2, \
+                mock.patch("os.open", return_value=99):
+            code = cli.main(["status", "--context", "ctx"], out=Closed(),
+                            kubectl=lambda ctx: cli.Kubectl(
+                                ctx, run=cluster.run, popen=cluster.popen))
         self.assertEqual(code, 0)
+        dup2.assert_called_once()
 
     def test_a_partial_failure_names_what_was_already_changed(self):
         cluster = make_cluster(nodes=("a", "b", "c"))

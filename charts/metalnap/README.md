@@ -155,6 +155,8 @@ name to exactly its own warmup pods.
 None of that is needed by a person asking for a node — the controller's own
 account does the work. The person needs their own `patch` on `nodes` to
 annotate one; with the CLI, also `get`/`list` on the controller's Deployment
-and ConfigMap and on `nodes`, and `pods/log` for `metalnap logs`.
+and ConfigMap and on `nodes`, and `list` on `pods` plus `get` on `pods/log`
+for `metalnap logs` -- `kubectl logs deployment/...` has to find the pods
+before it can read them.
 
 [Source and full documentation](https://github.com/mgd43b/metalnap)
