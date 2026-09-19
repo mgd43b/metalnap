@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1](https://github.com/mgd43b/metalnap/compare/v0.5.0...v0.5.1) (2026-09-19)
+
+
+### Fixes
+
+* `metalnap` on its own lists its commands instead of starting the controller ([52b1abc](https://github.com/mgd43b/metalnap/commit/52b1abc4e51c301170d33cc8bdba3367301e14d9))
+* list the maintainer's public address in the chart and Artifact Hub metadata ([8977dd5](https://github.com/mgd43b/metalnap/commit/8977dd56e21f59c97261cbe931f0bccd5612fb47))
+* the metalnap command lists its commands, and the maintainer's public address ([81dc843](https://github.com/mgd43b/metalnap/commit/81dc843e238c2e07f41fa7b2d2af82fa23459a79))
+
 ## [0.5.0](https://github.com/mgd43b/metalnap/compare/v0.4.0...v0.5.0) (2026-09-19)
 
 
