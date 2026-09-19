@@ -41,7 +41,12 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
+      # The TAG, not the triggering ref. Called from release-please the two
+      # are the same commit; dispatched by hand to republish a tag, the
+      # triggering ref is main, which may have moved on since.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@v7
         with:
@@ -55,8 +60,14 @@ jobs:
       - name: Gate on the test suites
         # A tag must not publish an image the suites have not passed. Cheap
         # enough (~10s) that there is no excuse to skip it.
+        #
+        # Installed exactly as ci.yml installs it. A bare venv has no
+        # `requests`, so every test importing metalnap.kube errored, and v0.4.0
+        # was tagged and released with no image and no chart behind it.
         run: |
           python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e .
           .venv/bin/python -B tests/test_controller.py
           .venv/bin/python -B tests/sim.py --seeds 60 --ticks 900
 
@@ -108,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
       - uses: azure/setup-helm@v5
 
       - name: Lint and render
@@ -122,7 +135,8 @@ jobs:
           grep -q 'runAsNonRoot: true' /tmp/r.yaml
           # The controller must never tolerate the taint on nodes it manages.
           if grep -q 'tolerations:' /tmp/r.yaml; then
-            echo "chart renders tolerations by default -- metalnap could be"                  "scheduled onto a node it powers off" >&2
+            echo "chart renders tolerations by default -- metalnap could be" \
+                 "scheduled onto a node it powers off" >&2
             exit 1
           fi
 
