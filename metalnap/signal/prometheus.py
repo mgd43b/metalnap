@@ -6,6 +6,8 @@ class PrometheusSignal:
     def __init__(self, url, shortfall_query, saturation_query=None,
                  timeout=20, fit_check=None):
         self.url = url.rstrip("/")
+        #: One query, or {resource: query} to size on several -- which then
+        #: needs a NodeSource that reports capacity for the same resources.
         self.shortfall_query = shortfall_query
         self.saturation_query = saturation_query
         self.timeout = timeout
@@ -26,6 +28,8 @@ class PrometheusSignal:
         return float(res[0]["value"][1]) if res else 0.0
 
     def shortfall(self):
+        if isinstance(self.shortfall_query, dict):
+            return {r: self._scalar(q) for r, q in self.shortfall_query.items()}
         return self._scalar(self.shortfall_query)
 
     def saturated_units(self):

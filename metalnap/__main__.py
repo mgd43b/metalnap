@@ -40,7 +40,10 @@ Optional:
                             toleration and for the pending-pod fit check
     ARC_NAMESPACE           default arc-runners
     CORDON_ANNOTATION       default metalnap.io/cordoned
-    SHORTFALL_QUERY         override the default PromQL
+    SHORTFALL_QUERY         override the default PromQL for unmet MEMORY, GiB
+    CPU_SHORTFALL_QUERY     override the default PromQL for unmet CPU, cores,
+                            or "" to size on memory alone. The pool is sized
+                            on whichever of the two needs more nodes.
     SATURATION_QUERY        override, or "" to disable the saturation term
     MAINTENANCE_INTERVAL_S  wake a node that has been asleep this long, so it
                             collects updates and config changes it would
@@ -69,25 +72,36 @@ import sys
 from . import Config, Controller
 from .drain import ArcDrain
 from .drain.arc import ARC_SATURATION_QUERY
-from .kube import Kube, KubeNodeSource, PendingPodFit
+from .kube import Kube, KubeNodeSource, PendingPodFit, allocatable
 from .notify import AlertmanagerNotifier
 from .power import IpmiPower
 from .signal import PrometheusSignal
 from .warmup import ImagePrepull
 
 
-def default_shortfall_query(ns):
-    # Memory of pods the scheduler admitted but cannot place.
+def default_shortfall_query(ns, resource="memory"):
+    # Requests of pods the scheduler admitted but cannot place: memory in GiB,
+    # CPU in cores.
+    #
+    # Init containers are counted as well as containers. A runner's dind is a
+    # NATIVE SIDECAR -- an init container that keeps running -- and it asks
+    # for as much as the runner does, so counting containers alone read half
+    # of every backlog. It cannot be told apart from an ordinary init
+    # container here: kube-state-metrics labels restart_policy from container
+    # STATUS, and a pod that was never scheduled has none. So every init
+    # container is summed, which over-counts an ordinary one with requests of
+    # its own. That errs toward waking, which is the cheap direction.
     #
     # `and on(pod)` means this yields NO SERIES when nothing is unschedulable,
     # rather than a zero sample. PrometheusSignal reads an empty result as 0.0,
     # which is correct here -- but it is a real distinction, and a query that
     # returns nothing on the happy path surprises people who did not write it.
+    sel = '{namespace="%s",resource="%s"}' % (ns, resource)
     return (
-        'sum(kube_pod_container_resource_requests'
-        '{namespace="%s",resource="memory"} '
-        'and on(pod) kube_pod_status_unschedulable{namespace="%s"} == 1)'
-        ' / 1024/1024/1024' % (ns, ns)
+        'sum((kube_pod_container_resource_requests%s '
+        'or kube_pod_init_container_resource_requests%s) '
+        'and on(pod) kube_pod_status_unschedulable{namespace="%s"} == 1)%s'
+        % (sel, sel, ns, " / 1024/1024/1024" if resource == "memory" else "")
     )
 
 
@@ -110,6 +124,16 @@ def main(argv=None):
     kube = Kube()
 
     sat_q = os.environ.get("SATURATION_QUERY", ARC_SATURATION_QUERY)
+    # Sized per resource: this pool's runners run out of CPU well before
+    # memory, and sizing on memory alone woke about half the nodes a backlog
+    # needed. CPU_SHORTFALL_QUERY="" goes back to memory alone.
+    queries = {"memory": os.environ.get("SHORTFALL_QUERY")
+               or default_shortfall_query(ns)}
+    cpu_q = os.environ.get("CPU_SHORTFALL_QUERY")
+    if cpu_q is None:
+        cpu_q = default_shortfall_query(ns, "cpu")
+    if cpu_q:
+        queries["cpu"] = cpu_q
 
     # Silencing is opt-in by URL, but strongly recommended: without it every
     # sleep looks like a node dying and pages someone.
@@ -148,12 +172,13 @@ def main(argv=None):
         warmup=warmup,
         node_source=KubeNodeSource(
             kube, annotation=os.environ.get("CORDON_ANNOTATION",
-                                            "metalnap.io/cordoned")),
+                                            "metalnap.io/cordoned"),
+            capacity_of=allocatable(tuple(queries))),
         power=IpmiPower(host_for=lambda n: host_fmt.format(node=n),
                         user=require("BMC_USER"), password=require("BMC_PASS")),
         signal=PrometheusSignal(
             require("PROM_URL"),
-            os.environ.get("SHORTFALL_QUERY") or default_shortfall_query(ns),
+            queries,
             sat_q or None,
             fit_check=PendingPodFit(kube, ns, toleration_key=taint)),
         drain=ArcDrain(kube, namespace=ns),

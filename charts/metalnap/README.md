@@ -79,6 +79,7 @@ nodes stay asleep with nothing to explain why.
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
 | `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
 | `timers.powerCycleCooldownS` | `86400` | A node still powered but not Ready at its wake timeout is power-cycled at most once per node per this long; `0` disables. Must be `0` or at least `timers.wakeTimeoutS`, or the chart refuses to install. |
+| `queries.cpuShortfall` | `""` (ARC default) | PromQL for unmet CPU in cores. The pool is sized on whichever of memory and CPU needs more nodes; `-` sizes on memory alone. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
 ## Safety rules it will not break
@@ -102,7 +103,8 @@ Each exists because breaking it cost something real.
   never under an operator's cordon or running work — and then unmutes it and
   raises `MetalnapNodeNeedsAttention`.
 - **Wake readily, sleep reluctantly**, and hold evidence of demand across the
-  dips a noisy signal produces.
+  dips a noisy signal produces. Nodes carrying work count as wanted, and only
+  a node that has carried none for a whole sleep window is ever put down.
 - **A node nobody wants still has to be maintained.** Scheduled wakeups
   (`maintenance.intervalS`) bring an idle node up briefly so it is not weeks
   behind on updates when demand finally wants it. A visit yields to demand, to

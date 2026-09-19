@@ -19,8 +19,10 @@ class NodeState:
     ours: bool
     #: Unix timestamp the node last became Ready, or None. Drives min-uptime.
     ready_since: Optional[float]
-    #: Schedulable capacity in whatever unit the demand signal reports.
-    capacity: float
+    #: Schedulable capacity in whatever unit the demand signal reports -- a
+    #: bare number for one resource, or {resource: amount} to size on several
+    #: (see DemandSignal.shortfall).
+    capacity: object
     #: True if this node must never be power-managed, whatever the config
     #: says. A control plane node is the obvious case. This exists because
     #: configuration is the weakest link: the node list arrives from a
@@ -125,9 +127,19 @@ class DemandSignal(Protocol):
         """
         Unmet demand, in the same unit as NodeState.capacity.
 
+        A bare number for one resource, or {resource: amount} -- matched with a
+        NodeState.capacity keyed the same way -- to size on several. The pool
+        is then sized on whichever resource needs the most nodes: sized on
+        memory alone, work that runs out of CPU first woke half the nodes it
+        needed. The two must agree: one sizing per resource and the other not
+        is refused.
+
         Must be 0.0 when nothing is waiting -- NOT an error, and not an absent
         series. Returning a stale or unknown value is worse than raising:
         raising is treated as "do not act", which is always safe.
+
+        It is work WAITING, not work running. Work already on awake nodes is
+        counted from DrainPolicy.busy(), node by node.
         """
 
     def saturated_units(self) -> int:
@@ -152,6 +164,9 @@ class DemandSignal(Protocol):
         taint it does not tolerate, or an unbound volume inflates that sum and
         wakes hardware that cannot help it.
 
+        `capacity` is a NodeState.capacity, in whichever form the NodeSource
+        reports it.
+
         Return True if you cannot tell -- but know that "always True" means
         powering on a machine for work it can never run.
         """
@@ -172,6 +187,10 @@ class DrainPolicy(Protocol):
 
         Raise rather than guess. The controller treats an exception as "busy",
         because the only safe reading of "I could not tell" is "do not touch".
+
+        Also what the controller counts a node's demand from: every awake node
+        is asked each tick, and one carrying work is wanted awake for as long
+        as it does. Only a node busy() calls idle is ever put to sleep.
         """
 
     def idle(self, node: str) -> List[str]:

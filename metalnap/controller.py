@@ -936,6 +936,63 @@ class Controller:
             self.log("error", "could not begin a maintenance visit",
                      node=node, err=str(e))
 
+    # -- sizing ----------------------------------------------------------
+    def _size(self, shortfall, capacities):
+        """(node capacity, whole nodes the backlog needs).
+
+        Per resource when the signal and the nodes name them -- {"memory": GiB,
+        "cpu": cores} -- and then the node count is the most any one resource
+        needs. Sized on memory alone, a pool whose work runs out of CPU first
+        woke about half the nodes an e2e backlog needed. A bare number on both
+        sides is one resource, as before.
+        """
+        cfg = self.cfg
+        dicts = [isinstance(c, dict) for c in capacities]
+        if not isinstance(shortfall, dict) and not any(dicts):
+            cap = min([c for c in capacities if c > 0]
+                      or [cfg.default_capacity])
+            return cap, math.ceil(max(shortfall, 0.0) / cap)
+        if not isinstance(shortfall, dict) or not all(dicts):
+            # Refused rather than guessed at: dividing CPU by GiB sizes the
+            # pool on nonsense, and the tick fails toward "change nothing".
+            raise TypeError("the demand signal and the node source disagree: "
+                            "one sizes per resource and the other does not")
+        cap = {}
+        for r in set(shortfall).union(*capacities):
+            have = [c.get(r, 0) for c in capacities if c.get(r, 0) > 0]
+            if have:
+                cap[r] = min(have)
+            elif r == "memory":
+                cap[r] = cfg.default_capacity
+        unsized = sorted(r for r, v in shortfall.items()
+                         if v > 0 and r not in cap)
+        if unsized != self.st.get("_unsized_last"):
+            if unsized:
+                self.log("warn", "no node reports capacity for a resource the "
+                                 "demand signal asks for; not sizing on it",
+                         resources=unsized)
+            self.st["_unsized_last"] = unsized
+        return cap, max((math.ceil(v / cap[r]) for r, v in shortfall.items()
+                         if v > 0 and r in cap), default=0)
+
+    def _in_use(self, awake):
+        """Awake nodes carrying work, by the work queue's own records.
+
+        One that cannot be read counts as in use: if a check cannot tell
+        whether a node is busy, that reads as busy.
+        """
+        out = []
+        for n in awake:
+            try:
+                busy = self.drain.busy(n)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "busy check failed; counting the node as in "
+                                 "use", node=n, err=str(e))
+                busy = True
+            if busy:
+                out.append(n)
+        return out
+
     # -- what we did, and what we know ------------------------------------
     @staticmethod
     def _ours(state):
@@ -1225,8 +1282,8 @@ class Controller:
         # demand signal that is down must not also stop re-asserting alerts --
         # they carry a TTL, and would resolve themselves in the outage.
         shortfall = self.signal.shortfall()
-        capacity = min([states[n].capacity for n in present
-                        if states[n].capacity > 0] or [cfg.default_capacity])
+        capacity, backlog = self._size(shortfall,
+                                       [states[n].capacity for n in present])
         try:
             saturated = self.signal.saturated_units()
         except Exception as e:                        # noqa: BLE001
@@ -1235,8 +1292,20 @@ class Controller:
             saturated = 0
         # A saturated queue admits no more work, so its demand is invisible to
         # shortfall(). Count each as one node's worth.
-        effective = shortfall + saturated * capacity
-        want = max(0, min(len(wakeable), math.ceil(effective / capacity)))
+        backlog += saturated
+        # `want` is how many nodes should be AWAKE, so it has to count the
+        # ones already carrying work, not only the work still waiting. The
+        # shortfall sees only what the scheduler cannot place; once awake nodes
+        # absorbed a backlog it read zero, `want` read zero, and every busy node
+        # in the pool was cordoned and drained, one a tick -- while a full node
+        # plus a new backlog read as "demand met" and woke nothing.
+        in_use = self._in_use(awake)
+        for n in present:
+            if n in awake and n not in in_use:
+                self._node(n).setdefault("idle_since", self.now())
+            else:
+                self._node(n).pop("idle_since", None)
+        want = max(0, min(len(wakeable), len(in_use) + backlog))
 
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
@@ -1375,7 +1444,7 @@ class Controller:
                 if not self.signal.fits_node(capacity):
                     self.log("info", "demand present but none of it could run "
                                      "on a node this size; not waking",
-                             shortfall=round(shortfall, 1))
+                             shortfall=_show(shortfall))
                     want = len(awake)
             except Exception as e:                    # noqa: BLE001
                 self.log("warn", "fit check failed; not waking", err=str(e))
@@ -1388,8 +1457,9 @@ class Controller:
         coming = [n for n in present
                   if st.get(n, {}).get("phase") == "waking"
                   and st[n].get("booting")]
-        self.log("info", "observed", shortfall=round(shortfall, 1),
-                 saturated=saturated, want=want, awake=awake, coming=coming)
+        self.log("info", "observed", shortfall=_show(shortfall),
+                 saturated=saturated, want=want, awake=awake, in_use=in_use,
+                 coming=coming)
 
         if want > len(awake):
             st["want_high_since"] = st.get("want_high_since") or now
@@ -1426,7 +1496,14 @@ class Controller:
             st["want_high_last"] = None
             if now - st["want_low_since"] >= cfg.sleep_sustain_s:
                 for n in reversed(wakeable):
-                    if n in awake and n not in in_flight:
+                    # Only a node carrying no work, and carrying none for a
+                    # whole sleep window: sleep reluctantly. A node that has
+                    # just finished a job is the likeliest to be handed the
+                    # next, and cordoning a busy one takes capacity away for up
+                    # to a drain timeout while it finishes.
+                    if (n in awake and n not in in_flight and n not in in_use
+                            and now - st[n].get("idle_since", now)
+                            >= cfg.sleep_sustain_s):
                         if now < st.get(n, {}).get("cooldown_until", 0):
                             self.log("info", "sleep backing off; skipping",
                                      node=n)
@@ -1497,6 +1574,13 @@ def _hash_fraction(digest):
     names will ever produce -- but an all-ones digest produces it every time.
     """
     return int.from_bytes(digest[:4], "big") / 2.0 ** 32
+
+
+def _show(amount):
+    """A shortfall for a log line, one resource or several."""
+    if isinstance(amount, dict):
+        return {k: round(v, 1) for k, v in amount.items()}
+    return round(amount, 1)
 
 
 def _iso(ts):

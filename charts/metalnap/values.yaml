@@ -128,9 +128,14 @@ timers:
   # would not power off. Never forced.
   shutdownTimeoutS: 600
 
-# Override the demand queries if your signal differs.
+# Override the demand queries if your signal differs. The pool is sized on
+# whichever of memory and CPU needs more nodes: runners that run out of CPU
+# first were sized on memory alone, and woke about half the nodes they needed.
+# The defaults count init containers as well as containers, because a runner's
+# dind is a native sidecar asking for as much as the runner does.
 queries:
-  shortfall: ""           # empty = the ARC default from __main__.py
+  shortfall: ""           # memory, GiB; empty = the ARC default from __main__.py
+  cpuShortfall: ""        # CPU, cores; empty = the ARC default; "-" sizes on memory alone
   saturation: ""          # empty = the ARC default; "-" disables the term
 
 rbac:

@@ -75,7 +75,11 @@ Every one of these exists because breaking it cost something real.
   non-convergence hides longest.
 - **Wake readily, sleep reluctantly** — and hold evidence of demand across the
   dips a noisy signal produces. A queue sitting at its ceiling makes demand
-  flicker; a timer that resets on every dip never fires.
+  flicker; a timer that resets on every dip never fires. A node carrying work
+  is demand too: counting only the work still *waiting* read a backlog the
+  pool had just absorbed as no demand at all, and drained every busy node in
+  it. Only a node that has carried no work for a whole sleep window is put
+  down.
 - **A node nobody wants still has to be maintained.** One that sleeps for
   weeks misses every package update and config run, then has to catch all of
   it up at the exact moment demand finally wanted it. Scheduled wakeups fix
@@ -386,6 +390,16 @@ it takes to trust the numbers.
 
 `MAINTENANCE_INTERVAL_S` enables [scheduled wakeups](#scheduled-wakeups) and is
 `0` — off — by default.
+
+The pool is sized on **memory and CPU**, whichever needs more nodes
+(`SHORTFALL_QUERY` in GiB, `CPU_SHORTFALL_QUERY` in cores; set the latter to
+`""` to size on memory alone). Runners that run out of CPU first, sized on
+memory alone, woke about half the nodes a backlog needed. The default queries
+count init containers as well as containers — a runner's `dind` is a native
+sidecar that asks for as much as the runner does. A custom `DemandSignal` can
+do the same by returning `{"memory": …, "cpu": …}` from `shortfall()` with a
+`NodeSource` that reports capacity the same way (`kube.allocatable()`); a bare
+number on both sides is one resource, as before.
 
 `POWER_CYCLE_COOLDOWN_S` bounds the [power cycle of a wedged
 node](#when-a-node-will-not-come-back) to one per node per this long (default

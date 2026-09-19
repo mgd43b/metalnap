@@ -21,6 +21,9 @@ The cluster model is faithful on the points a controller gets wrong:
     the next tick, which is where a controller that trusts either signal
     alone sends a second shutdown into the first.
   * a node sometimes IGNORES a soft shutdown and stays up.
+  * a quarter of the seeds size on memory AND CPU, with the CPU a phase's
+    work asks for per GiB drawn per phase -- so either can be the resource
+    that runs out.
   * an operator periodically takes a node for maintenance, cordoning it
     WITHOUT the controller's annotation.
   * a node woken for a SCHEDULED maintenance visit sometimes reboots into the
@@ -139,6 +142,7 @@ BOOT_S = 150.0
 #: window a real one sees for most of a minute was never observed at all.
 SHUTDOWN_S = (20.0, 110.0)
 CAPACITY = 125.7
+CPU_CAPACITY = 40.0
 
 
 class InvariantError(AssertionError):
@@ -200,6 +204,11 @@ class Sim:
         # invariant violations, collected rather than raised so the tick that
         # caused them finishes and the report shows full context
         self.killed_work, self.powered_off_busy, self.stomped = [], [], []
+        self.cordoned_busy = []
+        #: Size per resource on a quarter of the seeds; the rest keep the
+        #: single-number form every signal used before resources had names.
+        self.per_resource = seed % 4 == 3
+        self.cpu_per_gib = 0.3
         self.interrupted_update = []
         self.blocked = None
         self.zombie_since = {}
@@ -276,7 +285,8 @@ class Sim:
         return NodeState(ready=n.ready, cordoned=n.cordoned,
                          ours=n.ours is not None,
                          ready_since=n.ready_since if n.ready else None,
-                         capacity=CAPACITY,
+                         capacity=({"memory": CAPACITY, "cpu": CPU_CAPACITY}
+                                   if self.per_resource else CAPACITY),
                          # durable: survives the controller restarts injected
                          # below, which is the whole point of it
                          ours_since=n.ours,
@@ -289,6 +299,12 @@ class Sim:
         n = self.nodes[name]
         if name in self.human_held and not cordoned:
             self.stomped.append((self.t, name, "uncordoned an operator"))
+        if cordoned and not n.cordoned and any(
+                w.node == name and w.work for w in self.workers):
+            # Taking a node out of service while it carries work: the drain
+            # then holds it, serving nothing new, for as long as the work
+            # takes. Sleeps are for idle nodes.
+            self.cordoned_busy.append((self.t, name))
         n.cordoned = cordoned
         n.ours = self.t if cordoned else None
 
@@ -367,6 +383,9 @@ class Sim:
 
     # -- DemandSignal ----------------------------------------------------
     def shortfall(self):
+        if self.per_resource:
+            return {"memory": self.demand,
+                    "cpu": self.demand * self.cpu_per_gib}
         return self.demand
 
     def saturated_units(self):
@@ -461,6 +480,9 @@ class Sim:
             # is unreachable.
             self.phase_left = (self.rnd.randint(230, 320) if not self.busy_phase
                                else self.rnd.randint(45, 90))
+            if self.per_resource:
+                # Either side of 40/125.7: sometimes CPU runs out first.
+                self.cpu_per_gib = self.rnd.uniform(0.15, 0.6)
 
         schedulable = [n for n in self.nodes.values()
                        if n.ready and not n.cordoned]
@@ -687,6 +709,9 @@ class Sim:
                                      self.t - self.stuck_wake_since[n.name],
                                      budget))
 
+        if self.cordoned_busy:
+            fail("took a node carrying work out of service: %s"
+                 % (self.cordoned_busy[0],))
         if self.powered_off_busy:
             fail("powered off a node running work: %s"
                  % (self.powered_off_busy[0],))
@@ -870,10 +895,13 @@ class Sim:
         # A wedged node is not capacity the controller can provide -- it has
         # tried, cycled and handed it to a human -- so it does not raise the
         # ceiling either. Whether it escalated at all is asserted separately.
+        backlog = math.ceil(self.demand / CAPACITY)
+        if self.per_resource:
+            backlog = max(backlog, math.ceil(self.demand * self.cpu_per_gib
+                                             / CPU_CAPACITY))
         need = min(sum(1 for n in self.nodes.values()
                        if not n.hung and n.partitioned is None),
-                   math.ceil((self.demand + self.saturated * CAPACITY)
-                             / CAPACITY))
+                   backlog + self.saturated)
         # A wedged node is powered and serves nothing, so it is not capacity.
         powered = sum(1 for n in self.nodes.values()
                       if n.powered and not n.hung and n.partitioned is None)

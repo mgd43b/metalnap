@@ -63,7 +63,9 @@ class Harness:
                  holds=False, fits=True, chassis=None):
         self.states = states
         self._shortfall, self._saturated, self._fits = shortfall, saturated, fits
-        self._busy, self._idle, self._holds = list(busy), list(idle), holds
+        self._busy = busy if isinstance(busy, (dict, BaseException)) \
+            else list(busy)
+        self._idle, self._holds = list(idle), holds
         self.acted = {"cordon": [], "on": [], "off": [], "released": [],
                       "cycle": [], "record": [], "note": [], "disown": []}
         #: Every power and record action, in order -- for asserting that the
@@ -133,6 +135,8 @@ class Harness:
     def busy(self, n):
         if isinstance(self._busy, BaseException):
             raise self._busy
+        if isinstance(self._busy, dict):          # per node
+            return list(self._busy.get(n, []))
         return list(self._busy)
 
     def idle(self, n):
@@ -1950,6 +1954,187 @@ class TestKubeNodeSource(unittest.TestCase):
         st = src.state("k8s15")
         self.assertEqual((st.visited_at, st.shutdown_at, st.trouble),
                          (1789694254.0, 1789694254.0, "wedged"))
+
+
+class TestSizing(unittest.TestCase):
+    """#16: the pool is sized on the work it holds, on whichever resource
+    runs out first.
+
+    The shortfall counts only work the scheduler cannot place. Compared with
+    every awake node, it read a backlog the pool had just absorbed as no
+    demand at all -- and drained every busy node in it, one a tick -- while a
+    full node plus a new backlog read as demand met, and woke nothing.
+    """
+
+    def cordoned(self, h, n):
+        return (n, True) in h.acted["cordon"]
+
+    def test_work_already_running_is_demand(self):
+        h = Harness({"a": node(), "b": node()}, busy={"a": ["job-1"],
+                                                      "b": ["job-2"]})
+        c = h.controller()
+        for _ in range(3):
+            c.tick()
+            h.t += 60
+        self.assertFalse(self.cordoned(h, "a") or self.cordoned(h, "b"),
+                         "drained a busy pool on an empty backlog")
+
+    def test_a_full_node_and_a_backlog_wake_another(self):
+        h = Harness({"a": node(), "b": asleep(at=1000.0)}, shortfall=72.0,
+                    busy={"a": ["job-1"]})
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"],
+                         "a full node plus a backlog read as demand met")
+
+    def test_only_an_idle_node_is_put_to_sleep(self):
+        """reversed(wakeable) would have picked b, which is busy."""
+        h = Harness({"a": node(), "b": node()}, busy={"b": ["job-1"]})
+        c = h.controller()
+        c.tick()
+        self.assertTrue(self.cordoned(h, "a"))
+        self.assertFalse(self.cordoned(h, "b"), "cordoned a busy node")
+
+    def test_a_node_is_idle_for_a_whole_window_before_it_sleeps(self):
+        """Demand has been low all along; this node only just finished."""
+        h = Harness({"a": node(), "b": node()},
+                    busy={"a": ["job-1"], "b": ["job-2"]})
+        c = h.controller(sleep_sustain_s=600)
+        c.tick()
+        h.t += 500
+        h._busy = {"b": ["job-2"]}                # a's job ends
+        c.tick()
+        h.t += 200
+        c.tick()
+        self.assertFalse(self.cordoned(h, "a"), "slept a node just idle")
+        h.t += 420
+        c.tick()
+        self.assertTrue(self.cordoned(h, "a"))
+
+    def test_a_node_whose_work_cannot_be_read_is_in_use(self):
+        h = Harness({"a": node(), "b": node()},
+                    busy=RuntimeError("arc api down"))
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [], "slept a node it could not read")
+
+    def test_the_pool_is_sized_on_the_resource_that_runs_out(self):
+        """Memory alone says one node; CPU says two."""
+        cap = {"memory": 110.0, "cpu": 40.0}
+        h = Harness({n: asleep(at=1000.0, capacity=cap) for n in "abc"},
+                    shortfall={"memory": 30.0, "cpu": 60.0})
+        c = h.controller(nodes="abc")
+        for _ in range(3):
+            c.tick()
+            h.t += 60
+        self.assertEqual(h.acted["on"], ["a", "b"])
+
+    def test_a_signal_and_source_that_disagree_change_nothing(self):
+        """Dividing CPU by GiB is not sizing; the tick fails toward
+        changing nothing."""
+        h = Harness({"a": asleep(at=1000.0,
+                                 capacity={"memory": 110.0, "cpu": 40.0})},
+                    shortfall=300.0)
+        c = h.controller(nodes=("a",))
+        with self.assertRaises(TypeError):
+            c.tick()
+        self.assertEqual(h.acted["on"], [])
+
+    def test_a_resource_no_node_reports_is_not_sized_on(self):
+        h = Harness({"a": asleep(at=1000.0, capacity={"memory": 110.0}),
+                     "b": asleep(at=1000.0, capacity={"memory": 110.0})},
+                    shortfall={"memory": 10.0, "gpu": 5.0})
+        c = h.controller()
+        c.tick()
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        self.assertTrue(h.logged("no node reports capacity"))
+
+    def test_saturation_is_a_node_each_whatever_the_resources(self):
+        cap = {"memory": 110.0, "cpu": 40.0}
+        h = Harness({"a": asleep(at=1000.0, capacity=cap)},
+                    shortfall={"memory": 0.0, "cpu": 0.0}, saturated=1)
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_the_default_query_counts_sidecars(self):
+        """A runner's dind is a native sidecar -- an init container -- asking
+        for as much as the runner. Containers alone read half the backlog."""
+        from metalnap.__main__ import default_shortfall_query
+        for r in ("memory", "cpu"):
+            q = default_shortfall_query("ns", r)
+            for metric in ("kube_pod_container_resource_requests",
+                           "kube_pod_init_container_resource_requests"):
+                self.assertIn('%s{namespace="ns",resource="%s"}'
+                              % (metric, r), q)
+        self.assertIn("1024", default_shortfall_query("ns"))
+        self.assertNotIn("1024", default_shortfall_query("ns", "cpu"))
+
+
+class TestPerResourceSeams(unittest.TestCase):
+    def pod(self, cpu, mem, sidecar_cpu="0"):
+        return {"spec": {
+            "tolerations": [{"key": "ci-burst"}],
+            "containers": [{"resources": {"requests": {"cpu": cpu,
+                                                       "memory": mem}}}],
+            "initContainers": [
+                {"restartPolicy": "Always", "resources": {"requests": {
+                    "cpu": sidecar_cpu, "memory": "0"}}},
+                {"resources": {"requests": {"cpu": "64", "memory": "0"}}}]}}
+
+    def fit(self, pods, capacity):
+        from metalnap.kube import PendingPodFit
+
+        class K:
+            def request(self, *a, **k):
+                return {"items": pods}
+        return PendingPodFit(K(), "ns", toleration_key="ci-burst")(capacity)
+
+    def test_a_pod_fits_only_if_every_resource_does(self):
+        cap = {"memory": 110.0, "cpu": 40.0}
+        self.assertTrue(self.fit([self.pod("4", "8Gi")], cap))
+        self.assertFalse(self.fit([self.pod("48", "8Gi")], cap),
+                         "a pod needing 48 cores fits a 40-core node?")
+
+    def test_a_sidecar_counts_and_an_init_container_does_not(self):
+        cap = {"memory": 110.0, "cpu": 40.0}
+        self.assertFalse(self.fit([self.pod("30", "8Gi", "12")], cap))
+        self.assertTrue(self.fit([self.pod("30", "8Gi", "4")], cap),
+                        "a plain init container's 64 cores counted")
+
+    def test_a_bare_number_is_memory_as_before(self):
+        self.assertTrue(self.fit([self.pod("400", "8Gi")], 110.0))
+
+    def test_allocatable_reads_each_resource(self):
+        from metalnap.kube import allocatable
+        got = allocatable()({"status": {"allocatable": {
+            "cpu": "39500m", "memory": "126976Mi"}}})
+        self.assertEqual(got, {"memory": 124.0, "cpu": 39.5})
+
+    def test_a_signal_with_a_query_per_resource_returns_each(self):
+        from metalnap.signal import prometheus
+        answers = {"qm": "30", "qc": "60"}
+
+        class R:
+            def __init__(self, q):
+                self.q = q
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": {"result": [{"value": [0, answers[self.q]]}]}}
+        real = prometheus.requests.get
+        prometheus.requests.get = lambda url, params, timeout: R(
+            params["query"])
+        try:
+            sig = prometheus.PrometheusSignal(
+                "http://p", {"memory": "qm", "cpu": "qc"})
+            self.assertEqual(sig.shortfall(), {"memory": 30.0, "cpu": 60.0})
+        finally:
+            prometheus.requests.get = real
 
 
 if __name__ == "__main__":

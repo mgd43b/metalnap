@@ -181,6 +181,23 @@
           "description": "Bound on one visit, from power-on. Must be at least windowS + timers.wakeTimeoutS."
         }
       }
+    },
+    "queries": {
+      "type": "object",
+      "properties": {
+        "shortfall": {
+          "type": "string",
+          "description": "PromQL for unmet memory, GiB. Empty = the ARC default."
+        },
+        "cpuShortfall": {
+          "type": "string",
+          "description": "PromQL for unmet CPU, cores. Empty = the ARC default; \"-\" sizes on memory alone."
+        },
+        "saturation": {
+          "type": "string",
+          "description": "PromQL counting work queues at their ceiling. Empty = the ARC default; \"-\" disables the term."
+        }
+      }
     }
   }
 }

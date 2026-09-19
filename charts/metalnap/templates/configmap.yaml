@@ -96,6 +96,9 @@ data:
   {{- with .Values.queries.shortfall }}
   SHORTFALL_QUERY: {{ . | quote }}
   {{- end }}
+  {{- if .Values.queries.cpuShortfall }}
+  CPU_SHORTFALL_QUERY: {{ if eq .Values.queries.cpuShortfall "-" }}""{{ else }}{{ .Values.queries.cpuShortfall | quote }}{{ end }}
+  {{- end }}
   {{- if .Values.queries.saturation }}
   SATURATION_QUERY: {{ if eq .Values.queries.saturation "-" }}""{{ else }}{{ .Values.queries.saturation | quote }}{{ end }}
   {{- end }}

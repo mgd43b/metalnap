@@ -55,6 +55,30 @@ def mem_to_gib(v):
     return float(v) / (1024 ** 3)
 
 
+def cpu_to_cores(v):
+    v = str(v)
+    return float(v[:-1]) / 1000 if v.endswith("m") else float(v)
+
+
+#: How each resource is read off a Kubernetes quantity, in the unit its
+#: shortfall is reported in: GiB of memory, cores of CPU.
+QUANTITY = {"memory": mem_to_gib, "cpu": cpu_to_cores}
+
+
+def allocatable(resources=("memory", "cpu")):
+    """A KubeNodeSource `capacity_of` that reports several resources.
+
+    Pair it with a demand signal that reports a shortfall for the same ones,
+    and the pool is sized on whichever runs out first. The default stays
+    memory alone, as a bare number, so a signal written for that keeps its
+    meaning.
+    """
+    def capacity_of(n):
+        alloc = n["status"].get("allocatable", {})
+        return {r: QUANTITY[r](alloc.get(r, "0")) for r in resources}
+    return capacity_of
+
+
 class KubeNodeSource:
     """NodeState from the Kubernetes API, with cordon ownership by annotation."""
 
@@ -182,12 +206,18 @@ class PendingPodFit:
     `toleration_key` matters: a pod that does not tolerate the taint keeping
     work off your sleepable nodes can never land there, however much room the
     node has.
+
+    Capacity is a bare number of GiB, or {resource: amount} -- and then a pod
+    fits only if EVERY resource named fits: a runner that needs 8 cores does
+    not run on a node with 4, whatever its memory.
     """
 
     def __init__(self, kube, namespace, toleration_key=None):
         self.kube, self.ns, self.toleration_key = kube, namespace, toleration_key
 
-    def __call__(self, capacity_gib):
+    def __call__(self, capacity):
+        if not isinstance(capacity, dict):
+            capacity = {"memory": capacity}
         pods = self.kube.request(
             "GET", "/api/v1/namespaces/%s/pods?fieldSelector=status.phase=Pending"
                    % self.ns)
@@ -202,14 +232,11 @@ class PendingPodFit:
                     continue
             # Effective request is containers plus native sidecars; plain
             # initContainers are only a floor, so summing them all over-counts.
-            req = 0.0
-            for c in p["spec"].get("containers", []):
-                req += mem_to_gib(c.get("resources", {})
-                                  .get("requests", {}).get("memory", "0"))
-            for c in p["spec"].get("initContainers", []):
-                if c.get("restartPolicy") == "Always":
-                    req += mem_to_gib(c.get("resources", {})
-                                      .get("requests", {}).get("memory", "0"))
-            if req <= capacity_gib:
+            running = list(p["spec"].get("containers", [])) + [
+                c for c in p["spec"].get("initContainers", [])
+                if c.get("restartPolicy") == "Always"]
+            if all(sum(QUANTITY[r](c.get("resources", {}).get("requests", {})
+                                   .get(r, "0")) for c in running) <= cap
+                   for r, cap in capacity.items() if r in QUANTITY):
                 return True
         return False
