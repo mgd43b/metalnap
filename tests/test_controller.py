@@ -2021,7 +2021,9 @@ class TestSizing(unittest.TestCase):
         self.assertFalse(self.cordoned(h, "b"), "cordoned a busy node")
 
     def test_a_node_is_idle_for_a_whole_window_before_it_sleeps(self):
-        """Demand has been low all along; this node only just finished."""
+        """a only just finished. (Here the pool's own sleep timer starts at the
+        same moment; test_the_longest_idle_node_goes_first_not_the_one_just_
+        done pins the per-node window where it does not.)"""
         h = Harness({"a": node(), "b": node()},
                     busy={"a": ["job-1"], "b": ["job-2"]})
         c = h.controller(sleep_sustain_s=600)

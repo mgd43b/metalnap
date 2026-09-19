@@ -352,6 +352,10 @@ class Sim:
         if n.powered:
             n.powered = False
             n.change_at = self.t + self.rnd.uniform(*SHUTDOWN_S)
+            # Powered off, so no longer partitioned from anything. Left set,
+            # the old heal deadline fired after the next boot and declared the
+            # node Ready over whatever that boot was doing.
+            n.partitioned = None
         self.workers = [w for w in self.workers if w.node != name]
 
     def power_cycle(self, name):
