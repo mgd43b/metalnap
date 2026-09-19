@@ -42,8 +42,26 @@ prometheus:
 # without this every sleep pages someone -- and people paged for routine events
 # stop reading the alerts that matter. Leave the URL empty to disable, and
 # accept that consequence knowingly.
+#
+# Only nodes metalnap itself put down are silenced. One that crashed, one an
+# operator holds, and one metalnap has stopped being able to account for all
+# stay loud -- and for the last, metalnap raises MetalnapNodeNeedsAttention
+# (severity=critical, labels node and instance) so it can be routed to a page.
 alertmanager:
   url: http://alertmanager-main.monitoring.svc:9093
+  # One silence per label, matching <label>=<node>. A node's alerts do not
+  # agree on a label: kube-state-metrics alerts (KubeNodeUnreachable and
+  # friends) name it in `node`, relabelled node-exporter alerts in `instance`.
+  # Silencing `instance` alone let every sleep through as KubeNodeUnreachable.
+  silenceLabels: [instance, node]
+  # Extra matchers ANDed into every silence, in amtool syntax. Set these to
+  # mute only what a sleep is EXPECTED to trip, so anything else a sleeping
+  # node raises still arrives. Every silence also carries
+  # alertname!="MetalnapNodeNeedsAttention", so metalnap's own alert is never
+  # muted -- a negative matcher, which needs Alertmanager 0.22 or later.
+  # For example:
+  #   - 'alertname=~"KubeNodeUnreachable|KubeletInstanceUnreachable"'
+  silenceMatchers: []
 
 # Pull this image onto a node after waking it, so the first jobs do not each
 # pay for it. Empty disables the warmup entirely.
@@ -51,10 +69,14 @@ warmup:
   image: ""
   pullSecrets: []
 
-# The taint that keeps other work off your sleepable nodes. Used for the warmup
-# pod's toleration and for the pending-work fit check -- work that does not
-# tolerate it can never land here, however much room the node has.
+# The taint that keeps other work off your sleepable nodes, exactly as they
+# carry it -- `kubectl taint node <node> ci-burst=true:NoSchedule`. The warmup
+# pod tolerates it, and only pending work tolerating it, by the scheduler's own
+# rule, counts as demand: work that does not can never land here, however much
+# room the node has. So a taint that differs from the nodes' reads as NO demand.
 burstTaintKey: ci-burst
+burstTaintValue: "true"
+burstTaintEffect: NoSchedule
 
 arc:
   namespace: arc-runners
@@ -96,10 +118,29 @@ timers:
   maxSleepAttempts: 5
   sleepCooldownS: 1800
   defaultCapacityGib: 125.7
+  # A node still powered but not Ready at its wake timeout is wedged -- a
+  # locked kernel reads "on" to its BMC indefinitely. It is power-cycled at
+  # most once per node per this long, bounded by an annotation on the node
+  # (metalnap.io/power-cycled; delete it to re-arm) so a restart cannot re-arm
+  # it by accident. Never while an operator's cordon is on it, never while the
+  # cluster lists work running on it. Needing a second cycle inside the window
+  # means it needs a human: it is then unmuted and alerted on instead. 0
+  # disables the cycle and alerts straight away. Must be 0 or at least
+  # wakeTimeoutS.
+  powerCycleCooldownS: 86400
+  # How long a soft shutdown may take before the node is reported as one that
+  # would not power off. Never forced.
+  shutdownTimeoutS: 600
 
-# Override the demand queries if your signal differs.
+# Override the demand queries if your signal differs. The pool is sized on
+# whichever of memory and CPU needs more nodes: runners that run out of CPU
+# first were sized on memory alone, and woke about half the nodes they needed.
+# By default both are read off the unschedulable pods themselves, with the
+# scheduler's effective-request formula -- native sidecars (a runner's dind)
+# included, ordinary init containers counted only as the floor they are.
 queries:
-  shortfall: ""           # empty = the ARC default from __main__.py
+  shortfall: ""           # memory, GiB, as PromQL; empty = read off the pods
+  cpuShortfall: ""        # CPU, cores, as PromQL; empty = read off the pods; "-" sizes on memory alone
   saturation: ""          # empty = the ARC default; "-" disables the term
 
 rbac:

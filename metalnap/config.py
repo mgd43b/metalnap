@@ -25,8 +25,23 @@ class Config:
     #: A node may not sleep within this long of becoming Ready. Stops a node
     #: that woke for a short burst thrashing straight back down.
     min_uptime_s: int = _i("MIN_UPTIME_S", 2700)
-    #: Give up waiting for a node to become Ready after a wake.
+    #: Give up waiting for a node to become Ready after a wake. What happens
+    #: next depends on the chassis: still off means the power-on did not take,
+    #: and the next wake tries again; ON means the machine is up but wedged,
+    #: which is what POWER_CYCLE_COOLDOWN_S is for.
     wake_timeout_s: int = _i("WAKE_TIMEOUT_S", 900)
+    #: A node still powered but not Ready when its wake times out is power-
+    #: cycled -- at most once per node per this long, measured from a
+    #: timestamp stored ON THE NODE so a restart cannot re-arm it. Between
+    #: cycles it is left alone, unmuted and alerted on, because a machine that
+    #: needs a second cycle inside this window needs a human rather than a
+    #: third. 0 disables the escalation: a wedged node is then alerted on and
+    #: left for a human straight away.
+    power_cycle_cooldown_s: int = _i("POWER_CYCLE_COOLDOWN_S", 86400)
+    #: How long a soft shutdown may take before the node is reported as one
+    #: that would not power off. It is never forced: see sleep() for why a
+    #: hard cut is not a remedy for a slow shutdown.
+    shutdown_timeout_s: int = _i("SHUTDOWN_TIMEOUT_S", 600)
     #: Give up waiting for work to finish, and hand the node back.
     drain_timeout_s: int = _i("DRAIN_TIMEOUT_S", 1800)
     #: Consecutive failed sleep RESTARTS before abandoning and backing off.
@@ -70,12 +85,32 @@ class Config:
         if self.mode not in ("off", "dry_run", "on"):
             raise ValueError("MODE must be off|dry_run|on, got %r" % self.mode)
         self._validate_maintenance()
-        if self.wake_sustain_s >= self.sleep_sustain_s:
-            # Not fatal, but almost always a mistake: it makes the controller
-            # sleep as readily as it wakes, and every cold start costs real
-            # latency to whatever was queued.
-            pass
+        self._validate_escalation()
         return self
+
+    def warnings(self):
+        """Legal but almost certainly mistaken. Logged at start, not fatal."""
+        out = []
+        if self.wake_sustain_s >= self.sleep_sustain_s:
+            out.append("WAKE_SUSTAIN_S >= SLEEP_SUSTAIN_S: the controller will "
+                       "sleep as readily as it wakes, and every cold start "
+                       "costs real latency to whatever was queued")
+        return out
+
+    def _validate_escalation(self):
+        if self.power_cycle_cooldown_s < 0:
+            raise ValueError("POWER_CYCLE_COOLDOWN_S must be >= 0 (0 disables)")
+        if 0 < self.power_cycle_cooldown_s < self.wake_timeout_s:
+            # A cycle is judged by the wake timeout that follows it. A cooldown
+            # shorter than that lets the next cycle land before the last one
+            # has been given the chance to work -- a loop by another name.
+            raise ValueError(
+                "POWER_CYCLE_COOLDOWN_S (%d) must be 0 or at least "
+                "WAKE_TIMEOUT_S (%d), or a node could be cycled again before "
+                "the last cycle had a chance to work"
+                % (self.power_cycle_cooldown_s, self.wake_timeout_s))
+        if self.shutdown_timeout_s <= 0:
+            raise ValueError("SHUTDOWN_TIMEOUT_S must be > 0")
 
     def _validate_maintenance(self):
         """Reject schedules that cannot work, rather than half-working.

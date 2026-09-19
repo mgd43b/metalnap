@@ -18,8 +18,13 @@ this box off overnight". This does the one narrow thing neither does.
 ```bash
 # BMC credentials are created out of band — they do not belong in values.yaml
 kubectl create ns metalnap
-kubectl -n metalnap create secret generic metalnap-bmc \
-  --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
+# The password is read from the terminal and piped straight in: it reaches
+# neither shell history, nor the process list (--from-literal puts it in
+# both), nor a variable that outlives the subshell reading it.
+(stty -echo; trap 'stty echo' EXIT; printf 'BMC password: ' >&2
+ IFS= read -r pass; echo >&2; printf %s "$pass") |
+  kubectl -n metalnap create secret generic metalnap-bmc \
+    --from-literal=user=ADMIN --from-file=pass=/dev/stdin
 
 helm install metalnap oci://ghcr.io/mgd43b/charts/metalnap \
   -n metalnap \
@@ -68,14 +73,20 @@ nodes stay asleep with nothing to explain why.
 | `bmc.hostFormat` | — | BMC hostname pattern; `{node}` is substituted. |
 | `bmc.existingSecret` | `metalnap-bmc` | Secret with `user` / `pass` keys. |
 | `prometheus.url` | in-cluster | Where the demand signal is read from. |
-| `alertmanager.url` | in-cluster | Silences a node's alerts while it is deliberately down. Strongly recommended. |
+| `alertmanager.url` | in-cluster | Silences a node's alerts while metalnap has deliberately put it down, and raises `MetalnapNodeNeedsAttention` when one needs a human. Strongly recommended. |
+| `alertmanager.silenceLabels` | `[instance, node]` | One silence per label, matching `<label>=<node>`. kube-state-metrics alerts name a node in `node`, relabelled node-exporter alerts in `instance`. |
+| `alertmanager.silenceMatchers` | `[]` | Extra amtool-syntax matchers ANDed into every silence, to mute only what a sleep is expected to trip. Silences also exclude `MetalnapNodeNeedsAttention` with a negative matcher, which **needs Alertmanager 0.22 or later**. |
 | `warmup.image` | `""` | Pulled onto a node after waking, so the first jobs do not each pay for it. |
 | `cordonAnnotation` | `metalnap.io/cordoned` | Marks a cordon as metalnap's own. |
-| `burstTaintKey` | `ci-burst` | Taint keeping other work off sleepable nodes. |
+| `burstTaintKey` | `ci-burst` | Taint keeping other work off sleepable nodes. Empty counts every pending pod. |
+| `burstTaintValue` | `"true"` | Its value. Only pending work tolerating the whole taint — key, value and effect, by the scheduler's rule — counts as demand, so all three must match the nodes' taint. |
+| `burstTaintEffect` | `NoSchedule` | Its effect. |
 | `maintenance.intervalS` | `0` (off) | Wake a node asleep this long so it collects updates. `86400` is a sensible start. |
 | `maintenance.windowS` | `300` | How long it stays up, measured from Ready. |
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
 | `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
+| `timers.powerCycleCooldownS` | `86400` | A node still powered but not Ready at its wake timeout is power-cycled at most once per node per this long; `0` disables. Must be `0` or at least `timers.wakeTimeoutS`, or the chart refuses to install. |
+| `queries.cpuShortfall` | `""` (read off the pods) | PromQL for unmet CPU in cores. The pool is sized on whichever of memory and CPU needs more nodes; `-` sizes on memory alone. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
 ## Safety rules it will not break
@@ -90,8 +101,17 @@ Each exists because breaking it cost something real.
   rather than waited on.
 - **Never block the reconcile loop.** Wake and sleep are phase machines taking
   one non-blocking step per tick.
+- **Bound every retry, and say so when a bound is hit.** Silent
+  non-convergence hides longest.
+- **Mute only what you put down.** A node that crashed looks exactly like one
+  that was slept; only a dark node carrying metalnap's own cordon is silenced.
+- **Escalate once, then hand it to a human.** A wake that times out on a node
+  whose BMC reads "on" power-cycles it — once per `timers.powerCycleCooldownS`,
+  never under an operator's cordon or running work — and then unmutes it and
+  raises `MetalnapNodeNeedsAttention`.
 - **Wake readily, sleep reluctantly**, and hold evidence of demand across the
-  dips a noisy signal produces.
+  dips a noisy signal produces. Nodes carrying work count as wanted, and only
+  a node that has carried none for a whole sleep window is ever put down.
 - **A node nobody wants still has to be maintained.** Scheduled wakeups
   (`maintenance.intervalS`) bring an idle node up briefly so it is not weeks
   behind on updates when demand finally wants it. A visit yields to demand, to
@@ -102,7 +122,8 @@ Each exists because breaking it cost something real.
 
 ## RBAC
 
-The chart grants `nodes: get/list/patch`, `pods: get/list`, and
+The chart grants `nodes: get/list/patch` (the cordon, its ownership
+annotation, and the `metalnap.io/` notes it keeps across restarts), `pods: get/list`, and
 `ephemeralrunners: get/list/delete`. What it **withholds** matters more: there
 is no `pods/delete` and no `pods/eviction`. Evicting worker pods directly is
 how running work gets destroyed; metalnap releases idle units through their own

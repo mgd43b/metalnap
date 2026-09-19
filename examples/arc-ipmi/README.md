@@ -5,7 +5,8 @@ serving CI, asleep most of the day.
 
 ```python
 from metalnap import Config, Controller
-from metalnap.kube import Kube, KubeNodeSource
+from metalnap.kube import Kube, KubeNodeSource, PendingPodFit
+from metalnap.notify import AlertmanagerNotifier
 from metalnap.power import IpmiPower
 from metalnap.signal import PrometheusSignal
 from metalnap.drain import ArcDrain
@@ -32,8 +33,19 @@ Controller(
                     user=os.environ["BMC_USER"],
                     password=os.environ["BMC_PASS"]),
     signal=PrometheusSignal(os.environ["PROM_URL"], SHORTFALL,
-                            ARC_SATURATION_QUERY),
+                            ARC_SATURATION_QUERY,
+                            # Without it, "does the waiting work fit here?"
+                            # always answers yes.
+                            fit_check=PendingPodFit(
+                                kube, "arc-runners",
+                                # Whole, as `kubectl taint` below sets it.
+                                taint={"key": "ci-burst", "value": "true",
+                                       "effect": "NoSchedule"})),
     drain=ArcDrain(kube, namespace="arc-runners"),
+    # Optional in the protocol, not in practice: without it every sleep looks
+    # like a node dying. It mutes only nodes metalnap put down, and raises
+    # MetalnapNodeNeedsAttention when one needs a human.
+    notifier=AlertmanagerNotifier(os.environ["ALERTMANAGER_URL"]),
     config=Config(),
 ).run_forever()
 ```
@@ -75,4 +87,7 @@ kubectl taint node k8s14 k8s15 ci-burst=true:NoSchedule
 Taint answers *what may land here*; cordon answers *when*. Both are needed:
 cordon alone lets any Deployment schedule onto a node you are about to power
 off. Give the workloads you want there a matching toleration, and no
-nodeSelector — a toleration permits, it does not pull.
+nodeSelector — a toleration permits, it does not pull. metalnap counts only
+pending work whose toleration matches the whole taint — key, value and effect,
+as the scheduler matches it — so keep `burstTaintKey`, `burstTaintValue` and
+`burstTaintEffect` in step with the taint above.

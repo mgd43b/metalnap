@@ -22,7 +22,16 @@ this against real hardware and real CI:
     the exact moment demand finally wanted it. Scheduled visits are the answer,
     and they are the LOWEST-priority thing here: they yield to demand, to an
     operator, and to any operation already in flight.
+  * Mute only what you put down. A node that crashed looks exactly like one
+    that was slept -- dark, unreachable -- and the more reliable the sleeps
+    are, the more routine a crash looks. A dark node without our cordon, or
+    one we have stopped being able to account for, is left loud.
+  * Escalate once, then hand it to a human. A machine whose kernel has locked
+    up reads "on" to its BMC and ignores a soft shutdown for ever; one power
+    cycle is what a person would try first. A machine that needs a second
+    inside the cooldown needs the person.
 """
+import dataclasses
 import hashlib
 import math
 import time
@@ -43,6 +52,11 @@ class Controller:
         # through the reconcile -- a null object cannot be forgotten at one
         # call site the way a None check can.
         self.notifier = notifier or NullNotifier()
+        if not all(callable(getattr(self.notifier, m, None))
+                   for m in ("alert", "clear_alert")):
+            # A notifier written before alert() existed still works: it keeps
+            # muting and unmuting, and metalnap's own alerts go nowhere.
+            self.notifier = _WithoutAlerts(self.notifier)
         self.warmup = warmup or NullWarmup()
         self.cfg = config.validate()
         self.now = clock
@@ -79,9 +93,84 @@ class Controller:
             return
         self.node_source.set_cordon(name, cordoned)
 
+    def _note(self, name, key, value):
+        """Durably record a note on the node; False if there is nowhere to.
+
+        Raises if the write fails, so a caller for whom the record is a
+        precondition -- the power cycle -- can refuse to go on without it.
+        dry_run writes nothing outside this process, notes included.
+        """
+        if self.cfg.mode != "on":
+            return False
+        fn = getattr(self.node_source, "note", None)
+        if not callable(fn):
+            return False
+        fn(name, key, value)
+        return True
+
+    def _try_note(self, name, key, value):
+        """_note for records that improve on memory but gate nothing."""
+        try:
+            return self._note(name, key, value)
+        except Exception as e:                        # noqa: BLE001
+            self.log("warn", "could not record a note on the node; "
+                             "remembering it only until a restart",
+                     node=name, note=key, err=str(e))
+            return False
+
+    def _disown(self, name):
+        """Remove our ownership mark without writing the cordon."""
+        if self.cfg.mode != "on":
+            self.log("info", "dry_run: would clear the ownership mark",
+                     node=name)
+            return
+        fn = getattr(self.node_source, "disown", None)
+        if callable(fn):
+            fn(name)
+        else:
+            self.node_source.set_cordon(name, False)
+
+    def _set_trouble(self, name, reason, state=None):
+        """Hand the node to a human: unmuted and alerted on from this tick.
+
+        On the node as well as in memory. Held only in memory, a restart
+        re-muted a node metalnap had given up on and resolved its alert.
+        """
+        s = self._node(name)
+        s["trouble"] = reason
+        # Compared with what the NODE says, not with memory: a write that
+        # failed is retried by the reconcile until the node agrees.
+        if state is None or state.trouble != reason:
+            self._try_note(name, "trouble", reason)
+
+    def _clear_trouble(self, name, state):
+        """Returns the state as it now stands: the observation still carries
+        the note just deleted, and reading it back would re-raise the alert
+        on the very tick the node recovered."""
+        self._node(name).pop("trouble", None)
+        if state.trouble is None:
+            return state
+        self._try_note(name, "trouble", None)
+        return dataclasses.replace(state, trouble=None)
+
+    def _visit_until(self, s, state):
+        """Until when a dark node may be rebooting into a visit's update.
+
+        One visit bound from going dark in a visit this process saw, or two
+        from a visit's power-on read off the node -- enough to cover the visit
+        and the same again after it, whichever this process can still see.
+        """
+        mt = self.cfg.maintenance_timeout_s
+        return max((s["dark_after_visit"] + mt) if s.get("dark_after_visit")
+                   else 0,
+                   (state.visited_at + 2 * mt)
+                   if state is not None and state.visited_at else 0)
+
     def run_forever(self):
         self.log("info", "metalnap starting", nodes=self.nodes,
                  interval_s=self.cfg.interval_s)
+        for w in self.cfg.warnings():
+            self.log("warn", "suspicious configuration: " + w)
         while True:
             try:
                 self.tick()
@@ -91,7 +180,7 @@ class Controller:
 
     # -- wake ------------------------------------------------------------
     def wake(self, name):
-        """One non-blocking step of a wake."""
+        """One non-blocking step of a wake. True on the step that completes it."""
         s = self._node(name)
         phase = s.get("phase")
 
@@ -100,12 +189,28 @@ class Controller:
             if self.cfg.mode != "on":
                 self.log("info", "dry_run: would power on and uncordon",
                          node=name)
-                return
-            if self.power.state(name) == "off":
+                return False
+            power = self.power.state(name)
+            if power == "off":
                 self.power.on(name)
+            else:
+                # Powered, yet not Ready -- or it would not be a candidate. It
+                # is booting from an attempt a restart forgot, or it is wedged,
+                # and nothing observable tells those apart yet. The timeout
+                # does; see _wake_timed_out().
+                self.log("info", "node is already powered; waiting for it to "
+                                 "become Ready", node=name)
+            for k in ("cycled", "power_confirmed", "off"):
+                s.pop(k, None)
+            #: A cold boot WE started is capacity on its way, and tick() counts
+            #: it as such. One found already powered is not: it may never come.
+            s["booting"] = power == "off"
+            #: And one we started from OFF cannot be rebooting into an update
+            #: from an earlier visit, which is what the visit guard is for.
+            s["cold_start"] = power == "off"
             s["phase"] = "waking"
             s["phase_since"] = self.now()
-            return
+            return False
 
         st = None
         try:
@@ -121,6 +226,9 @@ class Controller:
             s["awake_since"] = self.now()
             s["sleep_attempts"] = 0
             s.pop("cooldown_until", None)
+            s["booting"] = False
+            for k in ("cycled", "power_confirmed", "cold_start"):
+                s.pop(k, None)
             self.log("info", "WAKE complete -- node uncordoned", node=name)
             # Warm AFTER the node is already schedulable. Warming first means a
             # slow warmup strands a node that is powered, Ready and serving
@@ -134,12 +242,199 @@ class Controller:
                 self.log("warn", "warmup could not start; first work may pay "
                                  "the cost", node=name, err=str(e))
                 s["phase"] = None
-            return
+            return True
+        if s.get("booting") and not s.get("power_confirmed"):
+            # A cold boot counts as capacity on its way, and holds back every
+            # other wake while it does -- so it had better be real. A BMC that
+            # accepted `power on` and did nothing would otherwise stall demand
+            # for a full wake timeout before anybody noticed. Checked once:
+            # the chassis reports power within a second, not a boot later.
+            try:
+                power = self.power.state(name)
+            except Exception as e:                    # noqa: BLE001
+                power = None
+                self.log("warn", "could not confirm the power-on; retrying "
+                                 "next tick", node=name, err=str(e))
+            if power == "off":
+                self._give_up_wake(name, s, "the chassis did not power on",
+                                   self.now() + self.cfg.wake_timeout_s,
+                                   power="off", state=st)
+                return False
+            if power == "on":
+                s["power_confirmed"] = True
         if self.now() - s.get("phase_since", 0) > self.cfg.wake_timeout_s:
-            self.log("error", "WAKE TIMEOUT -- node did not become Ready",
-                     node=name, timeout_s=self.cfg.wake_timeout_s)
+            self._wake_timed_out(name, s, st)
+        return False
+
+    def _wake_timed_out(self, name, s, st):
+        """A wake ran out of time. What that means depends on the chassis.
+
+        OFF: the power-on did not take, or did not stay. The next wake simply
+        tries again -- unless we SAW it come on, in which case something
+        powered it back off mid-boot and that is a human's problem.
+
+        ON: the machine is up and wedged -- the state a locked kernel sits in,
+        reading "on" to its BMC for as long as anyone cares to wait. Waiting
+        longer changes nothing, so it is power-cycled, once, and given one
+        more wake timeout to come back. If it does not, or it may not be
+        cycled, it is left for a human: unmuted, alerted on, and passed over
+        by demand until it can be tried again.
+        """
+        cfg, now = self.cfg, self.now()
+        s["booting"] = False
+        if st is None:
+            # The readiness read failed this step. That is not a verdict on
+            # the node; ask again next tick rather than acting on no data.
+            return
+        # The operator check uses the FRESH read taken this step, not the one
+        # tick() began with: this is where the operation finishes, and a hard
+        # power cut is the last thing to get wrong on a stale read.
+        if st.cordoned and not st.ours:
+            self.log("info", "WAKE TIMEOUT -- an operator has cordoned the "
+                             "node; leaving it to them", node=name)
             s["phase"] = None
-        return
+            return
+        try:
+            power = self.power.state(name)
+        except Exception as e:                        # noqa: BLE001
+            # Reasons are FIXED phrases. They are written to Alertmanager and
+            # onto the node; an exception's text is not ours to publish.
+            self.log("warn", "could not read power state at the wake timeout",
+                     node=name, err=str(e))
+            self._give_up_wake(name, s, "its BMC could not be read",
+                               now + cfg.wake_timeout_s, power="unknown",
+                               state=st)
+            return
+        if power != "on":
+            if s.get("power_confirmed"):
+                self._give_up_wake(name, s, "it powered on, then was off "
+                                            "again before it became Ready",
+                                   now + cfg.wake_timeout_s, power=power,
+                                   state=st)
+                return
+            self.log("error", "WAKE TIMEOUT -- node did not become Ready",
+                     node=name, timeout_s=cfg.wake_timeout_s, power=power)
+            s["phase"] = None
+            return
+
+        reason, retry_at, alert = self._cycle_refusal(name, s, st, now)
+        if reason is None:
+            alert = True        # any failure from here on is a human's
+            # On record BEFORE the cycle, and no record means no cycle: a
+            # cycle the bound cannot see is how a bound becomes a loop.
+            try:
+                self._note(name, "power-cycled", now)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "could not record the power cycle",
+                         node=name, err=str(e))
+                reason, retry_at = ("the power cycle could not be recorded, "
+                                    "so it was not attempted",
+                                    now + cfg.wake_timeout_s)
+            else:
+                # What the node now says, so the give-up below does not read
+                # our own new record as an operator's re-arm.
+                st = dataclasses.replace(st, power_cycled_at=now)
+                try:
+                    self.power.cycle(name)
+                except Exception as e:                # noqa: BLE001
+                    # Stays on record. A cycle on record that did not happen
+                    # costs one retry; one that happened off the record costs
+                    # the bound.
+                    self.log("warn", "the power cycle failed", node=name,
+                             err=str(e))
+                    reason, retry_at = ("the power cycle failed",
+                                        now + cfg.power_cycle_cooldown_s)
+                else:
+                    self.log("error", "WAKE TIMEOUT -- node is powered but "
+                                      "not Ready; power-cycling it",
+                             node=name, timeout_s=cfg.wake_timeout_s,
+                             down_since=_iso(st.down_since)
+                             if st.down_since else None)
+                    s["cycled"] = True
+                    s["phase_since"] = now
+                    return
+        self._give_up_wake(name, s, reason, retry_at, power="on", alert=alert,
+                           state=st)
+
+    def _cycle_refusal(self, name, s, st, now):
+        """Why this wedged node may NOT be power-cycled now.
+
+        (reason, retry_at, alert), or (None, None, None) if it may. Each guard
+        is a way a hard power cut goes wrong, and each is checked where the
+        operation finishes rather than trusted from where it began.
+        """
+        cfg = self.cfg
+        cooldown = cfg.power_cycle_cooldown_s
+        if not cooldown:
+            return ("power-cycle escalation is disabled "
+                    "(POWER_CYCLE_COOLDOWN_S=0)", math.inf, True)
+        # Optional seams. A backend that cannot cycle (Wake-on-LAN cannot), or
+        # a source that cannot record one durably, degrades to "alert and
+        # leave it" -- never to an unbounded cycle.
+        if not callable(getattr(self.power, "cycle", None)):
+            return "the power backend cannot power-cycle", math.inf, True
+        if not callable(getattr(self.node_source, "note", None)):
+            return ("the node source cannot record a power cycle, so none "
+                    "can be bounded", math.inf, True)
+        # The record on the node is the ONLY bound, deliberately: an operator
+        # re-arms it by deleting the annotation, and a copy held in memory
+        # would quietly overrule them.
+        last = st.power_cycled_at
+        if s.get("cycled"):
+            # No record now means an operator deleted ours mid-wait: re-armed.
+            return ("a power cycle during this wake did not bring it back",
+                    last + cooldown if last is not None
+                    else now + cfg.wake_timeout_s, True)
+        if last is not None and now - last < cooldown:
+            return ("it was already power-cycled at %s" % _iso(last),
+                    last + cooldown, True)
+        visit_until = self._visit_until(s, st)
+        if now < visit_until and not s.get("cold_start"):
+            # Dark since a maintenance visit, and maybe rebooting into
+            # firmware it just installed -- see maintain(). Not a failure yet,
+            # so no alert; demand is simply pointed elsewhere until the visit
+            # bound has passed. A wake that found the chassis OFF is exempt: a
+            # machine that was powered down is not mid-update.
+            return ("it went dark soon after a maintenance visit and may be "
+                    "mid-update", visit_until, False)
+        # NEVER interrupt running work -- not by power either. NotReady is not
+        # dead: a kubelet cut off from the API server leaves its jobs running,
+        # and busy() reads the work queue's own records, not the kubelet. If
+        # it cannot tell, that reads as busy. The cost is a node whose stale
+        # records keep it from being cycled, and that is left to a human.
+        try:
+            busy = self.drain.busy(name)
+        except Exception as e:                        # noqa: BLE001
+            self.log("warn", "busy check failed at the wake timeout",
+                     node=name, err=str(e))
+            return ("could not tell whether it is running work, which reads "
+                    "as busy", now + cfg.wake_timeout_s, True)
+        if busy:
+            return ("the cluster still lists running work on it: %s"
+                    % ", ".join(busy[:5]), now + cfg.wake_timeout_s, True)
+        return None, None, None
+
+    def _give_up_wake(self, name, s, reason, retry_at, power, alert=True,
+                      state=None):
+        """Stop, say why, and point demand at other nodes until retry_at."""
+        now = self.now()
+        s["phase"] = None
+        s["booting"] = False
+        s["wake_backoff_until"] = retry_at
+        # Remember which record the backoff is waiting out, so that deleting
+        # the annotation -- the documented re-arm -- lifts it straight away.
+        if state is not None:
+            s["backoff_record"] = state.power_cycled_at
+        else:
+            s.pop("backoff_record", None)
+        if alert:
+            self._set_trouble(name, "not Ready after a wake: " + reason, state)
+        self.log("error", "WAKE FAILED -- node did not become Ready; %s"
+                          % ("leaving it for a human" if alert
+                             else "trying other nodes first"),
+                 node=name, reason=reason, power=power,
+                 retry_in_s=None if retry_at == math.inf
+                 else int(retry_at - now))
 
     def warm(self, name):
         """One non-blocking step of the warmup phase."""
@@ -207,8 +502,12 @@ class Controller:
             # the drain deadline -- so a restarted sleep would reset the very
             # clock that is supposed to survive a restart, and a node with hung
             # work could be held indefinitely, one restart at a time.
-            if not (state and state.cordoned and state.ours):
+            if not self._ours(state):
                 self._set_cordon(name, True)
+            if state is not None and state.shutdown_at is not None:
+                # Left by a shutdown this process never saw finish. This sleep
+                # starts its own; a stale one would read as already underway.
+                self._try_note(name, "shutdown", None)
             s["phase"] = "sleeping"
             s["phase_since"] = self.now()
             return
@@ -292,11 +591,83 @@ class Controller:
             self.log("warn", "could not announce the shutdown; not powering "
                              "off this tick", node=name, err=str(e))
             return
+        # On the node before the request, so a restart in the minute the
+        # kubelet goes on reporting Ready resumes waiting instead of reading
+        # the node as stranded and asking a second time.
+        self._try_note(name, "shutdown", self.now())
         self.power.soft_off(name)
-        s["phase"] = None
-        s["sleep_attempts"] = 0
+        # Not done yet: a soft shutdown is a REQUEST. The node stays in flight
+        # until the chassis confirms it, which does two jobs. The kubelet keeps
+        # reporting Ready for most of a minute after the OS starts going down,
+        # and a node that is Ready, cordoned and ours with no operation in
+        # flight reads as STRANDED -- so the repair used to "complete the
+        # sleep" of a machine already shutting down, a second soft-off into a
+        # shutdown in progress. And an OS that never finishes going down --
+        # wedged on an unmount, or ignoring the request -- is caught rather
+        # than muted as asleep for as long as nobody wants it.
+        s["phase"] = "powering_off"
+        s["phase_since"] = self.now()
         s["awake_since"] = None
-        self.log("info", "SLEEP complete -- powered off", node=name)
+        self.log("info", "SLEEP shutdown requested -- waiting for power-off",
+                 node=name)
+
+    def confirm_off(self, name, state=None):
+        """One non-blocking step of waiting for a soft shutdown to finish.
+
+        A shutdown that outlasts its bound is reported, never forced. The
+        choice is the same one maintain() makes about a node that may be
+        mid-update: a hard cut is the reading that is expensive to get wrong,
+        and the machine is going nowhere while a human looks. If demand wants
+        it, a wake finds it powered and wedged and escalates exactly as it
+        would for a node that crashed in service.
+        """
+        s = self._node(name)
+        try:
+            power = self.power.state(name)
+        except Exception as e:                        # noqa: BLE001
+            power = None
+            self.log("warn", "could not read power state while waiting for "
+                             "the shutdown", node=name, err=str(e))
+        timed_out = (self.now() - s.get("phase_since", 0)
+                     > self.cfg.shutdown_timeout_s)
+        # Off AND NotReady. The BMC can read off while the kubelet is still
+        # reported Ready, and ending the phase then hands a node that reads
+        # Ready, cordoned and ours to the stranded repair -- which "completes
+        # the sleep" with a second soft-off into a chassis already off.
+        if power == "off" and (timed_out or not (state and state.ready)):
+            s["phase"] = None
+            s["sleep_attempts"] = 0
+            s["off"] = True
+            s.pop("shutdown_failed", None)
+            self._try_note(name, "shutdown", None)
+            self.log("info", "SLEEP complete -- powered off", node=name)
+            return
+        if not timed_out:
+            return
+        s["phase"] = None
+        self._try_note(name, "shutdown", None)
+        if power == "on":
+            reason = _NOT_OFF % self.cfg.shutdown_timeout_s
+            if state is not None and not state.ready:
+                # Wedged partway down: dark, powered, and going nowhere. That
+                # is a node in trouble like any other dark one.
+                self._set_trouble(name, reason, state)
+            else:
+                # Ignoring the request, and still Ready. Kept apart from
+                # `trouble`, which Ready clears, and raised only while Ready:
+                # once it reads NotReady it is going down after all.
+                #
+                # sleep_attempts is deliberately NOT reset. The node reads as
+                # stranded and is slept again, and it is the attempt bound,
+                # counting across those, that finally returns it to service
+                # instead of asking forever.
+                s["shutdown_failed"] = reason
+            self.log("error", "SLEEP FAILED -- node did not power off; "
+                              "leaving it powered rather than cutting power",
+                     node=name, timeout_s=self.cfg.shutdown_timeout_s)
+        else:
+            self.log("error", "could not confirm the node powered off",
+                     node=name, timeout_s=self.cfg.shutdown_timeout_s)
 
     # -- scheduled maintenance -------------------------------------------
     def _maintenance_offset(self, name):
@@ -382,8 +753,25 @@ class Controller:
                 self.log("info", "dry_run: would power on for a maintenance "
                                  "window", node=name)
                 return
-            if self.power.state(name) == "off":
+            power = self.power.state(name)
+            if power == "off":
+                # On the node BEFORE the power-on: the one thing a restart
+                # must not forget about a visit is that it may have started an
+                # update. Only a visit that powers the node on can have -- one
+                # that finds it already powered and dark is visiting a node
+                # that is wedged, and stamping it would renew the mid-update
+                # grace on every visit, so it was never cycled or alerted on.
+                self._try_note(name, "visited", self.now())
                 self.power.on(name)
+            # Kept for the case where demand takes the visit over mid-boot:
+            # the wake it becomes is then a cold boot we started, and counts.
+            s["booting"] = power == "off"
+            #: Whether THIS visit could have started an update. One that found
+            #: the node already powered and dark is visiting a wedged node, and
+            #: must not renew the mid-update grace -- it would keep the node
+            #: from ever being cycled or alerted on, one visit at a time.
+            s["visit_powered_on"] = power == "off"
+            s.pop("off", None)
             s["phase"] = "maintaining"
             s["phase_since"] = self.now()
             return
@@ -407,15 +795,20 @@ class Controller:
             # machine powered costs watts. Cutting power to one writing its own
             # firmware costs the machine, and no remote hands can undo it.
             #
-            # It is not abandoned silently. The node is announced down for as
-            # long as it stays down, this logs at error, and the next scheduled
-            # visit re-checks it -- while the ordinary stranded repair finishes
-            # the job the moment it comes back Ready.
+            # It is not abandoned silently. It is NOT muted -- a node that
+            # outlasted a whole visit NotReady needs a human to look, which is
+            # exactly what muting would stop -- it is alerted on, this logs at
+            # error, and the ordinary stranded repair finishes the job the
+            # moment it comes back Ready.
             self.log("error", "MAINTENANCE TIMEOUT -- node is still not Ready; "
                               "leaving it powered rather than cutting power to "
                               "a node that may be mid-update", node=name,
                      timeout_s=cfg.maintenance_timeout_s)
             self._release_visit(name)
+            if s.get("visit_powered_on"):
+                s.setdefault("dark_after_visit", self.now())
+            self._set_trouble(name, "still not Ready %ds into a maintenance "
+                                    "visit" % cfg.maintenance_timeout_s, state)
             return
 
         if state is not None and state.ready and not state.cordoned:
@@ -499,12 +892,18 @@ class Controller:
             state = states[n]
             if state.ready:
                 continue          # already up, and already getting its updates
-            if not (state.cordoned and state.ours):
+            if not self._ours(state):
                 # A dark node WITHOUT our cordon is not one we put to sleep.
                 # Somebody pulled it for a disk swap or a firmware flash, and
                 # powering it on underneath them is the single worst thing this
                 # feature could do. An operator's cordon outranks the
                 # controller; so does an operator's screwdriver.
+                continue
+            s = self.st.get(n) or {}
+            if (s.get("trouble") or state.trouble
+                    or self.now() < s.get("wake_backoff_until", 0)):
+                # Handed to a human, or given up on for now. A visit would
+                # power it on under the person now holding it.
                 continue
             if self._maintenance_due(n, state):
                 due.append((self._dark_since(n, state), n))
@@ -543,6 +942,176 @@ class Controller:
             self.log("error", "could not begin a maintenance visit",
                      node=node, err=str(e))
 
+    # -- sizing ----------------------------------------------------------
+    def _size(self, shortfall, capacities):
+        """(node capacity, whole nodes the backlog needs).
+
+        Per resource when the signal and the nodes name them -- {"memory": GiB,
+        "cpu": cores} -- and then the node count is the most any one resource
+        needs. Sized on memory alone, a pool whose work runs out of CPU first
+        woke about half the nodes an e2e backlog needed. A bare number on both
+        sides is one resource, as before.
+        """
+        cfg = self.cfg
+        dicts = [isinstance(c, dict) for c in capacities]
+        if not isinstance(shortfall, dict) and not any(dicts):
+            cap = min([c for c in capacities if c > 0]
+                      or [cfg.default_capacity])
+            return cap, math.ceil(max(shortfall, 0.0) / cap)
+        if not isinstance(shortfall, dict) or not all(dicts):
+            # Refused rather than guessed at: dividing CPU by GiB sizes the
+            # pool on nonsense, and the tick fails toward "change nothing".
+            raise TypeError("the demand signal and the node source disagree: "
+                            "one sizes per resource and the other does not")
+        cap = {}
+        for r in set(shortfall).union(*capacities):
+            have = [c.get(r, 0) for c in capacities if c.get(r, 0) > 0]
+            if have:
+                cap[r] = min(have)
+            elif r == "memory":
+                cap[r] = cfg.default_capacity
+        unsized = sorted(r for r, v in shortfall.items()
+                         if v > 0 and r not in cap)
+        if unsized != self.st.get("_unsized_last"):
+            if unsized:
+                self.log("warn", "no node reports capacity for a resource the "
+                                 "demand signal asks for; not sizing on it",
+                         resources=unsized)
+            self.st["_unsized_last"] = unsized
+        return cap, max((math.ceil(v / cap[r]) for r, v in shortfall.items()
+                         if v > 0 and r in cap), default=0)
+
+    def _in_use(self, awake):
+        """Awake nodes carrying work, by the work queue's own records.
+
+        One that cannot be read counts as in use: if a check cannot tell
+        whether a node is busy, that reads as busy.
+        """
+        out = []
+        for n in awake:
+            try:
+                busy = self.drain.busy(n)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "busy check failed; counting the node as in "
+                                 "use", node=n, err=str(e))
+                busy = True
+            if busy:
+                out.append(n)
+        return out
+
+    # -- what we did, and what we know ------------------------------------
+    @staticmethod
+    def _ours(state):
+        """Carrying OUR cordon. Every "did we do this?" question starts here.
+
+        One definition. There were three inline copies, and the place that
+        most needed the question -- the notification reconcile -- did not ask
+        it at all, and muted every dark node, crashed ones included.
+        """
+        return bool(state is not None and state.cordoned and state.ours)
+
+    def _asleep(self, name, state):
+        """Put down by us and still down the way we left it: the one kind of
+        dark node whose alerts are noise rather than news."""
+        if not self._ours(state):
+            return False        # crashed, or an operator's: either way, loud
+        phase = (self.st.get(name) or {}).get("phase")
+        if not state.ready:
+            # Dark mid-drain means it went down before we took it down: the
+            # sleep announces itself immediately before cutting power, and
+            # leaves this phase in the same step.
+            return phase != "sleeping"
+        # Ready, but already asked to shut down. The kubelet outlives the OS
+        # going down by most of a minute, and unmuting for that minute lets
+        # through exactly the alerts the mute was for.
+        return phase == "powering_off"
+
+    def _dark_trouble(self, name, state):
+        """Why this dark node needs a human, or None. Unmutes it: its own
+        alerts are exactly what should now arrive."""
+        return (self.st.get(name) or {}).get("trouble") or state.trouble
+
+    def _trouble(self, name, state):
+        """Why this node needs a human, or None.
+
+        Recorded where metalnap gave up, in memory and on the node, and
+        cleared when the node is seen Ready or an operator takes it. A node
+        that ignored a shutdown is the exception: that trouble is raised only
+        WHILE it is Ready, and cleared by a shutdown that is confirmed.
+        """
+        s = self.st.get(name) or {}
+        return (s.get("trouble") or state.trouble
+                or (s.get("shutdown_failed") if state.ready else None))
+
+    def _check_dark(self, name, state):
+        """Confirm that a node we believe asleep is actually OFF. Returns the
+        state as it now stands, for the same reason _clear_trouble does.
+
+        Everything else here assumes a dark node carrying our cordon is one we
+        powered off. It is, until it is not: an OS wedged partway through
+        shutting down, or a wake a restart forgot, leaves a machine powered,
+        dark and ours -- muted as asleep for as long as nobody wants it, which
+        is the incident this controller's mute rule exists to prevent, arriving
+        by the side door. So check: once per sleep (confirm_off() does it) and
+        once after every restart. A powered one gets a wake timeout's grace,
+        since it may simply be booting, and then is called what it is.
+
+        What this cannot see: a node confirmed off that something ELSE later
+        powers on -- a BMC restoring power after an outage -- and that then
+        wedges during boot. One that boots cleanly is caught by the stranded
+        repair; one that wedges stays muted until demand or a visit wants it.
+        """
+        s = self._node(name)
+        if s.get("phase"):
+            # An operation accounts for it, and times itself out. The grace
+            # below starts afresh if the operation ends with the node dark.
+            s.pop("dark_on_since", None)
+            return state
+        trouble = s.get("trouble") or state.trouble
+        if trouble and trouble.startswith(_RECHECKABLE):
+            # Trouble this function -- or a shutdown that outlasted its bound
+            # -- raised from a power reading. A later reading can take it
+            # back: a BMC that answers again, a slow shutdown that finished.
+            try:
+                power = self.power.state(name)
+            except Exception:                         # noqa: BLE001
+                return state
+            if power == "off":
+                self.log("info", "node carrying our cordon reads off after "
+                                 "all; muting it again", node=name,
+                         was=trouble)
+                state = self._clear_trouble(name, state)
+                s["off"] = True
+                s.pop("dark_on_since", None)
+            return state
+        if s.get("off") or trouble:
+            return state
+        if self.now() < self._visit_until(s, state):
+            return state  # may be rebooting into an update; see maintain()
+        since = s.setdefault("dark_on_since", self.now())
+        try:
+            power = self.power.state(name)
+        except Exception as e:                        # noqa: BLE001
+            # Bounded like everything else. A BMC that cannot be read for a
+            # whole wake timeout leaves a dark node nobody can vouch for, and
+            # muting that is the failure this function exists to prevent.
+            if self.now() - since > self.cfg.wake_timeout_s:
+                self._set_trouble(name, _BMC_UNREADABLE, state)
+            else:
+                self.log("warn", "could not read power state of a sleeping "
+                                 "node", node=name, err=str(e))
+            return state
+        if power == "off":
+            s["off"] = True
+            s.pop("dark_on_since", None)
+            return state
+        if self.now() - since > self.cfg.wake_timeout_s:
+            self._set_trouble(name, _POWERED_UNEXPLAINED, state)
+            self.log("error", "node carrying our cordon is powered but not "
+                              "Ready, and no operation of ours explains it",
+                     node=name, powered_for_s=int(self.now() - since))
+        return state
+
     # -- reconcile -------------------------------------------------------
     def tick(self):
         cfg, st = self.cfg, self.st
@@ -558,7 +1127,6 @@ class Controller:
         # Observe. ANY failure here means no action this tick -- fail toward
         # "everything stays on", which is the whole safety posture.
         states = {n: self.node_source.state(n) for n in self.nodes}
-        shortfall = self.signal.shortfall()
 
         # Drop protected nodes before anything else looks at them, so no code
         # path further down can act on one by accident. Configuration is the
@@ -583,12 +1151,82 @@ class Controller:
             self.log("info", "no configured node exists yet")
             return
 
+        # An operator who uncordons a node we cordoned leaves our ownership
+        # mark behind -- `kubectl uncordon` knows nothing of it. Left there, the
+        # operator's NEXT cordon of that node reads as ours, and every guard
+        # that defers to an operator stops deferring: the stranded repair would
+        # uncordon them, a visit would power the node on under their hands, a
+        # wedged one would be power-cycled. Clear it the moment it is seen.
+        for n in present:
+            if states[n].ours and not states[n].cordoned:
+                self.log("warn", "our ownership mark outlived its cordon -- "
+                                 "the node was uncordoned by someone else; "
+                                 "clearing the mark", node=n)
+                try:
+                    self._disown(n)
+                except Exception as e:                # noqa: BLE001
+                    self.log("error", "could not clear the ownership mark",
+                             node=n, err=str(e))
+                states[n] = dataclasses.replace(states[n], ours=False,
+                                                ours_since=None)
+
         # Reconcile notifications every tick rather than only on transitions.
         # A notification lost to a restart or an Alertmanager outage is then
         # re-asserted, and -- more importantly -- one left over on a node that
         # is UP is cleared, so a real failure of it is not silently swallowed.
+        #
+        # Muted means put down BY US: dark and carrying our cordon, and not a
+        # node we have stopped being able to account for. Readiness alone once
+        # decided this, which muted a node that crashed in service exactly as
+        # if it had been slept -- for the whole of a 21-hour outage.
         for n in present:
-            want_down = not states[n].ready
+            state, s = states[n], self._node(n)
+            by_operator = state.cordoned and not state.ours
+            if state.ready:
+                for k in ("dark_on_since", "off", "wake_backoff_until",
+                          "backoff_record", "dark_after_visit"):
+                    s.pop(k, None)
+                state = states[n] = self._clear_trouble(n, state)
+            elif by_operator:
+                # A human has it; they know.
+                state = states[n] = self._clear_trouble(n, state)
+            if by_operator or not state.ready or not self._ours(state):
+                # Raised only while metalnap keeps asking a Ready node to go
+                # down. Going dark, or back to service, ends that.
+                s.pop("shutdown_failed", None)
+            if (s.get("trouble") and s["trouble"] != state.trouble
+                    and not by_operator):
+                self._try_note(n, "trouble", s["trouble"])
+            if ("backoff_record" in s
+                    and state.power_cycled_at != s["backoff_record"]):
+                # Somebody deleted the power-cycle record -- the documented
+                # way to re-arm the cycle. Honour it now, not after the
+                # backoff it was waiting out.
+                self.log("info", "power-cycle record changed; the node may be "
+                                 "tried again", node=n)
+                s.pop("wake_backoff_until", None)
+                s.pop("backoff_record", None)
+            if (not s.get("phase") and state.shutdown_at is not None
+                    and self._ours(state)):
+                if self.now() - state.shutdown_at <= cfg.shutdown_timeout_s:
+                    # A restart interrupted a shutdown. Resume waiting for it,
+                    # rather than read a node the kubelet still reports Ready
+                    # as stranded and ask it to shut down a second time.
+                    self.log("info", "resuming a shutdown a restart "
+                                     "interrupted", node=n)
+                    s["phase"] = "powering_off"
+                    s["phase_since"] = state.shutdown_at
+                else:
+                    self._try_note(n, "shutdown", None)
+            if not state.ready and not by_operator and self._ours(state):
+                state = states[n] = self._check_dark(n, state)
+            trouble = None if by_operator else self._trouble(n, state)
+            # Dark trouble unmutes the node, so its own alerts arrive. A node
+            # that ignored a shutdown stays muted while it retries -- it is
+            # going down -- and is alerted on all the same: our own alert is
+            # excluded from our own silences, so the two do not collide.
+            want_down = (self._asleep(n, state)
+                         and (by_operator or not self._dark_trouble(n, state)))
             if cfg.mode != "on":
                 # dry_run must not mutate ANYTHING outside this process, and a
                 # notifier writes to a real system. A shadow deployment that
@@ -597,7 +1235,8 @@ class Controller:
                 # against. Caught by exactly that: a dry_run metalnap created a
                 # live Alertmanager silence next to the incumbent's.
                 self.log("info", "dry_run: would mark node %s"
-                                 % ("down" if want_down else "up"), node=n)
+                                 % ("down" if want_down else "up"), node=n,
+                         trouble=trouble)
                 continue
             try:
                 if want_down:
@@ -607,6 +1246,29 @@ class Controller:
             except Exception as e:                    # noqa: BLE001
                 self.log("warn", "notification reconcile failed", node=n,
                          err=str(e))
+            try:
+                if trouble:
+                    self.notifier.alert(n, trouble)
+                else:
+                    self.notifier.clear_alert(n)
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "alert reconcile failed", node=n,
+                         err=str(e))
+
+        # Dark, and nobody's cordon on it: it went down on its own. Its own
+        # alerts are left alone -- that is the point -- and it is said once
+        # here, in case those alerts are not being read.
+        crashed = [n for n in present
+                   if not states[n].ready and not states[n].cordoned]
+        if crashed != st.get("_crashed_last"):
+            if crashed:
+                self.log("error", "managed nodes are down and metalnap did not "
+                                  "put them down; their alerts are not muted",
+                         nodes=crashed)
+            elif st.get("_crashed_last"):
+                self.log("info", "no managed node is down unaccounted for",
+                         recovered=st["_crashed_last"])
+            st["_crashed_last"] = crashed
 
         awake = [n for n in present
                  if states[n].ready and not states[n].cordoned]
@@ -622,18 +1284,69 @@ class Controller:
                 self.log("info", "operator cordon cleared", released=st["_held_last"])
             st["_held_last"] = held
 
-        capacity = min([states[n].capacity for n in present
-                        if states[n].capacity > 0] or [cfg.default_capacity])
+        # Read AFTER the notification reconcile, which needs only node state: a
+        # demand signal that is down must not also stop re-asserting alerts --
+        # they carry a TTL, and would resolve themselves in the outage.
+        shortfall = self.signal.shortfall()
+        capacity, backlog = self._size(shortfall,
+                                       [states[n].capacity for n in present])
         try:
             saturated = self.signal.saturated_units()
         except Exception as e:                        # noqa: BLE001
             self.log("warn", "saturation check failed; sizing on shortfall "
                              "alone", err=str(e))
             saturated = 0
+        st["_tick"] = st.get("_tick", 0) + 1
+        # `want` is how many nodes should be AWAKE, so it has to count the
+        # ones already carrying work, not only the work still waiting. The
+        # shortfall sees only what the scheduler cannot place; once awake nodes
+        # absorbed a backlog it read zero, `want` read zero, and every busy node
+        # in the pool was cordoned and drained, one a tick -- while a full node
+        # plus a new backlog read as "demand met" and woke nothing.
+        in_use = self._in_use(awake)
+        for n in present:
+            if n in awake and n not in in_use:
+                self._node(n).setdefault("idle_since", self.now())
+            else:
+                self._node(n).pop("idle_since", None)
         # A saturated queue admits no more work, so its demand is invisible to
-        # shortfall(). Count each as one node's worth.
-        effective = shortfall + saturated * capacity
-        want = max(0, min(len(wakeable), math.ceil(effective / capacity)))
+        # shortfall() -- and it is a FLOOR, not more demand. Its runners sit on
+        # nodes already counted in use; a node woken on top of them is one the
+        # capped queue can never use. Counted as an addend it did exactly
+        # that, and held the extra node awake and idle for as long as the cap
+        # held.
+        want = max(0, min(len(wakeable),
+                          max(len(in_use) + backlog, saturated)))
+        # Scale-up simulation: would the waiting work actually FIT here?
+        # shortfall() is a sum, which assumes everything waiting is waiting on
+        # capacity. Work blocked on a selector or a volume, or too big for a
+        # node, inflates it -- and would wake a node that cannot help, keep an
+        # idle one awake, and pull a draining one back into service.
+        #
+        # Skipped when saturation drove the demand: a saturated queue has
+        # nothing pending to inspect -- that is the entire problem.
+        #
+        # Decided here, BEFORE anything acts on `want`, so a mid-sleep rescue
+        # or a visit takeover cannot fire on demand that cannot land. The one
+        # exception is the stranded repair below, which keeps `unguarded`: a
+        # differential test against the controller this replaced found 40
+        # divergences in 3000 states, every one with fits=False, and every one
+        # a STRANDED node -- already powered, already cordoned -- put to sleep
+        # instead of returned to service. Both are safe, but returning it
+        # matches "wake readily, sleep reluctantly", and a transient fit-check
+        # failure cannot power off a node that was only ever mid-wake.
+        unguarded = want
+        if backlog > 0 and saturated == 0:
+            try:
+                if not self.signal.fits_node(capacity):
+                    self.log("info", "demand present but none of it could run "
+                                     "on a node this size; not counting it",
+                             shortfall=_show(shortfall))
+                    want = max(0, min(len(wakeable), len(in_use)))
+            except Exception as e:                    # noqa: BLE001
+                self.log("warn", "fit check failed; holding the pool as it is",
+                         err=str(e))
+                want = len(awake)
 
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
@@ -665,15 +1378,38 @@ class Controller:
                 st[n].pop("maintenance_until", None)
                 if not states[n].ready:
                     # Still booting. The wake machine finishes it properly,
-                    # and its timeout runs from power-on either way.
+                    # and its timeout runs from power-on either way -- but it
+                    # is marked, because a node dark partway through a visit
+                    # may be rebooting into an update, and must not be the one
+                    # a wake timeout power-cycles.
                     st[n]["phase"] = "waking"
+                    if st[n].get("visit_powered_on"):
+                        st[n].setdefault("dark_after_visit", self.now())
+                    for k in ("cycled", "power_confirmed", "cold_start"):
+                        st[n].pop(k, None)
                     continue
                 try:
                     self._set_cordon(n, False)
                     st[n]["awake_since"] = self.now()
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
+                continue
+            if phase == "sleeping" and not states[n].cordoned:
+                # Somebody uncordoned it mid-drain. The cordon is how a drain
+                # holds a node out of service, so losing it means an operator
+                # wants the node working -- and finishing the sleep would power
+                # off the machine they just put back. maintain() reads the
+                # same signal the same way.
+                self.log("info", "node was uncordoned mid-drain; abandoning "
+                                 "the sleep and leaving it in service", node=n,
+                         cooldown_s=cfg.sleep_cooldown_s)
+                st[n]["phase"] = None
+                # Backed off like any abandoned sleep, or the next tick would
+                # start it again and re-cordon the node they just put back.
+                st[n]["sleep_attempts"] = 0
+                st[n]["cooldown_until"] = self.now() + cfg.sleep_cooldown_s
                 continue
             if phase == "sleeping" and want > len(awake):
                 self.log("info", "demand arrived mid-sleep; keeping the node",
@@ -682,16 +1418,23 @@ class Controller:
                 try:
                     self._set_cordon(n, False)
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
                 continue
             try:
                 if phase == "waking":
-                    self.wake(n)
+                    if self.wake(n):
+                        # Serving from this tick on. Counted now, or the
+                        # decisions below see demand this node already meets.
+                        awake.append(n)
+                        st["_joined_tick"] = st["_tick"]
                 elif phase == "warming":
                     self.warm(n)
                 elif phase == "maintaining":
                     self.maintain(n, states[n])
+                elif phase == "powering_off":
+                    self.confirm_off(n, states[n])
                 else:
                     self.sleep(n, states[n])
             except Exception as e:                    # noqa: BLE001
@@ -702,16 +1445,17 @@ class Controller:
         # power, serving nothing. It gets there when an operation is
         # interrupted. Only cordons this controller owns are touched.
         stranded = [n for n in present
-                    if states[n].ready and states[n].cordoned
-                    and states[n].ours and n not in in_flight]
+                    if states[n].ready and self._ours(states[n])
+                    and n not in in_flight]
         for n in stranded:
-            if len(awake) < want:
+            if len(awake) < unguarded:
                 self.log("warn", "stranded node needed; completing the wake",
                          node=n)
                 try:
                     self._set_cordon(n, False)
                     self._node(n)["awake_since"] = self.now()
                     awake.append(n)
+                    st["_joined_tick"] = st["_tick"]
                 except Exception as e:                # noqa: BLE001
                     self.log("error", "could not uncordon", node=n, err=str(e))
             else:
@@ -723,55 +1467,66 @@ class Controller:
                     self.log("error", "could not sleep", node=n, err=str(e))
             return  # one corrective action per tick; re-observe next
 
-        # Scale-up simulation: would the waiting work actually FIT here?
-        # shortfall() is a sum, which assumes everything waiting is waiting on
-        # capacity. Work blocked on a selector, a taint or a volume inflates it
-        # and powers on a machine that cannot help.
-        #
-        # Skipped when saturation drove the demand: a saturated queue has
-        # nothing pending to inspect -- that is the entire problem -- so
-        # applying the check there would veto every saturation-driven wake.
-        #
-        # POSITION MATTERS, and it is deliberately after the stranded reconcile
-        # rather than before it. A differential test against the controller
-        # this replaces found 40 divergences in 3000 states, every one of them
-        # here and every one with fits=False: guarding first meant a STRANDED
-        # node -- already powered, already cordoned -- got put to sleep instead
-        # of returned to service. Both are safe, but returning it matches the
-        # documented "wake readily, sleep reluctantly" bias, and it means a
-        # transient fit-check failure cannot power off a node that was only
-        # ever mid-wake.
-        if want > len(awake) and saturated == 0:
-            try:
-                if not self.signal.fits_node(capacity):
-                    self.log("info", "demand present but none of it could run "
-                                     "on a node this size; not waking",
-                             shortfall=round(shortfall, 1))
-                    want = len(awake)
-            except Exception as e:                    # noqa: BLE001
-                self.log("warn", "fit check failed; not waking", err=str(e))
-                want = len(awake)
-
         now = self.now()
-        self.log("info", "observed", shortfall=round(shortfall, 1),
-                 saturated=saturated, want=want, awake=awake)
+        # Capacity already on its way. Only a cold boot WE started counts: one
+        # found powered may be wedged, and counting it would hold demand back
+        # for a whole wake timeout behind a machine that never arrives.
+        coming = [n for n in present
+                  if st.get(n, {}).get("phase") == "waking"
+                  and st[n].get("booting")]
+        self.log("info", "observed", shortfall=_show(shortfall),
+                 saturated=saturated, want=want, awake=awake, in_use=in_use,
+                 coming=coming)
+        # A node that joined service last tick carries work a SCRAPED signal
+        # may not have seen placed yet: busy() counts it, and a shortfall
+        # from before the scrape counts it again. Hold new wakes for that one
+        # tick. The default signal reads pods live and cannot double-count,
+        # but a PromQL override scraped once a minute can.
+        just_joined = st.get("_joined_tick") == st["_tick"] - 1
 
         if want > len(awake):
             st["want_high_since"] = st.get("want_high_since") or now
             st["want_high_last"] = now
             st["want_low_since"] = None
-            if now - st["want_high_since"] >= cfg.wake_sustain_s:
+            # `coming` counts here and nowhere else. A cold boot takes minutes
+            # and this runs every one of them, so without it one node's worth
+            # of demand powered on one more machine per tick until the first
+            # came up -- measured in production at three and four nodes for
+            # want=1, every demand episode, each then held up by min_uptime.
+            if (now - st["want_high_since"] >= cfg.wake_sustain_s
+                    and want > len(awake) + len(coming) and not just_joined):
                 for n in wakeable:
-                    if n not in awake and n not in in_flight:
+                    if n in awake or n in in_flight:
+                        continue
+                    if now < st.get(n, {}).get("wake_backoff_until", 0):
+                        continue          # given up on, or failed to power on
+                    try:
                         self.wake(n)
-                        break
+                    except Exception as e:            # noqa: BLE001
+                        # A BMC that cannot be reached must not abort the rest
+                        # of the tick -- maintenance is decided below -- nor
+                        # be first in line again next tick, ahead of every
+                        # node that could actually come up.
+                        self.log("error", "could not begin the wake; trying "
+                                          "other nodes first", node=n,
+                                 err=str(e), retry_in_s=cfg.wake_timeout_s)
+                        self._node(n)["wake_backoff_until"] = (
+                            now + cfg.wake_timeout_s)
+                    break
         elif want < len(awake):
             st["want_low_since"] = st.get("want_low_since") or now
             st["want_high_since"] = None
             st["want_high_last"] = None
             if now - st["want_low_since"] >= cfg.sleep_sustain_s:
                 for n in reversed(wakeable):
-                    if n in awake and n not in in_flight:
+                    # Only a node carrying no work, and carrying none for a
+                    # whole sleep window: sleep reluctantly. A node that has
+                    # just finished a job is the likeliest to be handed the
+                    # next, and cordoning a busy one takes capacity away for up
+                    # to a drain timeout while it finishes.
+                    if (n in awake and n not in in_flight and n not in in_use
+                            and now - st[n].get("idle_since", now)
+                            >= cfg.sleep_sustain_s):
                         if now < st.get(n, {}).get("cooldown_until", 0):
                             self.log("info", "sleep backing off; skipping",
                                      node=n)
@@ -801,6 +1556,34 @@ class Controller:
         self._maybe_maintain(present, states, awake, want)
 
 
+#: Trouble raised from a power reading, which a later reading can take back.
+_BMC_UNREADABLE = "its BMC could not be read while it carries our cordon"
+_POWERED_UNEXPLAINED = ("powered but not Ready, and nothing metalnap is "
+                        "doing explains it")
+_NOT_OFF = "did not power off within %ds of a soft shutdown"
+_RECHECKABLE = (_BMC_UNREADABLE, _POWERED_UNEXPLAINED,
+                _NOT_OFF.split("%")[0])
+
+
+class _WithoutAlerts:
+    """A Notifier from before alert(), given no-op alerts."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def going_down(self, node):
+        self.inner.going_down(node)
+
+    def back_up(self, node):
+        self.inner.back_up(node)
+
+    def alert(self, node, reason):
+        pass
+
+    def clear_alert(self, node):
+        pass
+
+
 def _hash_fraction(digest):
     """A digest as a fraction in [0, 1) -- and the half-open end is load-bearing.
 
@@ -814,6 +1597,18 @@ def _hash_fraction(digest):
     names will ever produce -- but an all-ones digest produces it every time.
     """
     return int.from_bytes(digest[:4], "big") / 2.0 ** 32
+
+
+def _show(amount):
+    """A shortfall for a log line, one resource or several."""
+    if isinstance(amount, dict):
+        return {k: round(v, 1) for k, v in amount.items()}
+    return round(amount, 1)
+
+
+def _iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
 
 
 def _default_log(level, msg, **kv):

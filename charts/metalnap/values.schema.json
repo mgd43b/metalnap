@@ -56,6 +56,23 @@
       "properties": {
         "url": {
           "type": "string"
+        },
+        "silenceLabels": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "description": "Labels a node's alerts name it by; one silence per label, matching <label>=<node>."
+        },
+        "silenceMatchers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Extra matchers in amtool syntax (name=\"v\", name!=\"v\", name=~\"re\", name!~\"re\"), ANDed into every silence."
         }
       }
     },
@@ -79,6 +96,17 @@
     },
     "burstTaintKey": {
       "type": "string"
+    },
+    "burstTaintValue": {
+      "type": "string"
+    },
+    "burstTaintEffect": {
+      "type": "string",
+      "enum": [
+        "NoSchedule",
+        "PreferNoSchedule",
+        "NoExecute"
+      ]
     },
     "tolerations": {
       "type": "array",
@@ -126,6 +154,16 @@
         "defaultCapacityGib": {
           "type": "number",
           "exclusiveMinimum": 0
+        },
+        "powerCycleCooldownS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "At most one power cycle of a wedged node per node per this long. 0 disables. Must be 0 or at least wakeTimeoutS."
+        },
+        "shutdownTimeoutS": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long a soft shutdown may take before the node is reported as one that would not power off. Never forced."
         }
       }
     },
@@ -152,6 +190,23 @@
           "type": "integer",
           "minimum": 1,
           "description": "Bound on one visit, from power-on. Must be at least windowS + timers.wakeTimeoutS."
+        }
+      }
+    },
+    "queries": {
+      "type": "object",
+      "properties": {
+        "shortfall": {
+          "type": "string",
+          "description": "PromQL for unmet memory, GiB. Empty = read off the unschedulable pods with the scheduler's effective-request formula."
+        },
+        "cpuShortfall": {
+          "type": "string",
+          "description": "PromQL for unmet CPU, cores. Empty = read off the unschedulable pods; \"-\" sizes on memory alone."
+        },
+        "saturation": {
+          "type": "string",
+          "description": "PromQL counting work queues at their ceiling. Empty = the ARC default; \"-\" disables the term."
         }
       }
     }

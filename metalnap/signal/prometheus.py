@@ -6,6 +6,11 @@ class PrometheusSignal:
     def __init__(self, url, shortfall_query, saturation_query=None,
                  timeout=20, fit_check=None):
         self.url = url.rstrip("/")
+        #: A PromQL query or a callable returning the amount, or {resource:
+        #: either} to size on several -- which then needs a NodeSource that
+        #: reports capacity for the same resources. The reference wiring reads
+        #: unmet demand off the pods themselves (kube.PendingPodShortfall) and
+        #: keeps PromQL for overrides.
         self.shortfall_query = shortfall_query
         self.saturation_query = saturation_query
         self.timeout = timeout
@@ -25,8 +30,13 @@ class PrometheusSignal:
         # branch is load-bearing, not defensive padding.
         return float(res[0]["value"][1]) if res else 0.0
 
+    def _source(self, source):
+        return float(source()) if callable(source) else self._scalar(source)
+
     def shortfall(self):
-        return self._scalar(self.shortfall_query)
+        if isinstance(self.shortfall_query, dict):
+            return {r: self._source(q) for r, q in self.shortfall_query.items()}
+        return self._source(self.shortfall_query)
 
     def saturated_units(self):
         if not self.saturation_query:
