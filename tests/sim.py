@@ -26,6 +26,13 @@ The cluster model is faithful on the points a controller gets wrong:
     that runs out.
   * an operator periodically takes a node for maintenance, cordoning it
     WITHOUT the controller's annotation.
+  * on half the seeds an operator ASKS for a node -- metalnap.io/maintenance
+    -- whatever it is doing: asleep, in service, mid-drain, mid-visit, and
+    sometimes the whole fleet at once. While they hold it they reboot it,
+    switch it off at the BMC and sometimes back on themselves: everything a
+    node in trouble does, done on purpose. They give it back with plain
+    kubectl, which leaves the controller's record of the request behind for
+    the controller to clear.
   * a node woken for a SCHEDULED maintenance visit sometimes reboots into the
     update it just installed, going NotReady in the middle of its own window.
     Cutting power there is how a routine update becomes an unbootable
@@ -57,9 +64,10 @@ it report OK while testing nothing:
     controller destroy it.
 
 MEASURED DETECTION, by reintroducing each real bug and counting failing seeds
-(60 seeds x 900 ticks). Every table here was re-measured together, against
-the harness as it now stands; a rate measured against an older harness says
-nothing about this one:
+(60 seeds x 900 ticks). The first three tables were re-measured together,
+against the harness as it stood before operator maintenance requests were
+modelled; a rate measured against an older harness says nothing about this
+one, and what the requests did to them is set out after the fourth:
 
     no pre-release re-check                50/60
     controller never sleeps anything       16/60
@@ -112,7 +120,46 @@ and for wedged, partitioned and shutdown-ignoring nodes (60 x 900):
     no operator check at the moment of the cycle          0/60
     a booting node not counted (one node per tick)        0/60
 
-Every row in all three tables -- the zeroes and the ones -- also fails a
+and for operator maintenance requests, on the 30 of those 60 seeds that run
+them:
+
+    a request powered on again once taken up             30/30
+    a node asked for muted as asleep                     28/30
+    the power-on made before it is on record             24/30
+    the stranded repair takes a node asked for           23/30
+    an operation in flight not let go for a request      10/30
+    demand wakes and sleeps a node asked for             10/30
+    the record left behind when the node is given back   10/30
+    more than one maintenance power-on in a tick          9/30
+    a visit started on a node asked for                   2/30
+    no fresh-read check where a wake finishes             0/30
+    no fresh-read check at a wake timeout                 0/30
+    taken up on the tick its shutdown settles             0/30
+
+The zeroes are out of reach rather than missed. Nothing here changes inside a
+tick, so a request never lands between the observation a tick begins with and
+the fresh read a wake takes where it finishes -- the race both fresh-read
+checks exist for, and the reason the operator check at the moment of the cycle
+reads 0 above. And the last needs a shutdown confirmed on its timeout while the
+kubelet still reads Ready; the kubelet here never lags that far on its own,
+and where it came closest the operator had switched the node off themselves,
+and leaving it dark was not wrong.
+
+Requests hold a node out of most of this harness's budgets while they stand,
+so on their half of the seeds they thin the cover the first three tables were
+measured with. Four of those rows, the bug reintroduced afresh -- not quite
+the original patch for the second, which starts at 15 rather than 16 -- and
+measured without requests and with them (60 x 900, then 600 x 900):
+
+    no pre-release re-check                   50 -> 47/60    512 -> 477/600
+    controller never sleeps anything          15 -> 16/60    206 -> 175/600
+    a crashed node muted like a slept one     60 -> 60/60    600 -> 600/600
+    a power cycle made before it is on record 51 -> 49/60    479 -> 475/600
+
+The rest have not been re-measured. The other half of the seeds draw nothing
+for requests, and play out exactly as they did before them.
+
+Every row in all four tables -- the zeroes and the ones -- also fails a
 deterministic test in test_controller.py. The low rows are the ones that need
 two rare things at once (a restart inside a shutdown, a partition that
 outlasts a wake timeout, a visit's reboot that wedges), which is exactly why
@@ -138,6 +185,7 @@ injected restarts -- but it is a model, and a bug outside its shape will not be
 found here.
 
 Run: python3 -B tests/sim.py [--seeds N] [--ticks N]
+     (the defaults, 60 x 900, are the CI gate and the tables above)
 """
 import argparse
 import math
@@ -196,6 +244,14 @@ class Node:
         #: controller restarts injected below.
         self.power_cycled_at = self.visited_at = self.shutdown_at = None
         self.trouble = None
+        #: When the controller took up the current maintenance request. Its
+        #: note, durable like the rest -- and left behind when the operator
+        #: gives the node back, because plain `kubectl annotate` removes only
+        #: the annotation it names.
+        self.maintenance_started_at = None
+        #: An operator's maintenance request -- their reason -- or None. The
+        #: one field here that a PERSON writes and the controller only reads.
+        self.maintenance = None
         #: Ignored the last soft shutdown, and is still up because of it.
         self.ignored_off = False
 
@@ -237,6 +293,29 @@ class Sim:
         self.muted_hung_since = {}
         self.was_ours = {}
         self.stuck_wake_since = {}
+        #: Operator maintenance requests run on half the seeds, for the reason
+        #: default_cfg() gives visits half: a node asked for is exempt from
+        #: most of the budgets below, and asking on every seed would quietly
+        #: thin the cover those budgets give everywhere else. Split on
+        #: seed // 3, so it is independent of the visit, cooldown and
+        #: per-resource splits; the other half draws nothing for it.
+        self.operator_requests = (seed // 3) % 2 == 0
+        #: The operator's own dice. Drawn from the world's, every request
+        #: would reshuffle everything after it -- and every tick's chance of
+        #: one would reshuffle the seed from the first tick, before any
+        #: request existed. Apart, a seed plays out exactly as it did without
+        #: requests until the first one lands.
+        self.ops = random.Random("operator-%d" % seed)
+        #: Those standing now, by node: when each is to be given back, and
+        #: what the controller has done about it.
+        self.requests = {}
+        #: Each node's request, and its maintenance-started record, as the
+        #: controller observed them at the start of this tick. Every
+        #: maintenance invariant is judged against what it could see.
+        self.observed, self.observed_started = {}, {}
+        self.intruded = []
+        self.maint_power_ons = 0
+        self.untaken_since = {}
         #: Set once run() builds it. The reboot model reads the controller's
         #: own phase, which is the only honest way to tell a maintenance visit
         #: apart from a drain that happens to look identical from outside.
@@ -307,10 +386,24 @@ class Sim:
                          down_since=None if n.ready else n.down_since,
                          power_cycled_at=n.power_cycled_at,
                          visited_at=n.visited_at,
-                         shutdown_at=n.shutdown_at, trouble=n.trouble)
+                         shutdown_at=n.shutdown_at, trouble=n.trouble,
+                         maintenance=n.maintenance,
+                         maintenance_started_at=n.maintenance_started_at)
+
+    def _asked_for(self, name, what):
+        """Record `what` as an intrusion if an operator's request stood on
+        this node in the state the controller observed this tick.
+
+        The observation, not the node as it is now: the invariant is about
+        what the controller KNEW, and a request it could not yet have seen
+        is not one it ignored.
+        """
+        if self.observed.get(name):
+            self.intruded.append((self.t, name, what))
 
     def set_cordon(self, name, cordoned):
         n = self.nodes[name]
+        self._asked_for(name, "uncordoned" if not cordoned else "cordoned")
         if name in self.human_held and not cordoned:
             self.stomped.append((self.t, name, "uncordoned an operator"))
         if cordoned and not n.cordoned and any(
@@ -326,9 +419,18 @@ class Sim:
         setattr(self.nodes[name], {"power-cycled": "power_cycled_at",
                                    "visited": "visited_at",
                                    "shutdown": "shutdown_at",
-                                   "trouble": "trouble"}[key], value)
+                                   "trouble": "trouble",
+                                   "maintenance-started":
+                                       "maintenance_started_at"}[key], value)
+        req = self.requests.get(name)
+        if key == "maintenance-started" and req is not None:
+            # Taken up, by the controller's own account. Kept apart from the
+            # node's field because a record left over from an EARLIER request
+            # sits in that field too, and must not count as this one's.
+            req["taken"] = self.t if value is not None else None
 
     def disown(self, name):
+        self._asked_for(name, "cleared the ownership mark")
         self.nodes[name].ours = None
 
     # -- PowerBackend ----------------------------------------------------
@@ -337,11 +439,34 @@ class Sim:
 
     def power_on(self, name):
         n = self.nodes[name]
+        if self.observed.get(name):
+            # The one thing the controller may do to a node asked for, and
+            # only once per request: after that the machine's power is the
+            # operator's, and they switch it off on purpose.
+            req = self.requests[name]
+            req["power_ons"] += 1
+            self.maint_power_ons += 1
+            if self.observed_started.get(name) is not None:
+                self.intruded.append((self.t, name, "powered on a node whose "
+                                      "request was already taken up"))
+            elif n.maintenance_started_at != self.t:
+                # A power-on the record does not show is one a restart makes
+                # again after the operator has switched the machine off.
+                self.intruded.append((self.t, name, "powered on for "
+                                      "maintenance before putting it on "
+                                      "record"))
+            if req["power_ons"] > 1:
+                self.intruded.append((self.t, name, "powered on %d times for "
+                                      "one request" % req["power_ons"]))
+            if self.maint_power_ons > 1:
+                self.intruded.append((self.t, name, "%d maintenance power-ons "
+                                      "in one tick" % self.maint_power_ons))
         if not n.powered:
             n.powered = True
             n.change_at = self.t + BOOT_S
 
     def soft_off(self, name):
+        self._asked_for(name, "soft-off")
         if name in self.human_held:
             self.stomped.append((self.t, name, "powered off while held"))
         if self.nodes[name].updating:
@@ -368,6 +493,7 @@ class Sim:
 
     def power_cycle(self, name):
         n = self.nodes[name]
+        self._asked_for(name, "power cycle")
         if name in self.human_held:
             self.stomped.append((self.t, name, "power-cycled while held"))
         if n.updating:
@@ -417,12 +543,16 @@ class Sim:
 
     # -- Notifier --------------------------------------------------------
     def going_down(self, node):
+        # A person is working on it: whatever it does is news to nobody, and
+        # muted, a real failure of it is news nobody gets.
+        self._asked_for(node, "muted")
         self.notified[node] = "down"
 
     def back_up(self, node):
         self.notified[node] = "up"
 
     def alert(self, node, reason):
+        self._asked_for(node, "alerted on (%s)" % reason)
         self.alerted[node] = reason
 
     def clear_alert(self, node):
@@ -613,6 +743,8 @@ class Sim:
                 self.human_held.add(n.name)
                 n.cordoned, n.ours = True, None      # NOT ours: a human did it
 
+        self.step_maintenance_requests()
+
         # PHASED demand. Rerolling every tick never held demand below capacity
         # for the consecutive ticks a sleep needs, so the sleep path never ran.
         if not self.busy_phase:
@@ -641,6 +773,108 @@ class Sim:
             self.demand = self.rnd.choice([8.0, 40.0, 100.0, 130.0])
             self.saturated = self.rnd.choice([0, 1, 1, 2])
 
+    def step_maintenance_requests(self):
+        """An operator asks for a node -- `metalnap.io/maintenance` -- works
+        on it, and gives it back.
+
+        Asked for in whatever state the node is in: asleep, in service,
+        mid-drain, mid-visit, booting, wedged. Sometimes for the whole fleet at
+        once, which is the case one power-on per tick exists for. While they
+        hold it they do what a person upgrading a machine does, all of which
+        looks, from outside, like a node in trouble: they reboot it, they
+        switch it off at the BMC, and sometimes they switch it back on
+        themselves. Every one of the controller's remedies for a node doing
+        that is wrong here, which is what the invariants below assert.
+
+        Given back with plain kubectl, which removes the one annotation and
+        leaves the controller's maintenance-started record for it to clear --
+        so a controller that forgets to is caught by the NEXT request on that
+        node, which it then never takes up.
+        """
+        if not self.operator_requests:
+            return
+        interval = self.cfg.interval_s
+        released = set()
+        for name, req in list(self.requests.items()):
+            n = self.nodes[name]
+            if self.t >= req["until"]:
+                # Usually once it is back up; sometimes left dark, because the
+                # work that wanted it off is done and the rest is metalnap's.
+                # Never in the minute the kubelet outlives a power-off: that
+                # is a node Ready and off, and giving THAT back is a race of
+                # the operator's making, not a state the controller owns.
+                if ((n.ready and n.powered)
+                        or (not n.ready and self.ops.random() < 0.15)):
+                    n.maintenance = None
+                    del self.requests[name]
+                    released.add(name)
+                elif not n.powered and not n.ready and self.ops.random() < 0.2:
+                    self._operator_power_on(n)
+                continue
+            r = self.ops.random()
+            if n.powered and n.ready and n.updating is None and r < 0.03:
+                # A reboot into what they just installed: NotReady while
+                # powered, which is a wedge to anything that does not know.
+                n.ready = False
+                n.down_since = self.t
+                n.change_at = self.t + 2 * interval + BOOT_S
+                self.workers = [w for w in self.workers if w.node != name]
+            elif n.powered and r < 0.045:
+                # Off at the BMC, to reseat a DIMM or flash firmware that wants
+                # a cold start. The kubelet outlives it, as it does any other.
+                n.powered, n.hung, n.partitioned = False, False, None
+                n.ignored_off, n.updating = False, None
+                n.change_at = (self.t + self.ops.uniform(*SHUTDOWN_S)
+                               if n.ready else None)
+                self.workers = [w for w in self.workers if w.node != name]
+            elif not n.powered and not n.ready and r < 0.07:
+                self._operator_power_on(n)
+
+        free = [n for n in self.nodes.values()
+                if n.name not in self.requests and n.name not in released]
+        if free and self.ops.random() < 0.004:
+            # About a third for the whole fleet: `maintenance start --all`.
+            for n in (free if self.ops.random() < 0.3
+                      else [self.ops.choice(free)]):
+                self._ask_for(n)
+        elif (len(free) == len(self.nodes) and not any(n.powered for n in free)
+                and self.ops.random() < 0.004):
+            # And the fleet is likeliest asked for when it is asleep --
+            # nothing running, so the time to flash firmware -- which is also
+            # the one time several nodes that are off wait on one power-on per
+            # tick. Two nodes are both off about a seventh of the time here,
+            # so by chance alone that rule was barely reached.
+            for n in free:
+                self._ask_for(n)
+        # By chance a request lands mid-operation about one time in ten, which
+        # is too seldom for the case the controller's abandon logic exists
+        # for, so some are timed to the controller's own phase -- read from
+        # it the way the reboot model reads a visit's. Not a wake: one lingers
+        # only on a wedged node, where the power-cycle rows find their cover,
+        # and timing requests to it handed that cover to the operator.
+        for n in free:
+            if (n.maintenance is None and self.controller is not None
+                    and (self.controller.st.get(n.name) or {}).get("phase")
+                        not in (None, "waking")
+                    and self.ops.random() < 0.015):
+                self._ask_for(n)
+
+    def _ask_for(self, n):
+        n.maintenance = "kernel upgrade"
+        self.requests[n.name] = {
+            "until": self.t + self.ops.randint(5, 60) * self.cfg.interval_s,
+            "taken": None, "power_ons": 0}
+
+    def _operator_power_on(self, n):
+        if n.shutdown_at is not None:
+            # Switched back on under a shutdown the controller asked for and
+            # has not yet seen finish. To the controller that is exactly a
+            # node that ignored the request -- up, Ready, and inside the
+            # shutdown's bound -- and it is judged as one.
+            n.ignored_off = self.t
+        n.powered = True
+        n.change_at = self.t + BOOT_S
+
     # -- invariants ------------------------------------------------------
     def check(self, tick):
         def fail(msg):
@@ -668,7 +902,10 @@ class Sim:
             if n.powered and n.ready and ann == "down" and not ignoring:
                 fail("%s is Ready but still announced as down -- a real "
                      "failure of it would be silenced" % n.name)
-            if not n.powered and ours and ann != "down":
+            # Save one an operator has asked for, which is never muted at all:
+            # switched off at the BMC, it is off because they are working.
+            if (not n.powered and ours and ann != "down"
+                    and n.maintenance is None):
                 fail("%s was powered off without being announced as down "
                      "(announced=%r)" % (n.name, ann))
             # The incident: a node that went down on its own, muted as though
@@ -723,7 +960,9 @@ class Sim:
             waking = (self.controller is not None
                       and (self.controller.st.get(n.name) or {}).get("phase")
                       == "waking")
-            if not n.hung or n.name in self.alerted:
+            # Nor one an operator has asked for: its wake is abandoned, and it
+            # is theirs to cycle. The clock restarts with the next wake after.
+            if not n.hung or n.name in self.alerted or n.maintenance:
                 self.stuck_wake_since.pop(n.name, None)
                 continue
             if waking:
@@ -753,6 +992,9 @@ class Sim:
         if self.stomped:
             fail("overrode an operator's maintenance cordon: %s"
                  % (self.stomped[0],))
+        if self.intruded:
+            fail("acted on a node an operator asked for maintenance: %s"
+                 % (self.intruded[0],))
         if self.interrupted_update:
             fail("powered off a node that was rebooting into an update it had "
                  "just installed: %s" % (self.interrupted_update[0],))
@@ -770,9 +1012,12 @@ class Sim:
             # Powered, Ready and cordoned is NEITHER desired state: full power,
             # zero service. Brief is fine (mid-sleep); indefinite is a livelock.
             # A node an operator holds is exempt -- that is what maintenance
-            # looks like, and the controller is right to leave it.
+            # looks like, and the controller is right to leave it. So is one
+            # asked for, until it is given back; then the budget starts afresh,
+            # and a stranded node gets the whole of it to be put right.
             zombie = (n.powered and n.ready and n.cordoned
-                      and n.name not in self.human_held)
+                      and n.name not in self.human_held
+                      and n.maintenance is None)
             if zombie:
                 self.zombie_since.setdefault(n.name, self.t)
                 held = self.t - self.zombie_since[n.name]
@@ -790,7 +1035,9 @@ class Sim:
                          % (n.name, held, budget))
             else:
                 self.zombie_since.pop(n.name, None)
-            if not n.powered and n.ready and not n.cordoned:
+            # The operator's own power-off is their own race to lose.
+            if (not n.powered and n.ready and not n.cordoned
+                    and n.maintenance is None):
                 fail("%s is powered off but Ready and schedulable" % n.name)
 
         # ---- LIVENESS ----
@@ -835,6 +1082,7 @@ class Sim:
                          and n.powered and not n.hung
                          and n.partitioned is None
                          and n.name not in self.human_held
+                         and n.maintenance is None
                          and not any(w.node == n.name and w.work
                                      for w in self.workers))
             if not sleepable:
@@ -908,7 +1156,8 @@ class Sim:
             for n in self.nodes.values():
                 candidate = (not n.powered and n.cordoned
                              and n.ours is not None
-                             and n.name not in self.human_held)
+                             and n.name not in self.human_held
+                             and n.maintenance is None)
                 if not candidate:
                     self.unvisited_since.pop(n.name, None)
                     continue
@@ -919,6 +1168,42 @@ class Sim:
                          "without a maintenance visit -- the schedule has "
                          "stopped firing" % (n.name, dark, budget))
 
+        # An operator who asks for a dark node gets it powered on, and soon.
+        # This is the check that fails if a request is never taken up -- a
+        # record left behind by the last one, say -- which looks from outside
+        # exactly like a feature that is not there.
+        #
+        # Measured only while the request is waiting on the controller: the
+        # chassis OFF and the node NotReady (a node still reported Ready is
+        # one the controller is right to record as already up), and not yet
+        # taken up. Taken up and then dark is the operator's doing, and the
+        # controller must leave it so. Every term is reachable:
+        #   shutdown/warmup   the take-up yields to an operation of ours that
+        #                     cannot be recalled -- a shutdown already
+        #                     requested (or resumed from its note after a
+        #                     restart), or a warmup; never both at once
+        #   1 tick            and waits for a fresh observation after it ends,
+        #                     since the one the tick began with predates it
+        #   N ticks           one maintenance power-on per tick, so the last
+        #                     of the fleet waits behind every other
+        #   1 tick            measurement grain
+        if self.cfg.mode == "on":
+            budget = (max(self.cfg.shutdown_timeout_s,
+                          self.cfg.warmup_timeout_s)
+                      + (len(self.nodes) + 2) * self.cfg.interval_s)
+            for n in self.nodes.values():
+                req = self.requests.get(n.name)
+                if (req is None or req["taken"] is not None or n.powered
+                        or n.ready):
+                    self.untaken_since.pop(n.name, None)
+                    continue
+                self.untaken_since.setdefault(n.name, self.t)
+                waited = self.t - self.untaken_since[n.name]
+                if waited > budget:
+                    fail("%s was asked for maintenance and has been dark and "
+                         "off for %.0fs (budget %.0fs) without being powered "
+                         "on" % (n.name, waited, budget))
+
         # Sustained demand must actually produce a node. A WINDOWED MAJORITY,
         # not a run length: the signal flickers by nature, so a counter that
         # resets on any dip measures the flicker -- which is the mistake the
@@ -927,24 +1212,31 @@ class Sim:
         # A wedged node is not capacity the controller can provide -- it has
         # tried, cycled and handed it to a human -- so it does not raise the
         # ceiling either. Whether it escalated at all is asserted separately.
+        # Nor is one an operator has, by cordon or by request, powered or
+        # not: the controller may neither wake it nor count it, and a node
+        # counted here would hide the peer it failed to wake beside it. That
+        # was harmless while an operator's node was always powered; once they
+        # switch one off, a window filled while they held it failed the tick
+        # they let go of it, on a controller that had had no node to wake.
+        pool = [n for n in self.nodes.values()
+                if n.maintenance is None and n.name not in self.human_held]
         backlog = math.ceil(self.demand / CAPACITY)
         if self.per_resource:
             backlog = max(backlog, math.ceil(self.demand * self.cpu_per_gib
                                              / CPU_CAPACITY))
         # Saturation is a floor on what is wanted, not more of it: a capped
         # queue's runners are already on powered nodes.
-        need = min(sum(1 for n in self.nodes.values()
+        need = min(sum(1 for n in pool
                        if not n.hung and n.partitioned is None),
                    max(backlog, self.saturated))
         # A wedged node is powered and serves nothing, so it is not capacity.
-        powered = sum(1 for n in self.nodes.values()
+        powered = sum(1 for n in pool
                       if n.powered and not n.hung and n.partitioned is None)
         self.need_window.append(need > powered)
         if len(self.need_window) > 40:
             self.need_window.pop(0)
         if (len(self.need_window) == 40 and sum(self.need_window) >= 16
-                and any(not n.powered and n.name not in self.human_held
-                        for n in self.nodes.values())):
+                and any(not n.powered for n in pool)):
             fail("demand exceeded powered capacity in %d of the last 40 ticks "
                  "but a node is still off" % sum(self.need_window))
 
@@ -970,6 +1262,11 @@ class Sim:
                     self.muted_hung_since.clear()
                     self.stuck_wake_since.clear()
                 self.blocked = None
+                self.observed = {k: v.maintenance
+                                 for k, v in self.nodes.items()}
+                self.observed_started = {k: v.maintenance_started_at
+                                         for k, v in self.nodes.items()}
+                self.maint_power_ons = 0
                 c.tick()
                 self.check(i)
                 self.advance(self.cfg.interval_s)
@@ -997,7 +1294,7 @@ class _Power:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ticks", type=int, default=500)
+    ap.add_argument("--ticks", type=int, default=900)
     ap.add_argument("--seeds", type=int, default=60)
     a = ap.parse_args()
     failures = []
