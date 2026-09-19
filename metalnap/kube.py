@@ -46,18 +46,34 @@ class Kube:
             raise
 
 
+#: Every suffix a Kubernetes quantity may carry. Binary first: "Mi" must not
+#: be read as "M" followed by junk.
+_SUFFIX = (("Ki", 2 ** 10), ("Mi", 2 ** 20), ("Gi", 2 ** 30), ("Ti", 2 ** 40),
+           ("Pi", 2 ** 50), ("Ei", 2 ** 60),
+           ("n", 1e-9), ("u", 1e-6), ("m", 1e-3), ("k", 1e3), ("M", 1e6),
+           ("G", 1e9), ("T", 1e12), ("P", 1e15), ("E", 1e18))
+
+
+def quantity(v):
+    """A Kubernetes quantity -- "129Mi", "1G", "500m", "12e6", 4 -- as a number.
+
+    All three forms the API accepts: binary-SI, decimal-SI and a bare or
+    exponent number. Reading only some of them raised on a valid request like
+    "1G", and on the default demand path that failed the whole tick.
+    """
+    v = str(v).strip()
+    for suffix, mult in _SUFFIX:
+        if v.endswith(suffix) and not v[:-len(suffix)].endswith(("e", "E")):
+            return float(v[:-len(suffix)]) * mult
+    return float(v)                      # plain, or an exponent: "12e6"
+
+
 def mem_to_gib(v):
-    v = str(v)
-    for suffix, mult in (("Ki", 1 / 1048576), ("Mi", 1 / 1024), ("Gi", 1.0),
-                         ("Ti", 1024.0)):
-        if v.endswith(suffix):
-            return float(v[:-2]) * mult
-    return float(v) / (1024 ** 3)
+    return quantity(v) / 2 ** 30
 
 
 def cpu_to_cores(v):
-    v = str(v)
-    return float(v[:-1]) / 1000 if v.endswith("m") else float(v)
+    return quantity(v)
 
 
 #: How each resource is read off a Kubernetes quantity, in the unit its
@@ -96,6 +112,15 @@ def effective_requests(spec, resources=("memory", "cpu")):
     return out
 
 
+def tolerates(pod, key):
+    """Could this pod land on a node carrying taint `key`? True with no key."""
+    if not key:
+        return True
+    return any(t.get("key") == key
+               or (t.get("operator") == "Exists" and not t.get("key"))
+               for t in pod["spec"].get("tolerations", []))
+
+
 def _unschedulable(pod):
     return any(c.get("type") == "PodScheduled" and c.get("status") == "False"
                and c.get("reason") == "Unschedulable"
@@ -112,10 +137,16 @@ class PendingPodShortfall:
 
     `of(resource)` is one resource's shortfall -- memory in GiB, CPU in cores
     -- for PrometheusSignal to use as a source.
+
+    `toleration_key` as for PendingPodFit, and for the same reason: a pod that
+    does not tolerate the taint keeping work off these nodes can never land
+    on one, so it is no demand for them -- counted, it wakes nodes for work
+    they cannot run.
     """
 
-    def __init__(self, kube, namespace):
+    def __init__(self, kube, namespace, toleration_key=None):
         self.kube, self.ns = kube, namespace
+        self.toleration_key = toleration_key
 
     def of(self, resource):
         def shortfall():
@@ -124,7 +155,8 @@ class PendingPodShortfall:
                        "status.phase=Pending" % self.ns)
             return sum(effective_requests(p["spec"], (resource,))[resource]
                        for p in pods.get("items", [])
-                       if not p["spec"].get("nodeName") and _unschedulable(p))
+                       if not p["spec"].get("nodeName") and _unschedulable(p)
+                       and tolerates(p, self.toleration_key))
         return shortfall
 
 
@@ -287,12 +319,8 @@ class PendingPodFit:
         for p in pods.get("items", []):
             if p["spec"].get("nodeName"):
                 continue                      # already placed
-            if self.toleration_key:
-                tols = p["spec"].get("tolerations", [])
-                if not any(t.get("key") == self.toleration_key
-                           or (t.get("operator") == "Exists" and not t.get("key"))
-                           for t in tols):
-                    continue
+            if not tolerates(p, self.toleration_key):
+                continue
             # The scheduler's effective request, init-phase floor and all: a pod
             # whose init container needs more than its steady state does not
             # fit a node that only holds the steady state.

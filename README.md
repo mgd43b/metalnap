@@ -303,12 +303,13 @@ python3 -B tests/sim.py --seeds 20 --ticks 400
 ```bash
 # BMC credentials are created out of band -- they do not belong in values.yaml
 kubectl create ns metalnap
-# the password is read from stdin, so it reaches neither shell history nor
-# the process list (a --from-literal would put it in both)
-read -rsp 'BMC password: ' BMC_PASS && echo
-printf %s "$BMC_PASS" | kubectl -n metalnap create secret generic metalnap-bmc \
-  --from-literal=user=ADMIN --from-file=pass=/dev/stdin
-unset BMC_PASS
+# The password is read from the terminal and piped straight in: it reaches
+# neither shell history, nor the process list (--from-literal puts it in
+# both), nor a variable that outlives the subshell reading it.
+(stty -echo; trap 'stty echo' EXIT; printf 'BMC password: ' >&2
+ IFS= read -r pass; echo >&2; printf %s "$pass") |
+  kubectl -n metalnap create secret generic metalnap-bmc \
+    --from-literal=user=ADMIN --from-file=pass=/dev/stdin
 
 CHART_VERSION=0.3.1 # x-release-please-version
 

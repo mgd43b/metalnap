@@ -37,7 +37,8 @@ Optional:
     WARMUP_PULL_SECRETS     comma-separated imagePullSecrets for the above
     BURST_TAINT_KEY         taint keeping other work off sleepable nodes
                             (default ci-burst); used for the warmup pod's
-                            toleration and for the pending-pod fit check
+                            toleration, and to count only pending work that
+                            could land on those nodes
     ARC_NAMESPACE           default arc-runners
     CORDON_ANNOTATION       default metalnap.io/cordoned
     SHORTFALL_QUERY         PromQL for unmet MEMORY in GiB, instead of reading
@@ -98,6 +99,9 @@ def main(argv=None):
     ns = os.environ.get("ARC_NAMESPACE", "arc-runners")
     host_fmt = require("BMC_HOST_FMT")
     kube = Kube()
+    # The taint keeping other work off the sleepable nodes: the warmup pod
+    # tolerates it, and demand that does not tolerate it is no demand here.
+    taint = os.environ.get("BURST_TAINT_KEY", "ci-burst")
 
     sat_q = os.environ.get("SATURATION_QUERY", ARC_SATURATION_QUERY)
     # Sized per resource: runners that run out of CPU before memory, sized on
@@ -105,7 +109,7 @@ def main(argv=None):
     # CPU_SHORTFALL_QUERY="" goes back to memory alone. By default each is read
     # off the unschedulable pods with the scheduler's own effective-request
     # formula -- see PendingPodShortfall for why PromQL cannot give it.
-    pending = PendingPodShortfall(kube, ns)
+    pending = PendingPodShortfall(kube, ns, toleration_key=taint)
     queries = {"memory": os.environ.get("SHORTFALL_QUERY")
                or pending.of("memory")}
     cpu_q = os.environ.get("CPU_SHORTFALL_QUERY")
@@ -133,7 +137,6 @@ def main(argv=None):
     # Warming is opt-in by image. Without it the first work after a wake pays
     # the pull.
     warm_image = os.environ.get("WARMUP_IMAGE")
-    taint = os.environ.get("BURST_TAINT_KEY", "ci-burst")
     warmup = ImagePrepull(
         kube, warm_image, namespace=ns,
         tolerations=[{"key": taint, "operator": "Equal", "value": "true",

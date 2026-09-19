@@ -2167,6 +2167,67 @@ class TestPerResourceSeams(unittest.TestCase):
             "cpu": "39500m", "memory": "126976Mi"}}})
         self.assertEqual(got, {"memory": 124.0, "cpu": 39.5})
 
+    def test_every_kind_of_quantity_is_read(self):
+        """"1G" once raised, and on the default demand path that failed the
+        whole tick."""
+        from metalnap.kube import mem_to_gib, cpu_to_cores
+        self.assertEqual(mem_to_gib("1Gi"), 1.0)
+        self.assertEqual(mem_to_gib("1G"), 1e9 / 2 ** 30)
+        self.assertEqual(mem_to_gib("1073741824"), 1.0)
+        self.assertEqual(mem_to_gib("1.073741824e9"), 1.0)
+        self.assertEqual(mem_to_gib("512Mi"), 0.5)
+        self.assertEqual(mem_to_gib("1Ti"), 1024.0)
+        self.assertEqual(cpu_to_cores("500m"), 0.5)
+        self.assertEqual(cpu_to_cores("2"), 2.0)
+        self.assertEqual(cpu_to_cores(3), 3.0)
+        self.assertEqual(cpu_to_cores("1e3m"), 1.0)
+        with self.assertRaises(ValueError):
+            mem_to_gib("lots")
+
+    def test_demand_that_cannot_land_here_is_not_counted(self):
+        """Work that does not tolerate the burst taint never runs on a burst
+        node; counted, it wakes one for nothing."""
+        from metalnap.kube import PendingPodShortfall
+        unsched = {"conditions": [{"type": "PodScheduled", "status": "False",
+                                   "reason": "Unschedulable"}]}
+
+        def pod(tolerations):
+            return {"spec": {"tolerations": tolerations, "containers": [
+                {"resources": {"requests": {"memory": "4Gi"}}}]},
+                "status": unsched}
+
+        class K:
+            def request(self, *a, **k):
+                return {"items": [pod([{"key": "ci-burst"}]), pod([]),
+                                  pod([{"operator": "Exists"}])]}
+        self.assertEqual(
+            PendingPodShortfall(K(), "ns", "ci-burst").of("memory")(), 8.0)
+        self.assertEqual(PendingPodShortfall(K(), "ns").of("memory")(), 12.0)
+
+    def test_the_reference_wiring_builds(self):
+        """The whole of main(), short of the loop: a name used before it is
+        defined there only ever showed up at the first start."""
+        import os
+        from metalnap import __main__ as entry
+        env = {"NODES": "a,b", "BMC_HOST_FMT": "{node}-bmc.", "BMC_USER": "u",
+               "BMC_PASS": "p", "PROM_URL": "http://prom",
+               "ALERTMANAGER_URL": "http://am", "MODE": "dry_run"}
+        built = {}
+        saved = dict(os.environ)
+        real = entry.Controller.run_forever
+        entry.Controller.run_forever = lambda c: built.update(c=c)
+        try:
+            os.environ.update(env)
+            self.assertEqual(entry.main([]), 0)
+        finally:
+            entry.Controller.run_forever = real
+            os.environ.clear()
+            os.environ.update(saved)
+        c = built["c"]
+        self.assertEqual(set(c.signal.shortfall_query), {"memory", "cpu"})
+        self.assertEqual(c.signal.shortfall_query["cpu"].__qualname__,
+                         "PendingPodShortfall.of.<locals>.shortfall")
+
     def test_a_source_may_be_a_callable(self):
         from metalnap.signal import prometheus
         sig = prometheus.PrometheusSignal("http://p", {"cpu": lambda: 3})
