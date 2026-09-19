@@ -15,8 +15,8 @@
 # classes -- BMCs by FQDN, Prometheus/Alertmanager by short service name -- so
 # no single `ndots` value can serve both. Measured in-cluster at ndots:5:
 #
-#   k8s14-ipmi.internal.example.org   FAILS (rc=2)
-#   k8s14-ipmi.internal.example.org.  resolves
+#   node1-ipmi.internal.example.org   FAILS (rc=2)
+#   node1-ipmi.internal.example.org.  resolves
 #   prometheus-k8s.monitoring.svc     resolves (via search list)
 #
 # Hence bmc.hostFormat must be ABSOLUTE (trailing dot). A trailing dot is

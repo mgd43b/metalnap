@@ -7,16 +7,16 @@ With a command instead, it is the operator's tool, run on your own machine
 against the controller in a cluster -- see `metalnap status --help`:
 
     metalnap status                 every managed node, and its state
-    metalnap maintenance start k8s7 --reason "kernel 6.8"
-    metalnap maintenance stop k8s7  ask for a node to work on; give it back
-    metalnap logs -f --node k8s7    the controller's log, readable
+    metalnap maintenance start node1 --reason "kernel 6.8"
+    metalnap maintenance stop node1  ask for a node to work on; give it back
+    metalnap logs -f --node node1    the controller's log, readable
 
 Everything comes from the environment so the container image is useful without
 a code change. If your stack differs, import Controller and pass your own
 seams -- that is the point of them, and this module is only one wiring of many.
 
 Required:
-    NODES           comma-separated node names, e.g. "k8s14,k8s15"
+    NODES           comma-separated node names, e.g. "node1,node2"
     BMC_USER        BMC credentials
     BMC_PASS
     BMC_HOST_FMT    python format string for the BMC host,

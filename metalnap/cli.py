@@ -3,10 +3,10 @@
 node.
 
     metalnap status
-    metalnap maintenance start k8s7 k8s12 --reason "kernel 6.8"
+    metalnap maintenance start node1 node2 --reason "kernel 6.8"
     metalnap maintenance start --all --reason "firmware"
-    metalnap maintenance stop k8s7
-    metalnap logs [-f] [--node k8s7] [--tail 200]
+    metalnap maintenance stop node1
+    metalnap logs [-f] [--node node1] [--tail 200]
 
 Everything goes through `kubectl`, so it runs with your kubeconfig, your RBAC
 and your audit trail, and holds no credential of its own. It names the context
@@ -344,7 +344,7 @@ def parser(command):
     """The parser for one command.
 
     One per command rather than argparse subcommands, so each can be parsed
-    INTERMIXED: `maintenance start --reason x k8s7` and `start k8s7 --reason
+    INTERMIXED: `maintenance start --reason x node1` and `start node1 --reason
     x` mean the same thing. With subcommands, argparse fills the node list
     from the first unbroken run of names only, and a name after any option
     was rejected as an unrecognised argument.

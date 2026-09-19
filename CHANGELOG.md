@@ -176,7 +176,7 @@ Chart-only fix: **the Warmup seam had no RBAC**. It was added in 0.2.0 and the
 chart was never updated, so a real wake logged:
 
     warmup could not start; first work may pay the cost
-    403 Forbidden .../pods/metalnap-warmup-k8s15
+    403 Forbidden .../pods/metalnap-warmup-node2
 
 Found on metalnap's first production wake, minutes after cutover.
 

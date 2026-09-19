@@ -127,11 +127,11 @@ Each exists because breaking it cost something real.
 To work on a node, ask for it — no value to set, nothing to redeploy:
 
 ```bash
-kubectl annotate --overwrite node k8s7 metalnap.io/maintenance="kernel 6.8"
-kubectl annotate node k8s7 metalnap.io/maintenance- metalnap.io/maintenance-started-
+kubectl annotate --overwrite node node1 metalnap.io/maintenance="kernel 6.8"
+kubectl annotate node node1 metalnap.io/maintenance- metalnap.io/maintenance-started-
 ```
 
-(or `metalnap maintenance start k8s7` / `stop k8s7` with the CLI — see the
+(or `metalnap maintenance start node1` / `stop node1` with the CLI — see the
 [project README](https://github.com/mgd43b/metalnap#operating-it-from-your-machine)).
 metalnap powers it on **once**, recording that as
 `metalnap.io/maintenance-started` before it does, and then leaves it alone
