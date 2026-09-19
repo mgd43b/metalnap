@@ -12,8 +12,9 @@ requires-python = ">=3.9"
 dependencies = ["requests>=2.25"]
 
 [project.scripts]
-# The operator's CLI. With no command it runs the controller, as the image does.
-metalnap = "metalnap.__main__:main"
+# The operator's CLI, and only that. The controller is `python -m metalnap`,
+# which is what the image runs.
+metalnap = "metalnap.cli:console"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/metalnap"

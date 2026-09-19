@@ -28,8 +28,15 @@ import json
 import os
 import subprocess
 import sys
+import warnings
 
-from .kube import KubeNodeSource
+with warnings.catch_warnings():
+    # kube.py brings in requests, and on a Python built against LibreSSL --
+    # macOS's own -- urllib3 warns about that on import. Nothing here talks
+    # HTTP (kubectl does), so the warning would only ever be noise, printed
+    # above every command.
+    warnings.simplefilter("ignore")
+    from .kube import KubeNodeSource
 
 #: The operator's request, and metalnap's record that it took it up. Always
 #: under this prefix, whatever cordon annotation the controller is given.
@@ -387,6 +394,44 @@ _HELP = {
 
 COMMANDS = {"status": cmd_status, "maintenance": cmd_maintenance,
             "logs": cmd_logs}
+
+USAGE = """usage: metalnap <command> [options]
+
+  status                          every managed node, and its state
+  maintenance start|stop NODE...  ask for nodes to work on, and give them back
+                                  (--all for every managed node)
+  logs [-f] [--node NODE]         the controller's log, readable
+
+`metalnap <command> --help` for a command's options. The controller itself
+runs as `python -m metalnap`, configured from its environment."""
+
+
+def command_first(argv):
+    """`metalnap --context prod status` is `status --context prod`: options
+    first is the kubectl and helm habit, and they are the command's."""
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        at = next((i for i, a in enumerate(argv) if a in COMMANDS), None)
+        if at is not None:
+            return [argv[at]] + argv[:at] + argv[at + 1:]
+    return argv
+
+
+def console(argv=None):
+    """The `metalnap` command: the operator's CLI, and nothing else.
+
+    Pointed at __main__ it fell through to the CONTROLLER when given no
+    command -- which on a laptop only ever said NODES was required. The
+    controller is `python -m metalnap`, as the image runs it.
+    """
+    argv = command_first(list(sys.argv[1:] if argv is None else argv))
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if argv[0] not in COMMANDS:
+        print("metalnap: unknown command %r\n\n%s" % (argv[0], USAGE),
+              file=sys.stderr)
+        return 2
+    return main(argv)
 
 
 def main(argv, out=sys.stdout, kubectl=Kubectl):
