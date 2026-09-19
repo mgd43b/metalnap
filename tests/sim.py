@@ -57,22 +57,29 @@ it report OK while testing nothing:
     controller destroy it.
 
 MEASURED DETECTION, by reintroducing each real bug and counting failing seeds
-(60 seeds x 900 ticks):
+(60 seeds x 900 ticks). Every table here was re-measured together, against
+the harness as it now stands; a rate measured against an older harness says
+nothing about this one:
 
-    busy work ignored when draining        60/60
-    controller never sleeps anything       34/60
-    no pre-release re-check                21/60
-    cordon timestamp re-stamped             7/60
-    idle units never released               4/60
-    saturation signal ignored               3/60
-    wake timer reset by a flickering signal  2/60
-    in-flight operation ignores a cordon     1/60
+    no pre-release re-check                50/60
+    controller never sleeps anything       16/60
+    busy work ignored when draining        10/60
+    in-flight operation ignores a cordon    2/60
+    cordon timestamp re-stamped             1/60
+    idle units never released               0/60
+    saturation signal ignored               0/60
+    wake timer reset by a flickering signal  0/60
+
+"Busy work ignored" was 60/60 until only idle nodes were put to sleep; after
+that no drain here met work it had to time out on, and it fell to 0/60 without
+anything failing. Work that lands mid-drain now sometimes hangs, which is what
+brought it back.
 
 and for scheduled maintenance, on the 30 of those 60 seeds that run it:
 
-    power cut to a node rebooting mid-visit 30/30
-    a maintenance window that never closes  30/30
-    the schedule silently stops firing      28/30
+    power cut to a node rebooting mid-visit 29/30
+    a maintenance window that never closes  26/30
+    the schedule silently stops firing      23/30
     visits run in parallel                   0/30
     visits ignore unmet demand               0/30
     a failed visit is retried every tick     0/30
@@ -82,33 +89,34 @@ The four zeroes are not gaps in cover, they are gaps in THIS harness: each is
 caught deterministically in test_controller.py, and each describes a
 priority or scheduling mistake rather than a safety one -- the sim would need a
 model of what the fleet ought to be doing, not just what it is doing, to see
-them. The two 30/30 rows are the ones that destroy hardware, and they are the
+them. The top two rows are the ones that destroy hardware, and they are the
 ones this harness is good at.
 
 and for wedged, partitioned and shutdown-ignoring nodes (60 x 900):
 
     a crashed node muted like a slept one (#14)          60/60
-    a power cycle made before it is on record            48/60
-    a wedged node's wake retried forever (#13)           29/60
-    recovery re-alerting from a stale note               23/60
-    a node handed to a human left muted                  14/60
-    the cycle cooldown forgotten across a restart        12/60
-    a shutdown not resumed after a restart                6/60
-    a hand-off forgotten across a restart                 4/60
-    a node dark mid-drain muted as asleep                 3/60
-    a power cycle over running work (a partition)         3/60
-    a power cycle mid-update after a visit                1/60
-    every visit renewing the mid-update grace             1/60
+    a power cycle made before it is on record            51/60
+    a wedged node's wake retried forever (#13)           33/60
+    recovery re-alerting from a stale note               16/60
+    the cycle cooldown forgotten across a restart        16/60
+    a shutdown not resumed after a restart                5/60
+    a node handed to a human left muted                   4/60
+    a hand-off forgotten across a restart                 3/60
+    a power cycle over running work (a partition)         1/60
     "would not power off" outliving the retry             1/60
+    a node dark mid-drain muted as asleep                 0/60
+    a power cycle mid-update after a visit                0/60
+    every visit renewing the mid-update grace             0/60
     a sleep "complete" at the soft-off request            0/60
     a sleeping node never checked for power               0/60
     no operator check at the moment of the cycle          0/60
     a booting node not counted (one node per tick)        0/60
 
-Every row here -- the zeroes and the ones -- also fails a deterministic test.
-The low rows are the ones that need two rare things at once (a restart inside
-a shutdown, a partition that outlasts a wake timeout, a visit's reboot that
-wedges), which is exactly why the deterministic test comes first.
+Every row in all three tables -- the zeroes and the ones -- also fails a
+deterministic test in test_controller.py. The low rows are the ones that need
+two rare things at once (a restart inside a shutdown, a partition that
+outlasts a wake timeout, a visit's reboot that wedges), which is exactly why
+the deterministic test comes first.
 
 The low-rate rows are BACKSTOPS, not primary cover. Anything guarding running
 work or an operator's cordon also has a deterministic test in
