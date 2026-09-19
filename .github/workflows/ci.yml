@@ -29,6 +29,14 @@ jobs:
       - name: Byte-compile
         run: .venv/bin/python -m compileall -q metalnap tests
 
+      - name: Lint
+        # Nothing linted the tree, and it showed: an unused import and two
+        # ambiguous names had accumulated by the time anyone ran ruff. Its
+        # default rules only -- pyflakes and the unambiguous pycodestyle ones.
+        run: |
+          .venv/bin/pip install --quiet ruff
+          .venv/bin/ruff check .
+
       - name: Version consistency
         # The version lives in four files. Image 0.2.4 shipped with
         # __version__ = "0.2.3" because they were bumped by hand.
@@ -48,9 +56,14 @@ jobs:
         # backstop.
         run: .venv/bin/python -B tests/test_controller.py
 
+      - name: CLI tests
+        # The operator's tool: every call pinned to one named kubectl context,
+        # and nothing written for a node the controller does not manage.
+        run: .venv/bin/python -B tests/test_cli.py
+
       - name: Simulation harness
         # Thousands of ticks against a fake cluster with phased demand, hung
-        # work, operator maintenance and injected restarts, asserting safety
+        # work, operator cordons and injected restarts, asserting safety
         # AND liveness after every tick. Every bug this project's ancestor
         # shipped lived in a SEQUENCE, which single-call unit tests cannot see.
         run: .venv/bin/python -B tests/sim.py --seeds 60 --ticks 900
@@ -85,10 +98,12 @@ jobs:
       - name: Smoke test
         # Proves the interpreter, the package and ipmitool all survived the
         # build. `import metalnap` alone would pass an image with no ipmitool,
-        # which is the one binary this controller cannot work without.
+        # which is the one binary this controller cannot work without. Every
+        # module is imported, not a hand-picked few: a list is a list someone
+        # forgets to extend when a module is added.
         run: |
           docker run --rm --entrypoint sh metalnap:ci -c '
-            python3 -c "import metalnap, metalnap.controller, metalnap.power.ipmi"
+            python3 -c "import importlib, pkgutil, metalnap; [importlib.import_module(m.name) for m in pkgutil.walk_packages(metalnap.__path__, \"metalnap.\")]"
             command -v ipmitool >/dev/null'
 
       - name: Fail on anything with a fix available
