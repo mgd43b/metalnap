@@ -1886,7 +1886,9 @@ class TestIpmiPower(unittest.TestCase):
     def test_the_password_is_not_in_argv(self):
         seen, power, _ = self.run_with(stdout="Chassis Power is on")
         self.assertEqual(power, "on")
-        self.assertNotIn("hunter2", seen["cmd"])
+        # The whole command line, not element by element: "-Phunter2" or
+        # "IPMI_PASSWORD=hunter2" in one argument would pass an element check.
+        self.assertNotIn("hunter2", " ".join(seen["cmd"]))
         self.assertIn("-E", seen["cmd"])
         self.assertEqual(seen["env"]["IPMI_PASSWORD"], "hunter2")
 
