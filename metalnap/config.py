@@ -1,20 +1,33 @@
 """Tunables. Every one is an operational knob, so every one is settable."""
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# Each default is read from the environment when a Config is BUILT, not when
+# this module is imported. As plain default expressions they were read once,
+# at import, and an environment set any later -- by a test, or by a program
+# embedding the controller -- was silently ignored.
 
 
 def _f(name, default):
-    return float(os.environ.get(name, default))
+    return field(default_factory=lambda: float(os.environ.get(name, default)))
 
 
 def _i(name, default):
-    return int(os.environ.get(name, default))
+    return field(default_factory=lambda: int(os.environ.get(name, default)))
+
+
+def _s(name, default):
+    return field(default_factory=lambda: os.environ.get(name, default).strip())
 
 
 @dataclass
 class Config:
     #: off (observe nothing, do nothing) | dry_run (observe, log, never act) | on
-    mode: str = os.environ.get("MODE", "dry_run").strip()
+    #:
+    #: Maintenance mode is NOT a fourth value. It is asked for per node, on the
+    #: node, and holds in `on` exactly as a cordon does; a value here would
+    #: also read as "not on" to every dry_run guard in the controller.
+    mode: str = _s("MODE", "dry_run")
     #: Seconds between reconciles.
     interval_s: int = _i("INTERVAL_S", 60)
     #: Demand must exceed capacity for this long before a node is woken.
