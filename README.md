@@ -50,7 +50,7 @@ Supermicro Twin serving GitHub Actions CI.
    month of updates  │
                      │
        an operator ──┘
-   "I need k8s7 for
+   "I need node1 for
     a kernel upgrade"
 ```
 
@@ -226,16 +226,16 @@ anyone at a terminal can tell, and powering it on by hand just hands it back to
 a controller that will put it to sleep again. So ask metalnap for it:
 
 ```bash
-metalnap maintenance start k8s7 --reason "kernel 6.8"     # or --all
+metalnap maintenance start node1 --reason "kernel 6.8"     # or --all
 metalnap status
-metalnap maintenance stop k8s7
+metalnap maintenance stop node1
 ```
 
 or, with nothing but `kubectl`:
 
 ```bash
-kubectl annotate --overwrite node k8s7 metalnap.io/maintenance="kernel 6.8"
-kubectl annotate node k8s7 metalnap.io/maintenance- metalnap.io/maintenance-started-
+kubectl annotate --overwrite node node1 metalnap.io/maintenance="kernel 6.8"
+kubectl annotate node node1 metalnap.io/maintenance- metalnap.io/maintenance-started-
 ```
 
 What metalnap does with a node while the request stands:
@@ -286,9 +286,9 @@ own:
 pipx install git+https://github.com/mgd43b/metalnap   # or: pip install -e .
 
 metalnap status                         # every managed node, and its state
-metalnap maintenance start k8s7 k8s12 --reason "firmware"
-metalnap maintenance stop k8s7 k8s12
-metalnap logs -f --node k8s7            # the controller's log, readable
+metalnap maintenance start node1 node2 --reason "firmware"
+metalnap maintenance stop node1 node2
+metalnap logs -f --node node1            # the controller's log, readable
 ```
 
 It names the context it is acting on every time, and pins every call to it —
@@ -471,7 +471,7 @@ IPMI + Prometheus — entirely from environment variables, so the image is
 useful without writing code:
 
 ```bash
-NODES=k8s14,k8s15 BMC_HOST_FMT='{node}-ipmi.internal.example.org' BMC_USER=... BMC_PASS=... PROM_URL=http://prometheus:9090 MODE=dry_run   python3 -m metalnap
+NODES=node1,node2 BMC_HOST_FMT='{node}-ipmi.internal.example.org' BMC_USER=... BMC_PASS=... PROM_URL=http://prometheus:9090 MODE=dry_run   python3 -m metalnap
 ```
 
 **It ships as `MODE=dry_run`** and will not touch anything until you say

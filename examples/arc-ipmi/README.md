@@ -27,7 +27,7 @@ SHORTFALL = (
 )
 
 Controller(
-    nodes=["k8s14", "k8s15"],
+    nodes=["node1", "node2"],
     node_source=KubeNodeSource(kube, annotation="metalnap.io/cordoned"),
     power=IpmiPower(host_for=lambda n: f"{n}-ipmi.internal.example.org",
                     user=os.environ["BMC_USER"],
@@ -81,7 +81,7 @@ that mistake.
 ## Taint the burst nodes
 
 ```
-kubectl taint node k8s14 k8s15 ci-burst=true:NoSchedule
+kubectl taint node node1 node2 ci-burst=true:NoSchedule
 ```
 
 Taint answers *what may land here*; cordon answers *when*. Both are needed:

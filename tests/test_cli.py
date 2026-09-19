@@ -400,7 +400,7 @@ class TestConfigRead(unittest.TestCase):
 
 class TestCordonAnnotation(unittest.TestCase):
     def test_custom_annotation_reads_as_our_own_cordon(self):
-        custom = "burst-controller.mattd.org/cordoned"
+        custom = "legacy-controller.example.org/cordoned"
         n = k8s_node("a", ready=False, cordoned=True,
                     annotations={custom: "2024-01-01T00:00:00Z"})
         cluster = make_cluster(nodes=("a",), cordon_annotation=custom,
@@ -413,7 +413,7 @@ class TestCordonAnnotation(unittest.TestCase):
         """Same node, default CORDON_ANNOTATION: ownership is judged by the
         annotation the controller was told about, not by who else might
         have cordoned it."""
-        custom = "burst-controller.mattd.org/cordoned"
+        custom = "legacy-controller.example.org/cordoned"
         n = k8s_node("a", ready=False, cordoned=True,
                     annotations={custom: "2024-01-01T00:00:00Z"})
         cluster = make_cluster(nodes=("a",), node_objs={"a": n})
@@ -623,7 +623,7 @@ class TestMaintenanceStart(unittest.TestCase):
     def test_options_and_names_go_in_any_order(self):
         """Parsed as subcommands, a node named after any option was rejected
         by argparse as an unrecognised argument -- and `start --reason x
-        k8s7` is the order people type."""
+        node1` is the order people type."""
         for argv in (["maintenance", "start", "--reason", "x", "a"],
                      ["maintenance", "--reason", "x", "start", "a"],
                      ["maintenance", "start", "a", "--reason", "x"]):
@@ -712,25 +712,25 @@ class TestFormatLog(unittest.TestCase):
         # records can be matched to a node, so an unparseable line is
         # dropped rather than guessed at.
         self.assertIsNone(
-            cli.format_log("mentions k8s7 as plain text", node="k8s7"))
+            cli.format_log("mentions node1 as plain text", node="node1"))
 
     def test_node_filter_matches_a_scalar_field(self):
         line = json.dumps({"ts": "t", "level": "i", "msg": "m",
-                          "node": "k8s7"})
-        self.assertIsNotNone(cli.format_log(line, node="k8s7"))
-        self.assertIsNone(cli.format_log(line, node="k8s9"))
+                          "node": "node1"})
+        self.assertIsNotNone(cli.format_log(line, node="node1"))
+        self.assertIsNone(cli.format_log(line, node="node2"))
 
     def test_node_filter_matches_a_list_field(self):
         line = json.dumps({"ts": "t", "level": "i", "msg": "m",
-                          "nodes": ["k8s7", "k8s9"]})
-        self.assertIsNotNone(cli.format_log(line, node="k8s7"))
-        self.assertIsNone(cli.format_log(line, node="k8s3"))
+                          "nodes": ["node1", "node2"]})
+        self.assertIsNotNone(cli.format_log(line, node="node1"))
+        self.assertIsNone(cli.format_log(line, node="node3"))
 
     def test_node_filter_matches_a_dict_key(self):
         line = json.dumps({"ts": "t", "level": "i", "msg": "m",
-                          "per_node": {"k8s7": "cordoned"}})
-        self.assertIsNotNone(cli.format_log(line, node="k8s7"))
-        self.assertIsNone(cli.format_log(line, node="k8s3"))
+                          "per_node": {"node1": "cordoned"}})
+        self.assertIsNotNone(cli.format_log(line, node="node1"))
+        self.assertIsNone(cli.format_log(line, node="node3"))
 
 
 class TestLogsCommand(unittest.TestCase):

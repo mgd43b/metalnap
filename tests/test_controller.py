@@ -1793,15 +1793,15 @@ class TestAlertmanagerNotifier(unittest.TestCase):
     def test_one_silence_per_label(self):
         """kube-state-metrics alerts name the node in `node`; node-exporter
         alerts, in `instance`. One silence cannot match either."""
-        self.notifier().going_down("k8s14")
+        self.notifier().going_down("node1")
         self.assertEqual(
             sorted(m["name"] for s in self.am.silences for m in s["matchers"]
-                   if m["value"] == "k8s14"), ["instance", "node"])
+                   if m["value"] == "node1"), ["instance", "node"])
 
     def test_our_own_alert_is_never_silenced_by_our_own_silence(self):
         """It carries node= and instance=, so it routes like the node's other
         alerts -- and would be muted on exactly the node it is about."""
-        self.notifier().going_down("k8s14")
+        self.notifier().going_down("node1")
         own = {"name": "alertname", "value": "MetalnapNodeNeedsAttention",
                "isRegex": False, "isEqual": False}
         for s in self.am.silences:
@@ -1809,8 +1809,8 @@ class TestAlertmanagerNotifier(unittest.TestCase):
 
     def test_going_down_is_idempotent(self):
         n = self.notifier()
-        n.going_down("k8s14")
-        n.going_down("k8s14")
+        n.going_down("node1")
+        n.going_down("node1")
         self.assertEqual(len(self.am.silences), 2)
 
     def test_a_silence_from_before_this_change_is_replaced(self):
@@ -1818,15 +1818,15 @@ class TestAlertmanagerNotifier(unittest.TestCase):
         what we create now, so it is replaced, new ones first."""
         self.am.silences.append({
             "id": "old", "status": {"state": "active"},
-            "comment": "metalnap: k8s14 is deliberately powered down",
-            "matchers": [{"name": "instance", "value": "k8s14",
+            "comment": "metalnap: node1 is deliberately powered down",
+            "matchers": [{"name": "instance", "value": "node1",
                           "isRegex": False, "isEqual": True}]})
-        self.notifier().going_down("k8s14")
+        self.notifier().going_down("node1")
         self.assertNotIn("old", [s["id"] for s in self.am.silences])
         self.assertEqual(len(self.am.silences), 2)
 
     def test_extra_matchers_narrow_every_silence(self):
-        self.notifier(matchers=['alertname=~"KubeNode.*"']).going_down("k8s14")
+        self.notifier(matchers=['alertname=~"KubeNode.*"']).going_down("node1")
         for s in self.am.silences:
             self.assertIn({"name": "alertname", "value": "KubeNode.*",
                            "isRegex": True, "isEqual": True}, s["matchers"])
@@ -1834,9 +1834,9 @@ class TestAlertmanagerNotifier(unittest.TestCase):
     def test_a_reconfigured_silence_is_replaced(self):
         """Left in place it silences what the new matchers were written to
         let through."""
-        self.notifier().going_down("k8s14")
+        self.notifier().going_down("node1")
         self.notifier(matchers=['alertname="KubeNodeUnreachable"']
-                      ).going_down("k8s14")
+                      ).going_down("node1")
         self.assertEqual(len(self.am.silences), 2)
         for s in self.am.silences:
             self.assertEqual(len(s["matchers"]), 3)
@@ -1846,55 +1846,55 @@ class TestAlertmanagerNotifier(unittest.TestCase):
         node over-silenced, not bare."""
         self.am.silences.append({
             "id": "old", "status": {"state": "active"},
-            "comment": "metalnap: k8s14 is deliberately powered down",
-            "matchers": [{"name": "instance", "value": "k8s14",
+            "comment": "metalnap: node1 is deliberately powered down",
+            "matchers": [{"name": "instance", "value": "node1",
                           "isRegex": False, "isEqual": True}]})
         real_post = self.am.post
         self.am.post = lambda *a, **k: FakeAlertmanager.R(400)
         with self.assertRaises(RuntimeError):
-            self.notifier().going_down("k8s14")
+            self.notifier().going_down("node1")
         self.am.post = real_post
         self.assertEqual([s["id"] for s in self.am.silences], ["old"])
 
     def test_back_up_deletes_on_the_singular_path(self):
         n = self.notifier()
-        n.going_down("k8s14")
-        n.back_up("k8s14")
+        n.going_down("node1")
+        n.back_up("node1")
         self.assertEqual(self.am.silences, [])
         self.assertTrue(all("/api/v2/silence/" in u for u in self.am.deletes))
 
     def test_back_up_falls_back_to_the_plural_path(self):
         self.am.plural_delete = True
         n = self.notifier()
-        n.going_down("k8s14")
-        n.back_up("k8s14")
+        n.going_down("node1")
+        n.back_up("node1")
         self.assertEqual(self.am.silences, [])
 
     def test_another_nodes_silence_is_untouched(self):
         n = self.notifier()
-        n.going_down("k8s14")
-        n.going_down("k8s15")
-        n.back_up("k8s14")
+        n.going_down("node1")
+        n.going_down("node2")
+        n.back_up("node1")
         self.assertEqual(len(self.am.silences), 2)
 
     def test_an_alert_keeps_its_start(self):
         """Omitted, Alertmanager sets startsAt to endsAt -- in the future."""
         n = self.notifier()
-        n.alert("k8s15", "wedged")
-        n.alert("k8s15", "wedged")
+        n.alert("node2", "wedged")
+        n.alert("node2", "wedged")
         first, second = self.am.alerts
         self.assertEqual(first["startsAt"], second["startsAt"])
         self.assertLess(first["startsAt"], first["endsAt"])
 
     def test_alert_and_clear(self):
         n = self.notifier()
-        n.alert("k8s15", "wedged")
+        n.alert("node2", "wedged")
         a = self.am.alerts[-1]
-        self.assertEqual(a["labels"]["node"], "k8s15")
+        self.assertEqual(a["labels"]["node"], "node2")
         self.assertEqual(a["annotations"]["description"], "wedged")
-        n.clear_alert("k8s15")
+        n.clear_alert("node2")
         self.assertEqual(len(self.am.alerts), 2, "never resolved")
-        n.clear_alert("k8s15")
+        n.clear_alert("node2")
         self.assertEqual(len(self.am.alerts), 2, "one POST per tick for nothing")
 
     def test_matcher_syntax(self):
@@ -1943,7 +1943,7 @@ class TestIpmiPower(unittest.TestCase):
         try:
             p = ipmi.IpmiPower(lambda n: n + "-ipmi.", "admin", "hunter2")
             try:
-                return seen, p.state("k8s15"), None
+                return seen, p.state("node2"), None
             except Exception as e:                # noqa: BLE001
                 return seen, None, e
         finally:
@@ -2520,21 +2520,21 @@ class TestKubeNodeSource(unittest.TestCase):
     def test_the_power_cycle_is_read_back(self):
         _k, src = self.source({"metalnap.io/power-cycled":
                                "2026-09-18T01:17:34+00:00"})
-        st = src.state("k8s15")
+        st = src.state("node2")
         self.assertEqual(st.power_cycled_at, 1789694254.0)
         self.assertEqual(st.down_since, 1789686614.0)
 
     def test_an_unparseable_record_reads_as_none(self):
         _k, src = self.source({"metalnap.io/power-cycled": "yesterday"})
-        self.assertIsNone(src.state("k8s15").power_cycled_at)
+        self.assertIsNone(src.state("node2").power_cycled_at)
 
     def test_notes_touch_metadata_only(self):
         """The node noted is as likely an uncordoned crash as one we slept;
         the cordon is not this call's to change."""
         k, src = self.source({})
-        src.note("k8s15", "power-cycled", 1789694254.0)
-        src.note("k8s15", "trouble", None)
-        src.disown("k8s15")
+        src.note("node2", "power-cycled", 1789694254.0)
+        src.note("node2", "trouble", None)
+        src.disown("node2")
         self.assertTrue(all(list(p) == ["metadata"] for p in k.patches))
         self.assertEqual(k.patches[0]["metadata"]["annotations"],
                          {"metalnap.io/power-cycled":
@@ -2548,29 +2548,29 @@ class TestKubeNodeSource(unittest.TestCase):
         _k, src = self.source({"metalnap.io/maintenance": " kernel 6.8 ",
                                "metalnap.io/maintenance-started":
                                "2026-09-18T01:17:34Z"})
-        st = src.state("k8s15")
+        st = src.state("node2")
         self.assertEqual((st.maintenance, st.maintenance_started_at),
                          ("kernel 6.8", 1789694254.0))
-        self.assertIsNone(src.state("k8s15").trouble)
+        self.assertIsNone(src.state("node2").trouble)
 
     def test_a_request_without_a_reason_is_still_a_request(self):
         """`kubectl annotate node x metalnap.io/maintenance=` asks, too."""
         _k, src = self.source({"metalnap.io/maintenance": ""})
-        self.assertEqual(src.state("k8s15").maintenance, "no reason given")
+        self.assertEqual(src.state("node2").maintenance, "no reason given")
         _k, src = self.source({})
-        self.assertIsNone(src.state("k8s15").maintenance)
+        self.assertIsNone(src.state("node2").maintenance)
 
     def test_parse_reads_a_listed_node_as_state_reads_a_fetched_one(self):
         k, src = self.source({"metalnap.io/cordoned": "2026-09-18T01:17:34Z",
                               "metalnap.io/maintenance": "firmware"})
-        self.assertEqual(src.parse(k.request("GET", "/api/v1/nodes/k8s15")),
-                         src.state("k8s15"))
+        self.assertEqual(src.parse(k.request("GET", "/api/v1/nodes/node2")),
+                         src.state("node2"))
 
     def test_every_note_is_read_back(self):
         _k, src = self.source({"metalnap.io/visited": "2026-09-18T01:17:34Z",
                                "metalnap.io/shutdown": "2026-09-18T01:17:34Z",
                                "metalnap.io/trouble": "wedged"})
-        st = src.state("k8s15")
+        st = src.state("node2")
         self.assertEqual((st.visited_at, st.shutdown_at, st.trouble),
                          (1789694254.0, 1789694254.0, "wedged"))
 

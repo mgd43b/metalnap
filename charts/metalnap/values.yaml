@@ -7,8 +7,8 @@ image:
 
 # Nodes metalnap is allowed to manage. It will touch nothing else.
 nodes: []
-  # - k8s14
-  # - k8s15
+  # - node1
+  # - node2
 
 # off | dry_run | on
 #
