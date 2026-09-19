@@ -276,6 +276,23 @@ class TestRunningWork(unittest.TestCase):
                          "idle unit not released -- this is the livelock")
         self.assertEqual(h.acted["off"], [], "powered off without re-observing")
 
+    def test_a_restarted_sleep_keeps_the_cordon_it_already_holds(self):
+        """The cordon's timestamp is the drain deadline's durable anchor.
+        Re-stamping it when a restarted process begins the sleep again resets
+        the one clock meant to survive the restart -- and a node with hung
+        work is held for ever, one restart at a time."""
+        h = Harness({"a": node(), "b": None}, busy=["u1"])
+        h.states["a"] = node(cordoned=True, ours=True, ours_since=h.t - 100)
+        c = h.controller()                    # a fresh process: no phase
+        c.sleep("a", h.states["a"])
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        self.assertNotIn(("a", True), h.acted["cordon"],
+                         "re-stamped the cordon, resetting the drain deadline")
+        h.states["b"] = node()
+        c.sleep("b", h.states["b"])
+        self.assertIn(("b", True), h.acted["cordon"],
+                      "a node not yet ours was never cordoned")
+
     def test_clean_node_powers_off(self):
         h = Harness({"a": node(), "b": None})
         c = h.controller()
