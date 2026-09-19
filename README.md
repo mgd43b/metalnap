@@ -303,8 +303,12 @@ python3 -B tests/sim.py --seeds 20 --ticks 400
 ```bash
 # BMC credentials are created out of band -- they do not belong in values.yaml
 kubectl create ns metalnap
-kubectl -n metalnap create secret generic metalnap-bmc \
-  --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
+# the password is read from stdin, so it reaches neither shell history nor
+# the process list (a --from-literal would put it in both)
+read -rsp 'BMC password: ' BMC_PASS && echo
+printf %s "$BMC_PASS" | kubectl -n metalnap create secret generic metalnap-bmc \
+  --from-literal=user=ADMIN --from-file=pass=/dev/stdin
+unset BMC_PASS
 
 CHART_VERSION=0.3.1 # x-release-please-version
 
@@ -392,11 +396,13 @@ it takes to trust the numbers.
 `0` — off — by default.
 
 The pool is sized on **memory and CPU**, whichever needs more nodes
-(`SHORTFALL_QUERY` in GiB, `CPU_SHORTFALL_QUERY` in cores; set the latter to
-`""` to size on memory alone). Runners that run out of CPU first, sized on
-memory alone, woke about half the nodes a backlog needed. The default queries
-count init containers as well as containers — a runner's `dind` is a native
-sidecar that asks for as much as the runner does. A custom `DemandSignal` can
+(set `CPU_SHORTFALL_QUERY=""` to size on memory alone). Runners that run out
+of CPU first, sized on memory alone, woke about half the nodes a backlog
+needed. By default both are read off the unschedulable pods with the
+scheduler's own effective-request formula — so a runner's `dind`, a native
+sidecar asking for as much as the runner does, is counted, and an ordinary
+init container only as the floor it is. `SHORTFALL_QUERY` (GiB) and
+`CPU_SHORTFALL_QUERY` (cores) replace either with PromQL. A custom `DemandSignal` can
 do the same by returning `{"memory": …, "cpu": …}` from `shortfall()` with a
 `NodeSource` that reports capacity the same way (`kube.allocatable()`); a bare
 number on both sides is one resource, as before.

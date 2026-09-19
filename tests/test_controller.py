@@ -2077,22 +2077,33 @@ class TestSizing(unittest.TestCase):
         c.tick()
         self.assertEqual(h.acted["on"], ["a"])
 
-    def test_the_default_query_counts_sidecars(self):
-        """A runner's dind is a native sidecar -- an init container -- asking
-        for as much as the runner. Containers alone read half the backlog."""
-        from metalnap.__main__ import default_shortfall_query
-        for r in ("memory", "cpu"):
-            q = default_shortfall_query("ns", r)
-            for metric in ("kube_pod_container_resource_requests",
-                           "kube_pod_init_container_resource_requests"):
-                self.assertIn('%s{namespace="ns",resource="%s"}'
-                              % (metric, r), q)
-        self.assertIn("1024", default_shortfall_query("ns"))
-        self.assertNotIn("1024", default_shortfall_query("ns", "cpu"))
+    def test_the_default_shortfall_is_read_off_the_pods(self):
+        """PromQL cannot tell a sidecar from an init container for a pod that
+        was never scheduled; the pod spec can."""
+        from metalnap.__main__ import main  # noqa: F401 -- wiring imports
+        from metalnap.kube import PendingPodShortfall
+        runner = {"containers": [{"resources": {"requests": {
+            "cpu": "2", "memory": "4Gi"}}}],
+            "initContainers": [{"restartPolicy": "Always", "resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"}}}]}
+        unsched = {"conditions": [{"type": "PodScheduled", "status": "False",
+                                   "reason": "Unschedulable"}]}
+
+        class K:
+            def request(self, *a, **k):
+                return {"items": [
+                    {"spec": runner, "status": unsched},
+                    {"spec": runner, "status": {}},         # not tried yet
+                    {"spec": dict(runner, nodeName="n1"),   # already bound
+                     "status": unsched}]}
+        pending = PendingPodShortfall(K(), "ns")
+        self.assertEqual(pending.of("memory")(), 8.0,
+                         "missed the sidecar, or counted pods not failing")
+        self.assertEqual(pending.of("cpu")(), 4.0)
 
 
 class TestPerResourceSeams(unittest.TestCase):
-    def pod(self, cpu, mem, sidecar_cpu="0"):
+    def pod(self, cpu, mem, sidecar_cpu="0", init_cpu="1"):
         return {"spec": {
             "tolerations": [{"key": "ci-burst"}],
             "containers": [{"resources": {"requests": {"cpu": cpu,
@@ -2100,7 +2111,8 @@ class TestPerResourceSeams(unittest.TestCase):
             "initContainers": [
                 {"restartPolicy": "Always", "resources": {"requests": {
                     "cpu": sidecar_cpu, "memory": "0"}}},
-                {"resources": {"requests": {"cpu": "64", "memory": "0"}}}]}}
+                {"resources": {"requests": {"cpu": init_cpu,
+                                            "memory": "0"}}}]}}
 
     def fit(self, pods, capacity):
         from metalnap.kube import PendingPodFit
@@ -2116,11 +2128,35 @@ class TestPerResourceSeams(unittest.TestCase):
         self.assertFalse(self.fit([self.pod("48", "8Gi")], cap),
                          "a pod needing 48 cores fits a 40-core node?")
 
-    def test_a_sidecar_counts_and_an_init_container_does_not(self):
+    def test_a_sidecar_counts_toward_the_steady_state(self):
         cap = {"memory": 110.0, "cpu": 40.0}
         self.assertFalse(self.fit([self.pod("30", "8Gi", "12")], cap))
-        self.assertTrue(self.fit([self.pod("30", "8Gi", "4")], cap),
-                        "a plain init container's 64 cores counted")
+        self.assertTrue(self.fit([self.pod("30", "8Gi", "4")], cap))
+
+    def test_an_init_container_is_a_floor_not_a_sum(self):
+        """It runs before the app containers, beside the sidecars started
+        ahead of it: the pod needs the larger of the two phases."""
+        cap = {"memory": 110.0, "cpu": 40.0}
+        self.assertFalse(self.fit([self.pod("4", "8Gi", "4", "64")], cap),
+                         "a 64-core init phase fits a 40-core node?")
+        self.assertTrue(self.fit([self.pod("30", "8Gi", "4", "20")], cap),
+                        "an init container was summed with the app")
+
+    def test_the_effective_request_is_the_schedulers(self):
+        from metalnap.kube import effective_requests
+
+        def c(cpu, always=False):
+            d = {"resources": {"requests": {"cpu": cpu}}}
+            if always:
+                d["restartPolicy"] = "Always"
+            return d
+        spec = {"containers": [c("2")],
+                "initContainers": [c("5"), c("1", True), c("3"), c("2", True)],
+                "overhead": {"cpu": "250m"}}
+        # init phase: 5; 1 (sidecar); 1+3; sidecars 3. steady: 2 + 3 = 5.
+        self.assertEqual(effective_requests(spec, ("cpu",)), {"cpu": 5.25})
+        spec["initContainers"][2] = c("6")         # 1 + 6 beats the steady 5
+        self.assertEqual(effective_requests(spec, ("cpu",)), {"cpu": 7.25})
 
     def test_a_bare_number_is_memory_as_before(self):
         self.assertTrue(self.fit([self.pod("400", "8Gi")], 110.0))
@@ -2130,6 +2166,11 @@ class TestPerResourceSeams(unittest.TestCase):
         got = allocatable()({"status": {"allocatable": {
             "cpu": "39500m", "memory": "126976Mi"}}})
         self.assertEqual(got, {"memory": 124.0, "cpu": 39.5})
+
+    def test_a_source_may_be_a_callable(self):
+        from metalnap.signal import prometheus
+        sig = prometheus.PrometheusSignal("http://p", {"cpu": lambda: 3})
+        self.assertEqual(sig.shortfall(), {"cpu": 3.0})
 
     def test_a_signal_with_a_query_per_resource_returns_each(self):
         from metalnap.signal import prometheus

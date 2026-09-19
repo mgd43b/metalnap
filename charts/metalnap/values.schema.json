@@ -187,11 +187,11 @@
       "properties": {
         "shortfall": {
           "type": "string",
-          "description": "PromQL for unmet memory, GiB. Empty = the ARC default."
+          "description": "PromQL for unmet memory, GiB. Empty = read off the unschedulable pods with the scheduler's effective-request formula."
         },
         "cpuShortfall": {
           "type": "string",
-          "description": "PromQL for unmet CPU, cores. Empty = the ARC default; \"-\" sizes on memory alone."
+          "description": "PromQL for unmet CPU, cores. Empty = read off the unschedulable pods; \"-\" sizes on memory alone."
         },
         "saturation": {
           "type": "string",

@@ -18,8 +18,12 @@ this box off overnight". This does the one narrow thing neither does.
 ```bash
 # BMC credentials are created out of band — they do not belong in values.yaml
 kubectl create ns metalnap
-kubectl -n metalnap create secret generic metalnap-bmc \
-  --from-literal=user=ADMIN --from-literal=pass='<bmc-password>'
+# the password is read from stdin, so it reaches neither shell history nor
+# the process list (a --from-literal would put it in both)
+read -rsp 'BMC password: ' BMC_PASS && echo
+printf %s "$BMC_PASS" | kubectl -n metalnap create secret generic metalnap-bmc \
+  --from-literal=user=ADMIN --from-file=pass=/dev/stdin
+unset BMC_PASS
 
 helm install metalnap oci://ghcr.io/mgd43b/charts/metalnap \
   -n metalnap \
@@ -79,7 +83,7 @@ nodes stay asleep with nothing to explain why.
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
 | `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
 | `timers.powerCycleCooldownS` | `86400` | A node still powered but not Ready at its wake timeout is power-cycled at most once per node per this long; `0` disables. Must be `0` or at least `timers.wakeTimeoutS`, or the chart refuses to install. |
-| `queries.cpuShortfall` | `""` (ARC default) | PromQL for unmet CPU in cores. The pool is sized on whichever of memory and CPU needs more nodes; `-` sizes on memory alone. |
+| `queries.cpuShortfall` | `""` (read off the pods) | PromQL for unmet CPU in cores. The pool is sized on whichever of memory and CPU needs more nodes; `-` sizes on memory alone. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
 ## Safety rules it will not break

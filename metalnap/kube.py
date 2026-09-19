@@ -65,6 +65,69 @@ def cpu_to_cores(v):
 QUANTITY = {"memory": mem_to_gib, "cpu": cpu_to_cores}
 
 
+def effective_requests(spec, resources=("memory", "cpu")):
+    """What the scheduler reserves for a pod, per resource.
+
+    Kubernetes' own formula, so a shortfall and a fit check agree with the
+    scheduler they are second-guessing: the larger of the steady state --
+    every app container plus every native sidecar, an init container with
+    restartPolicy Always that keeps running -- and the init phase, where each
+    ordinary init container runs beside the sidecars started before it. Plus
+    the pod's overhead.
+
+    Counting app containers alone missed a runner's dind sidecar: half of
+    every backlog. Summing every init container instead over-counts one that
+    only runs first.
+    """
+    out = {}
+    for r in resources:
+        def req(c, q=QUANTITY[r], r=r):
+            return q(c.get("resources", {}).get("requests", {}).get(r, "0"))
+        sidecars = init_peak = 0.0
+        for c in spec.get("initContainers", []):
+            if c.get("restartPolicy") == "Always":
+                sidecars += req(c)
+                init_peak = max(init_peak, sidecars)
+            else:
+                init_peak = max(init_peak, sidecars + req(c))
+        steady = sum(req(c) for c in spec.get("containers", [])) + sidecars
+        out[r] = (max(steady, init_peak)
+                  + QUANTITY[r](spec.get("overhead", {}).get(r, "0")))
+    return out
+
+
+def _unschedulable(pod):
+    return any(c.get("type") == "PodScheduled" and c.get("status") == "False"
+               and c.get("reason") == "Unschedulable"
+               for c in pod.get("status", {}).get("conditions", []))
+
+
+class PendingPodShortfall:
+    """Unmet demand, read off the pods the scheduler tried and failed to place.
+
+    The default shortfall. A metrics pipeline cannot give the scheduler's
+    effective request for such a pod: kube-state-metrics labels which init
+    containers are sidecars from container STATUS, and a pod that was never
+    scheduled has none. The pod spec says so directly.
+
+    `of(resource)` is one resource's shortfall -- memory in GiB, CPU in cores
+    -- for PrometheusSignal to use as a source.
+    """
+
+    def __init__(self, kube, namespace):
+        self.kube, self.ns = kube, namespace
+
+    def of(self, resource):
+        def shortfall():
+            pods = self.kube.request(
+                "GET", "/api/v1/namespaces/%s/pods?fieldSelector="
+                       "status.phase=Pending" % self.ns)
+            return sum(effective_requests(p["spec"], (resource,))[resource]
+                       for p in pods.get("items", [])
+                       if not p["spec"].get("nodeName") and _unschedulable(p))
+        return shortfall
+
+
 def allocatable(resources=("memory", "cpu")):
     """A KubeNodeSource `capacity_of` that reports several resources.
 
@@ -230,13 +293,12 @@ class PendingPodFit:
                            or (t.get("operator") == "Exists" and not t.get("key"))
                            for t in tols):
                     continue
-            # Effective request is containers plus native sidecars; plain
-            # initContainers are only a floor, so summing them all over-counts.
-            running = list(p["spec"].get("containers", [])) + [
-                c for c in p["spec"].get("initContainers", [])
-                if c.get("restartPolicy") == "Always"]
-            if all(sum(QUANTITY[r](c.get("resources", {}).get("requests", {})
-                                   .get(r, "0")) for c in running) <= cap
-                   for r, cap in capacity.items() if r in QUANTITY):
+            # The scheduler's effective request, init-phase floor and all: a pod
+            # whose init container needs more than its steady state does not
+            # fit a node that only holds the steady state.
+            need = effective_requests(
+                p["spec"], [r for r in capacity if r in QUANTITY])
+            if all(need[r] <= cap for r, cap in capacity.items()
+                   if r in QUANTITY):
                 return True
         return False
