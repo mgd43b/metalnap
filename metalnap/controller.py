@@ -983,11 +983,15 @@ class Controller:
         for n in present:
             state = states[n]
             if state.maintenance:
-                # Whatever metalnap last knew of this machine's power, a person
-                # may since have changed it. Forgotten now, so that giving the
-                # node back has it checked afresh rather than muted on the
-                # strength of an "off" from before somebody switched it on.
-                for k in ("off", "dark_on_since"):
+                # Whatever metalnap last concluded about this machine, a person
+                # has had it since. Its power is checked afresh when it is given
+                # back, rather than muted on an "off" from before somebody
+                # switched it on; and a wake metalnap gave up on is forgotten,
+                # or a node fixed and given back dark is passed over by demand
+                # for a day with nothing saying why. The power-cycle bound
+                # lives on the node, so forgetting this cannot make a loop.
+                for k in ("off", "dark_on_since", "wake_backoff_until",
+                          "backoff_record"):
                     self._node(n).pop(k, None)
                 continue
             for k in ("maintenance_dry_run", "maintenance_power_failed_at"):
@@ -1012,7 +1016,7 @@ class Controller:
             st["_maint_last"] = maint
         return maint
 
-    def _take_up_maintenance(self, maint, states, in_flight):
+    def _take_up_maintenance(self, maint, states, settling):
         """Power on, ONCE per request, each node an operator has asked for.
 
         Once, not whenever it is dark. A person mid-maintenance powers the
@@ -1033,17 +1037,19 @@ class Controller:
         the operator's, so it is theirs to power at the BMC, or to ask for
         again with a fresh request.
 
-        Not while an operation of ours is still settling, either, nor on the
-        tick one ends. A shutdown already requested cannot be recalled, so it
-        is seen through to OFF and the node powered on after it -- and not on
-        the observation this tick began with, which predates it: that still
-        reads Ready, and the node would be recorded as taken up and left dark.
+        Not while a shutdown of ours is still settling, either, nor on the
+        tick one ends. It cannot be recalled, so it is seen through to OFF and
+        the node powered on after it -- and not on the observation this tick
+        began with, which predates it: that still reads Ready, and the node
+        would be recorded as taken up and left dark. Nothing else waits: a
+        node up and warming is up, and waiting for its warmup left a window in
+        which an operator's power-off was undone the moment it ended.
         """
         powered, now = False, self.now()
         for n in maint:
             state, s = states[n], self._node(n)
-            if (state.maintenance_started_at is not None or s.get("phase")
-                    or n in in_flight):
+            if (state.maintenance_started_at is not None
+                    or s.get("phase") == "powering_off" or n in settling):
                 continue
             if self.cfg.mode != "on":
                 # Remembered in memory only, so the shadow says it once per
@@ -1533,6 +1539,7 @@ class Controller:
         # reintroduce the starvation the phase machines exist to remove: one
         # node draining would stop any other being woken.
         in_flight = [n for n in present if st.get(n, {}).get("phase")]
+        settling = [n for n in in_flight if st[n]["phase"] == "powering_off"]
         for n in in_flight:
             phase = st[n]["phase"]
             if n in held:
@@ -1641,7 +1648,7 @@ class Controller:
 
         # Before the stranded repair, which ends the tick: a request is an
         # operator waiting, and must not queue behind a repair on another node.
-        took_up = self._take_up_maintenance(maint, states, in_flight)
+        took_up = self._take_up_maintenance(maint, states, settling)
 
         # A node powered on but cordoned is in NEITHER desired state: burning
         # power, serving nothing. It gets there when an operation is

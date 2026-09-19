@@ -377,7 +377,8 @@ python3 -B tests/sim.py --seeds 60 --ticks 900    # ~54k ticks, ~2s
 ```
 
 `tests/sim.py` drives the controller through thousands of ticks against a fake
-cluster and fake BMCs, with phased demand, hung work, operator cordons,
+cluster and fake BMCs, with phased demand, hung work, operators cordoning
+nodes and asking for them for maintenance,
 nodes whose kernels lock up, and injected restarts, asserting **safety and
 liveness** after every tick. Liveness
 matters more than it looks: safety alone is satisfied by a controller that does

@@ -2220,6 +2220,57 @@ class TestMaintenanceMode(unittest.TestCase):
         c.tick()
         self.assertFalse(h.logged("metalnap did not put them down"))
 
+    def test_a_node_warming_up_is_recorded_straight_away(self):
+        """Up and in service is up and in service, warmup or not. Waiting for
+        the warmup to finish left a window -- up to WARMUP_TIMEOUT_S -- in
+        which an operator's power-off was undone the moment it ended.
+        Found by the simulation harness with a slow warmup."""
+        h = self.harness({"a": held(node(ready=True))})
+        c = h.controller(nodes=("a",))
+
+        class Slow:
+            def start(self, n):
+                pass
+
+            def done(self, n):
+                return False
+
+            def cleanup(self, n):
+                pass
+        c.warmup = Slow()
+        c.st["a"] = {"phase": "warming", "phase_since": h.t}
+        c.tick()
+        self.assertIsNotNone(h.states["a"].maintenance_started_at,
+                             "a node already up waited for its warmup to be "
+                             "recorded")
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=False,
+                                            ready_since=None, down_since=h.t)
+        h.chassis["a"] = "off"                          # operator: poweroff
+        for _ in range(20):
+            h.t += 60
+            c.tick()
+        self.assertEqual(h.acted["on"], [],
+                         "powered back on a machine the operator switched off")
+
+    def test_giving_up_on_a_wake_is_forgotten_by_the_hold(self):
+        """metalnap's verdict on a node it could not wake predates whatever
+        the operator then did to it. Kept, a node fixed and given back dark
+        was passed over by demand for up to a day, with nothing alerting.
+        Found by the simulation harness (seed 4766, 1800 ticks)."""
+        h = self.harness({"a": held(maintenance_started_at=T0 - 600)},
+                         shortfall=150.0)
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"wake_backoff_until": h.t + 86400,
+                     "backoff_record": None,
+                     "trouble": "not Ready after a wake: wedged"}
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], maintenance=None)
+        c.st["want_high_since"] = 0.0
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"],
+                         "demand passed over a node the operator fixed")
+
     def test_a_request_abandons_a_wake(self):
         """Well inside the wake timeout, so it is the abandon that is tested
         and not the timeout's own check: a cold boot left counted as capacity
