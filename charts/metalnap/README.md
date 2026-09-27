@@ -140,7 +140,7 @@ no alert, and no change to its cordon. That makes it a request, not a drain: a
 node in service stays schedulable, so `kubectl cordon` it as well to let its
 running work finish first. Power it off to work on it and it stays off.
 Removed, the node is metalnap's again — put into service or to sleep as demand
-says.
+says — unless you cordoned it yourself, which holds it until you uncordon it.
 
 ## RBAC
 
