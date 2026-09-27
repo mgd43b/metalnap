@@ -78,7 +78,9 @@ Optional:
                             annotating it metalnap.io/maintenance=<reason>
                             (or `metalnap maintenance start`). It is powered
                             on once, then left alone -- no sleep, drain,
-                            power cycle or mute -- until the annotation goes.
+                            cordon, power cycle or mute -- until the
+                            annotation goes. `kubectl cordon` one in service
+                            to let its running work finish first.
     SHUTDOWN_TIMEOUT_S      how long a soft shutdown may take before the node
                             is reported as one that would not power off
                             (default 600). Never forced.

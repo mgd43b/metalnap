@@ -238,6 +238,19 @@ kubectl annotate --overwrite node node1 metalnap.io/maintenance="kernel 6.8"
 kubectl annotate node node1 metalnap.io/maintenance- metalnap.io/maintenance-started-
 ```
 
+A request is metalnap getting out of the way, not a drain. **It does not
+cordon, drain or power off a node that is in service**: running work carries
+on, and new work can still land on it. To let what is running finish before
+you start, cordon it yourself as well:
+
+```bash
+kubectl cordon node1
+metalnap maintenance start node1 --reason "kernel 6.8"
+# ...its running work finishes; do yours...
+metalnap maintenance stop node1
+kubectl uncordon node1
+```
+
 What metalnap does with a node while the request stands:
 
 - **Powers it on — once.** If the chassis is off, it is powered on, one node
@@ -259,7 +272,8 @@ What metalnap does with a node while the request stands:
 - **It leaves the cordon as it found it.** A node woken from sleep keeps
   metalnap's cordon, so no work lands while you reboot it; host-level updates,
   config management and DaemonSets run regardless. A node that was in service
-  stays in service. `kubectl cordon` and `uncordon` are yours throughout.
+  stays in service, schedulable, until you cordon it. `kubectl cordon` and
+  `uncordon` are yours throughout.
 - **It is out of the pool.** Demand neither wakes, sleeps nor counts it, the
   way it does not count a node an operator cordoned; scheduled visits pass it
   over. A wake, sleep or visit already under way is abandoned where it stands.
@@ -268,10 +282,12 @@ What metalnap does with a node while the request stands:
 
 **Give it back when it is Ready**, and it is metalnap's again from the next
 tick: put into service if demand wants it, or through the ordinary sleep — with
-every rule a sleep keeps — if not. A node given back dark under metalnap's
-cordon is checked like any it put to sleep: off is asleep, and powered but not
-Ready gets a wake timeout's grace and is then handed to a human. One given back
-dark and uncordoned reads as down, loudly, like any node that crashed.
+every rule a sleep keeps — if not. One you cordoned yourself stays held, like
+any node an operator cordoned, until you uncordon it. A node given back dark
+under metalnap's cordon is checked like any it put to sleep: off is asleep, and
+powered but not Ready gets a wake timeout's grace and is then handed to a
+human. One given back dark and uncordoned reads as down, loudly, like any node
+that crashed.
 
 It is not a `MODE` and not a Helm value. It is per node, asked for on the node,
 so it needs no redeploy and nothing to remember to set back.

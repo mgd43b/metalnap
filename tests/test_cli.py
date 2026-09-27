@@ -577,6 +577,22 @@ class TestMaintenanceStart(unittest.TestCase):
                           "metalnap.io/maintenance-started": None})
         self.assertIn("a already asked for", out)
 
+    def test_a_node_in_service_is_said_to_stay_schedulable(self):
+        """"Maintenance" reads as "drain it first"; asking for a node does
+        not cordon it, so one in service keeps taking work."""
+        cluster = make_cluster(nodes=("a", "b"), node_objs={
+            "b": k8s_node("b", ready=False, cordoned=True, annotations={
+                "metalnap.io/cordoned": "2026-09-18T01:17:34Z"})})
+        code, out, err = run_cli(["maintenance", "start", "--all",
+                                  "--reason", "x", "--context", "ctx"],
+                                 cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("a in service: not cordoned or drained", out)
+        self.assertNotIn("b in service", out)
+        self.assertNotIn("a, b in service", out)
+        for _n, patch in cluster.patches:
+            self.assertNotIn("spec", patch)
+
     def test_logs_fails_when_kubectl_does(self):
         """`metalnap logs | grep` must not read "no permission to read any"
         as "no lines matched"."""

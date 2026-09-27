@@ -250,6 +250,11 @@ def cmd_maintenance(t, args, out):
     states = t.states() if start else {}
     already = [n for n in nodes
                if states.get(n) is not None and states[n].maintenance]
+    # Asking for a node does not cordon it, so one in service keeps taking
+    # work. Said here, because "maintenance" reads as "drain it first".
+    in_service = [n for n in nodes
+                  if states.get(n) is not None and states[n].ready
+                  and not states[n].cordoned]
     done = []
     for n in nodes:
         if not start:
@@ -286,6 +291,11 @@ def cmd_maintenance(t, args, out):
             print("%s already asked for: reason updated, and not powered on "
                   "again -- stop, then start, to ask for that."
                   % ", ".join(already), file=out)
+        if in_service:
+            print("%s in service: not cordoned or drained, so running work "
+                  "carries on and new work can still land -- `kubectl "
+                  "cordon` to let what is running finish first."
+                  % ", ".join(in_service), file=out)
     else:
         print("gave back %s. metalnap puts each into service or to sleep, as "
               "demand says." % ", ".join(nodes), file=out)
@@ -387,7 +397,8 @@ _HELP = {
     "status": "Every node the controller manages, and what state it is in.",
     "maintenance": "Ask for nodes to work on, and give them back. metalnap "
                    "powers each on once, then leaves it alone until it is "
-                   "given back.",
+                   "given back. It does not cordon or drain one in service; "
+                   "`kubectl cordon` it for that.",
     "logs": "The controller's log, readable.",
 }
 
