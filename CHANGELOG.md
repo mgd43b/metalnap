@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.2](https://github.com/mgd43b/metalnap/compare/v0.5.1...v0.5.2) (2026-10-01)
+
+
+### Fixes
+
+* **deps:** bump alpine from `28bd5fe` to `294b683` ([05aebdd](https://github.com/mgd43b/metalnap/commit/05aebdd6af495c0d75781783a103585d3fe52fe3))
+* **deps:** bump alpine from `28bd5fe` to `294b683` ([3f090e9](https://github.com/mgd43b/metalnap/commit/3f090e97caba7b885fb078975252d3675d2e4559))
+* say that maintenance mode leaves a node in service schedulable ([01dd074](https://github.com/mgd43b/metalnap/commit/01dd07433110d1867ab3f9c85bb4b5aacf2f02aa))
+* say that maintenance mode leaves a node in service schedulable ([f4323b8](https://github.com/mgd43b/metalnap/commit/f4323b82094416f004ddc469d2faa3c4613d9bdc))
+
+
+### Documentation
+
+* a node cordoned by hand stays held after maintenance stop (chart README) ([20fa609](https://github.com/mgd43b/metalnap/commit/20fa6098439db36ac49391d52d6df6d92fab9124))
+
 ## [0.5.1](https://github.com/mgd43b/metalnap/compare/v0.5.0...v0.5.1) (2026-09-19)
 
 
