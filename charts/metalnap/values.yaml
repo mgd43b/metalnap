@@ -106,6 +106,64 @@ maintenance:
   staggerS: 3600          # per-node spread, so a rack does not power on in unison
   timeoutS: 3600          # bound on one visit; must exceed windowS + wakeTimeoutS
 
+# A capacity ceiling: an external signal that caps how many of `nodes` may be
+# AWAKE, down to none -- for a room that is overheating, a UPS that has gone on
+# battery, a circuit that cannot carry more than N machines. While one is in
+# force nothing is woken beyond it, and nodes over it are shed through the
+# ordinary sleep: cordoned, drained, announced to Alertmanager, silenced and
+# shut down the soft way, without waiting out the sustain timers.
+#
+# OFF unless `query` or `static` is set, and it FAILS OPEN, in both directions:
+# an unreachable Prometheus never sheds a node, and one that goes away in the
+# middle of an event lifts the ceiling at once.
+#
+# It touches one of the rules the README lists as unbreakable -- "never
+# interrupt running work" -- and relaxes it in exactly one place: a node still
+# carrying work `drainDeadlineS` after it was shed is shut down anyway, the
+# ordinary soft way, announced first, and logged at error with what it ended.
+# Nothing is interrupted before the deadline, and none is while the CURRENT
+# reading no longer asks for it. `drainDeadlineS: 0` opts out: a busy node is
+# then never shed, so the ceiling cannot by itself bring an emergency under
+# control (the controller warns when it starts).
+#
+# `query` is PromQL on `prometheus.url`. Its VALUE is the most nodes allowed
+# awake, and NO SERIES MEANS NO CEILING -- the reverse of how the demand signal
+# reads an empty result, and what lets you write a gate. Several series take the
+# minimum. NaN, infinity, a negative or an error is "cannot tell", which is
+# never zero. Staleness is the expression's job, not metalnap's: an instant
+# query is stamped with the time it was EVALUATED, so end the expression with a
+# freshness guard (`... and on() (time() - timestamp(m) < 120)`) and a stale
+# metric returns no series. To combine signals, do it inside the one expression
+# with min() -- and beware `A or B`: both sides are label-less, so `or` keeps
+# only A.
+#
+#   # Thermal: inlet temperature over 35 C anywhere -> no managed node awake.
+#   query: 'vector(0) and on() (max(ipmi_temperature_celsius{sensor="Inlet Temp"}) > 35)'
+#
+#   # Power: on battery -> keep one node; under 20 minutes of runtime -> none.
+#   # (Metric names vary by exporter. No series on mains = no ceiling.)
+#   query: >-
+#     (1 - (min(ups_battery_runtime_seconds) < bool 1200))
+#     and on() (max(ups_on_battery) == 1)
+#
+# `static` is a fixed ceiling, to watch the shed path (in dry_run first) without
+# a signal, or a hard budget. 0 is a real ceiling: shed everything. Not with a
+# `query`.
+capacityCeiling:
+  query: ""
+  static: null
+  releaseHoldS: 900       # a looser reading must hold this long before shed nodes are released
+  drainDeadlineS: 600     # a busy node is given this long, then shut down anyway; 0 = never force
+
+# Prometheus metrics, on a plain HTTP listener inside the controller. OFF by
+# default: before this the controller listened on nothing at all. Set a port to
+# serve /metrics there -- metalnap_capacity_ceiling, ..._engaged, ..._signal_ok,
+# metalnap_nodes_shed and metalnap_shed_forced_total. There is deliberately no
+# Service: scrape the pod (a PodMonitor), or add a Service of your own. 1024 or
+# more -- the container runs unprivileged with every capability dropped.
+metrics:
+  port: 0
+
 # Every timer, in seconds. Defaults match metalnap/config.py.
 timers:
   intervalS: 60

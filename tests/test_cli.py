@@ -219,7 +219,7 @@ def k8s_node(name, ready=True, cordoned=False, annotations=None,
 def make_cluster(nodes=("a", "b", "c"), mode="on", cordon_annotation=None,
                  namespace="ops", name="metalnap-controller", release=None,
                  literal_env=None, node_objs=None, context="prod-cluster",
-                 configmap_name="metalnap-config"):
+                 configmap_name="metalnap-config", env=None):
     """One metalnap Deployment, its ConfigMap, and one Node per name.
 
     A node in `node_objs` is used as given; a name mapped to None is left
@@ -232,6 +232,7 @@ def make_cluster(nodes=("a", "b", "c"), mode="on", cordon_annotation=None,
                                     configmap_name=configmap_name,
                                     literal_env=literal_env))
     data = {"NODES": ",".join(nodes), "MODE": mode}
+    data.update(env or {})
     if cordon_annotation:
         data["CORDON_ANNOTATION"] = cordon_annotation
     c.configmaps[(namespace, configmap_name)] = {"data": data}
@@ -529,6 +530,264 @@ class TestStatusStates(unittest.TestCase):
     def test_trouble_is_flagged_needs_a_human(self):
         self.assertIn("NEEDS A HUMAN: bmc unreachable",
                       status_detail(self.rows["troubled"]))
+
+
+# ---------------------------------------------------------------------------
+# Capacity ceiling: the header line `status` reads from the status ConfigMap,
+# the per-node `shed` state it reads from the node, and the warning
+# `maintenance start` gives when one is engaged (#27).
+# ---------------------------------------------------------------------------
+
+SHED_AT = "2023-11-14T22:13:20Z"            # 1700000000.0
+ENGAGED_AT = 1700000000.0
+
+
+def ceiling_report(**kw):
+    """What the controller writes to the status object, as the CLI finds it.
+    `updated` is now, so it is fresh unless a test says otherwise."""
+    import time
+    report = {"configured": True, "mode": "on", "engaged": True, "limit": 0,
+              "signal": 0, "signal_ok": True, "since": ENGAGED_AT, "pool": 3,
+              "shed": ["b", "c"],
+              "draining": [{"node": "c", "until": ENGAGED_AT + 600}],
+              "exempt": [], "forced": 0, "updated": time.time(),
+              "refresh_s": 300}
+    report.update(kw)
+    return report
+
+
+def with_status(cluster, report, namespace="ops",
+                name="metalnap-controller-status"):
+    cluster.configmaps[(namespace, name)] = {
+        "data": {"ceiling": json.dumps(report)}}
+    return cluster
+
+
+def header(output):
+    return [ln for ln in output.splitlines() if ln.startswith("ceiling:")]
+
+
+class TestCeilingHeader(unittest.TestCase):
+    CONFIGURED = {"CEILING_QUERY": "vector(0)"}
+
+    def status(self, report=None, env=None, mode="on", **kw):
+        cluster = make_cluster(nodes=("a", "b", "c"), mode=mode,
+                               env=self.CONFIGURED if env is None else env,
+                               **kw)
+        if report is not None:
+            with_status(cluster, report)
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        return cluster, out
+
+    def test_engaged_says_how_many_it_allows_since_when_and_what_is_left(self):
+        _c, out = self.status(ceiling_report())
+        self.assertEqual(
+            header(out),
+            ["ceiling:    0 nodes, ENGAGED since 2023-11-14 22:13 UTC "
+             "(signal 0; 2 shed, 1 draining until 22:23 UTC)"])
+
+    def test_a_drain_that_is_never_forced_says_so(self):
+        _c, out = self.status(ceiling_report(
+            draining=[{"node": "c", "until": None}]))
+        self.assertIn("1 draining, never forced", header(out)[0])
+
+    def test_one_node_is_a_node(self):
+        _c, out = self.status(ceiling_report(limit=1, shed=["c"],
+                                             draining=[]))
+        self.assertIn("1 node, ENGAGED", header(out)[0])
+
+    def test_none_in_force(self):
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=None, signal=None, since=None, shed=[],
+            draining=[]))
+        self.assertEqual(header(out), ["ceiling:    none in force"])
+
+    def test_a_ceiling_that_does_not_bind_says_so(self):
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=3, signal=7, shed=[], draining=[]))
+        self.assertEqual(header(out), ["ceiling:    3 nodes, not limiting "
+                                       "(the pool is 3)"])
+
+    def test_an_unavailable_signal_is_said_and_is_not_a_ceiling(self):
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=None, signal=None, signal_ok=False,
+            since=None, shed=[], draining=[]))
+        self.assertEqual(header(out), ["ceiling:    signal UNAVAILABLE -- "
+                                       "treated as no ceiling"])
+
+    def test_a_status_nobody_has_written_lately_is_flagged(self):
+        """A controller that died while a ceiling was engaged leaves ENGAGED
+        in the object for ever."""
+        _c, out = self.status(ceiling_report(updated=ENGAGED_AT + 60))
+        self.assertIn("last written 2023-11-14 22:14 UTC, the controller "
+                      "may not be running", header(out)[0])
+
+    def test_nothing_is_said_when_no_ceiling_is_configured(self):
+        cluster, out = self.status(ceiling_report(), env={})
+        self.assertEqual(header(out), [])
+        self.assertFalse([a for a in cluster.calls
+                          if "metalnap-controller-status" in a],
+                         "read the status object of a deployment that has "
+                         "no ceiling")
+
+    def test_a_static_zero_counts_as_configured(self):
+        _c, out = self.status(ceiling_report(),
+                              env={"CEILING_STATIC": "0"})
+        self.assertEqual(len(header(out)), 1)
+
+    def test_an_unreadable_status_is_said_not_an_error(self):
+        """The chart creates the object; a deployment that did not, or a
+        person without `get configmap`, still gets the rest of `status`."""
+        _c, out = self.status(None)
+        self.assertEqual(len(header(out)), 1)
+        self.assertIn("could not be read", header(out)[0])
+        self.assertIn("NODE", out)
+
+    def test_an_empty_status_is_not_an_error_either(self):
+        """The chart's empty object, before the controller has written."""
+        cluster = make_cluster(nodes=("a",), env=self.CONFIGURED)
+        cluster.configmaps[("ops", "metalnap-controller-status")] = {}
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("has not written its status yet", header(out)[0])
+
+    def test_dry_run_says_what_it_does_and_reads_nothing(self):
+        cluster, out = self.status(ceiling_report(), mode="dry_run")
+        self.assertIn("dry_run", header(out)[0])
+        self.assertFalse([a for a in cluster.calls
+                          if "metalnap-controller-status" in a],
+                         "dry_run writes no status, so there is none to read")
+
+    def test_mode_off_says_the_ceiling_is_suspended(self):
+        _c, out = self.status(ceiling_report(), mode="off")
+        self.assertIn("suspended", header(out)[0])
+
+    def test_the_status_object_is_named_for_the_deployment(self):
+        cluster = make_cluster(nodes=("a",), name="mine", env=self.CONFIGURED)
+        with_status(cluster, ceiling_report(), name="mine-status")
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ENGAGED", header(out)[0])
+
+    def test_the_object_read_is_the_one_the_controller_was_told_to_write(self):
+        """STATUS_CONFIGMAP, from the controller's own environment -- not a
+        name guessed from the Deployment's, which a chart override or a hand
+        deployment can make a different one."""
+        cluster = make_cluster(nodes=("a",), env={
+            "CEILING_QUERY": "vector(0)", "STATUS_CONFIGMAP": "elsewhere"})
+        with_status(cluster, ceiling_report(), name="elsewhere")
+        cluster.configmaps[("ops", "metalnap-controller-status")] = {
+            "data": {"ceiling": json.dumps(ceiling_report(
+                engaged=False, limit=None, shed=[], draining=[]))}}
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ENGAGED", header(out)[0],
+                      "read the Deployment-derived object, not the configured "
+                      "one")
+
+    def test_without_one_the_name_is_the_deployments_plus_status(self):
+        cluster = make_cluster(nodes=("a",), env={"CEILING_QUERY": "vector(0)",
+                                                  "STATUS_CONFIGMAP": " "})
+        with_status(cluster, ceiling_report())
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ENGAGED", header(out)[0])
+
+    def test_the_read_is_pinned_to_the_context_like_every_other(self):
+        cluster, _out = self.status(ceiling_report())
+        reads = [a for a in cluster.calls if "metalnap-controller-status" in a]
+        self.assertTrue(reads)
+        for argv in reads:
+            self.assertEqual(argv[1:3], ["--context", "ctx"])
+
+
+class TestShedState(unittest.TestCase):
+    def rows(self, **nodes):
+        cluster = make_cluster(nodes=tuple(nodes), node_objs=nodes)
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        return {r.split()[0]: r for r in status_rows(out)}
+
+    def ours(self, **extra):
+        return dict({"metalnap.io/cordoned": SHED_AT,
+                     "metalnap.io/shed": SHED_AT}, **extra)
+
+    def test_a_shed_node_that_is_off(self):
+        rows = self.rows(a=k8s_node("a", ready=False, cordoned=True,
+                                    annotations=self.ours()))
+        self.assertEqual(status_state(rows["a"]), "shed")
+        self.assertIn("held down by a capacity ceiling since "
+                      "2023-11-14 22:13 UTC", status_detail(rows["a"]))
+        self.assertNotIn("draining", status_detail(rows["a"]))
+
+    def test_a_shed_node_that_is_still_up_is_draining(self):
+        rows = self.rows(a=k8s_node("a", ready=True, cordoned=True,
+                                    annotations=self.ours()))
+        self.assertEqual(status_state(rows["a"]), "shed")
+        self.assertIn("draining", status_detail(rows["a"]))
+
+    def test_a_note_without_our_cordon_is_not_a_shed(self):
+        """A note left on a node that was uncordoned and put back into
+        service is a stale record, not a node held down."""
+        rows = self.rows(
+            up=k8s_node("up", ready=True, cordoned=False,
+                        annotations={"metalnap.io/shed": SHED_AT}),
+            held=k8s_node("held", ready=True, cordoned=True,
+                          annotations={"metalnap.io/shed": SHED_AT}))
+        self.assertEqual(status_state(rows["up"]), "in service")
+        self.assertEqual(status_state(rows["held"]), "held")
+
+    def test_a_node_an_operator_asked_for_reads_as_maintenance(self):
+        rows = self.rows(a=k8s_node("a", ready=True, cordoned=True,
+                                    annotations=self.ours(**{
+                                        "metalnap.io/maintenance": "fw"})))
+        self.assertEqual(status_state(rows["a"]), "maintenance")
+
+
+class TestMaintenanceStartWarnsOfACeiling(unittest.TestCase):
+    CONFIGURED = {"CEILING_QUERY": "vector(0)"}
+
+    def start(self, report=None, env=None):
+        cluster = make_cluster(nodes=("a", "b"),
+                               env=self.CONFIGURED if env is None else env)
+        if report is not None:
+            with_status(cluster, report)
+        code, out, err = run_cli(["maintenance", "start", "a", "--reason",
+                                  "x", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        return cluster, out
+
+    def test_it_says_the_ceiling_does_not_block_the_power_on(self):
+        _c, out = self.start(ceiling_report())
+        self.assertIn("a capacity ceiling is engaged (0 nodes)", out)
+        self.assertIn("does not block", out)
+
+    def test_it_is_still_asked_for(self):
+        cluster, _out = self.start(ceiling_report())
+        self.assertEqual([n for n, _p in cluster.patches], ["a"])
+
+    def test_nothing_is_said_when_none_is_engaged(self):
+        _c, out = self.start(ceiling_report(engaged=False, limit=None,
+                                            shed=[], draining=[]))
+        self.assertNotIn("capacity ceiling", out)
+
+    def test_nothing_is_said_when_none_is_configured(self):
+        _c, out = self.start(ceiling_report(), env={})
+        self.assertNotIn("capacity ceiling", out)
+
+    def test_an_unreadable_status_does_not_stop_the_request(self):
+        _c, out = self.start(None)
+        self.assertIn("asked for a", out)
+
+    def test_a_stop_says_nothing_about_it(self):
+        cluster = with_status(make_cluster(nodes=("a",),
+                                           env=self.CONFIGURED),
+                              ceiling_report())
+        code, out, err = run_cli(["maintenance", "stop", "a", "--context",
+                                  "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("capacity ceiling", out)
 
 
 # ---------------------------------------------------------------------------

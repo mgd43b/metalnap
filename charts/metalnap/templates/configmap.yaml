@@ -40,6 +40,26 @@
 {{- fail (printf "timers.powerCycleCooldownS (%v) must be 0 or at least timers.wakeTimeoutS (%v), or a node could be power-cycled again before the last cycle had a chance to work" .powerCycleCooldownS .wakeTimeoutS) }}
 {{- end }}
 {{- end }}
+{{- /*
+  The capacity ceiling's two sources are mutually exclusive, and its numbers
+  cannot be negative -- the same checks as metalnap/config.py, here to move the
+  discovery to install time. `static` is tested for null and never for
+  truthiness: 0 is a ceiling of zero nodes.
+*/ -}}
+{{- with .Values.capacityCeiling }}
+{{- if and .query (not (kindIs "invalid" .static)) }}
+{{- fail "capacityCeiling.query and capacityCeiling.static are mutually exclusive: set one source of the ceiling, not both" }}
+{{- end }}
+{{- if and (not (kindIs "invalid" .static)) (lt (int .static) 0) }}
+{{- fail (printf "capacityCeiling.static (%v) must be 0 or more: 0 sheds every node, and null means no ceiling" .static) }}
+{{- end }}
+{{- if lt (int .releaseHoldS) 0 }}
+{{- fail (printf "capacityCeiling.releaseHoldS (%v) must be 0 or more" .releaseHoldS) }}
+{{- end }}
+{{- if lt (int .drainDeadlineS) 0 }}
+{{- fail (printf "capacityCeiling.drainDeadlineS (%v) must be 0 or more; 0 never forces a busy node" .drainDeadlineS) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -94,6 +114,28 @@ data:
   MAINTENANCE_WINDOW_S: {{ .windowS | quote }}
   MAINTENANCE_STAGGER_S: {{ .staggerS | quote }}
   MAINTENANCE_TIMEOUT_S: {{ .timeoutS | quote }}
+  {{- end }}
+  {{- with .Values.capacityCeiling }}
+  {{- /*
+    No `| default` and no bare `if .static`: 0 is a ceiling, and both read it as
+    unset. The two timers are always rendered, as the other timers are -- a
+    deadline of 0 is meaningful (never force) and is warned about at start.
+  */}}
+  {{- if .query }}
+  CEILING_QUERY: {{ .query | quote }}
+  {{- end }}
+  {{- if not (kindIs "invalid" .static) }}
+  CEILING_STATIC: {{ int64 .static | quote }}
+  {{- end }}
+  CEILING_RELEASE_HOLD_S: {{ int64 .releaseHoldS | quote }}
+  CEILING_DRAIN_DEADLINE_S: {{ int64 .drainDeadlineS | quote }}
+  {{- end }}
+  {{- if include "metalnap.ceilingEnabled" . }}
+  {{- /* Where the controller publishes what `metalnap status` shows. */}}
+  STATUS_CONFIGMAP: {{ include "metalnap.statusName" . | quote }}
+  {{- end }}
+  {{- if gt (int .Values.metrics.port) 0 }}
+  METRICS_PORT: {{ int .Values.metrics.port | quote }}
   {{- end }}
   {{- with .Values.queries.shortfall }}
   SHORTFALL_QUERY: {{ . | quote }}

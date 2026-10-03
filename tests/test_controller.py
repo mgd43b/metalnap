@@ -8,14 +8,17 @@ backstop is not good enough -- particularly anything guarding running work or
 an operator's cordon.
 """
 import dataclasses
+import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from metalnap import Config, Controller          # noqa: E402
+from metalnap.ceiling import PrometheusCeiling, StaticCeiling   # noqa: E402
 from metalnap.controller import _hash_fraction   # noqa: E402
-from metalnap.types import NodeState             # noqa: E402
+from metalnap.types import NodeState, NullCeiling   # noqa: E402
 
 
 def node(ready=True, cordoned=False, ours=False, ready_since=0.0,
@@ -30,7 +33,8 @@ def node(ready=True, cordoned=False, ours=False, ready_since=0.0,
 #: NodeSource.note() keys, as the NodeState fields they come back as.
 NOTE_FIELDS = {"power-cycled": "power_cycled_at", "visited": "visited_at",
                "shutdown": "shutdown_at", "trouble": "trouble",
-               "maintenance-started": "maintenance_started_at"}
+               "maintenance-started": "maintenance_started_at",
+               "shed": "shed_at"}
 
 
 def crashed(**kw):
@@ -61,9 +65,17 @@ class Harness:
     """A minimal stub world. Records what the controller tried to do."""
 
     def __init__(self, states, shortfall=0.0, saturated=0, busy=(), idle=(),
-                 holds=False, fits=True, chassis=None):
+                 holds=False, fits=True, chassis=None, ceiling=None):
         self.states = states
         self._shortfall, self._saturated, self._fits = shortfall, saturated, fits
+        #: What the capacity ceiling reads, tick by tick: an int, None (no
+        #: ceiling) or an exception to raise (the signal is unavailable).
+        self._ceiling = ceiling
+        self.ceiling_reads = 0
+        #: How many times each node was asked whether it is busy.
+        self.busy_calls = {}
+        #: Fail this many writes of the shed note, then let them through.
+        self.shed_note_fails = 0
         self._busy = busy if isinstance(busy, (dict, BaseException)) \
             else list(busy)
         self._idle, self._holds = list(idle), holds
@@ -81,6 +93,8 @@ class Harness:
         #: operator's cordon has to be caught.
         self.fresh = {}
         self.logs = []
+        #: The same lines with their level, which `logs` drops.
+        self.records = []
         self.t = 1000.0
 
     def logged(self, needle):
@@ -102,6 +116,9 @@ class Harness:
 
     def note(self, n, key, value):
         """Durable, like the annotations it stands for: survives c.st = {}."""
+        if key == "shed" and self.shed_note_fails > 0:
+            self.shed_note_fails -= 1
+            raise RuntimeError("apiserver said no")
         if key == "power-cycled":
             if self.record_fails:
                 raise RuntimeError("apiserver said no")
@@ -122,18 +139,30 @@ class Harness:
     def power(self):
         return _Power(self)
 
+    # CapacityCeiling
+    def limit(self):
+        self.ceiling_reads += 1
+        if isinstance(self._ceiling, BaseException):
+            raise self._ceiling
+        return self._ceiling
+
     # DemandSignal
     def shortfall(self):
+        if isinstance(self._shortfall, BaseException):
+            raise self._shortfall
         return self._shortfall
 
     def saturated_units(self):
         return self._saturated
 
     def fits_node(self, capacity):
+        if isinstance(self._fits, BaseException):
+            raise self._fits
         return self._fits
 
     # DrainPolicy
     def busy(self, n):
+        self.busy_calls[n] = self.busy_calls.get(n, 0) + 1
         if isinstance(self._busy, BaseException):
             raise self._busy
         if isinstance(self._busy, dict):          # per node
@@ -152,7 +181,8 @@ class Harness:
     def residual(self, n):
         return []
 
-    def controller(self, nodes=("a", "b"), power=None, notifier=None, **cfg):
+    def controller(self, nodes=("a", "b"), power=None, notifier=None,
+                   status=None, metrics=None, warmup=None, **cfg):
         defaults = dict(mode="on", wake_sustain_s=0, sleep_sustain_s=0,
                         min_uptime_s=0)
         defaults.update(cfg)          # let a test override any of them
@@ -160,8 +190,18 @@ class Harness:
         return Controller(nodes=list(nodes), node_source=self,
                           power=power or self.power, signal=self, drain=self,
                           config=c, clock=lambda: self.t, notifier=notifier,
-                          log=lambda lvl, msg, **kv: self.logs.append(
-                              (msg, kv)))
+                          warmup=warmup, ceiling=self, status=status,
+                          metrics=metrics,
+                          log=self._record)
+
+    def _record(self, lvl, msg, **kv):
+        self.logs.append((msg, kv))
+        self.records.append((lvl, msg, kv))
+
+    def at_level(self, lvl, needle=""):
+        """Log lines of one level -- for the cases where HOW LOUD is the rule."""
+        return [kv for level, msg, kv in self.records
+                if level == lvl and needle in msg]
 
 
 class _Power:
@@ -3078,6 +3118,1876 @@ class TestPerResourceSeams(unittest.TestCase):
             self.assertEqual(sig.shortfall(), {"memory": 30.0, "cpu": 60.0})
         finally:
             prometheus.requests.get = real
+
+# ---------------------------------------------------------------------------
+# Capacity ceiling: an external signal that caps how many managed nodes may be
+# awake, down to none (#27).
+#
+# README rule it touches: "Never interrupt running work". A forced shed after
+# CEILING_DRAIN_DEADLINE_S is the first deliberate relaxation of it, so most of
+# what follows is about what bounds that: nothing is interrupted before the
+# deadline, the deadline is durable, and it is enforced only while the CURRENT
+# reading still demands it.
+# ---------------------------------------------------------------------------
+
+class _Resp:
+    """Just enough of a requests.Response for Prometheus's query API."""
+
+    def __init__(self, body, code=200):
+        self.body, self.code = body, code
+
+    def raise_for_status(self):
+        if self.code >= 400:
+            raise RuntimeError("HTTP %d" % self.code)
+
+    def json(self):
+        return self.body
+
+
+def prom(result, result_type="vector", status="success"):
+    return _Resp({"status": status,
+                  "data": {"resultType": result_type, "result": result}})
+
+
+def vec(*values):
+    """An instant vector with one series per value, as Prometheus returns it:
+    the sample's value is a STRING."""
+    return [{"metric": {"ups": str(i)}, "value": [1.7e9, str(v)]}
+            for i, v in enumerate(values)]
+
+
+class TestPrometheusCeiling(unittest.TestCase):
+    """Three outcomes -- a value, none, and unavailable -- and the two that are
+    not a value must never be confused with 0, which sheds every node."""
+
+    def read(self, response):
+        with mock.patch("requests.get",
+                        return_value=response):
+            return PrometheusCeiling("http://prom:9090/", "q").limit()
+
+    def test_no_series_is_no_ceiling_and_not_zero(self):
+        """THE trap. PrometheusSignal._scalar() reads an empty result as 0.0,
+        which is right for demand -- nothing waiting -- and, for a ceiling, an
+        order to power every node off. A gate like `vector(0) and on() (...)`
+        yields no series on every ordinary day."""
+        self.assertIsNone(self.read(prom([])))
+
+    def test_zero_is_a_ceiling_of_zero(self):
+        got = self.read(prom(vec(0)))
+        self.assertEqual(got, 0)
+        self.assertIsNotNone(got)
+
+    def test_a_fraction_floors(self):
+        self.assertEqual(self.read(prom(vec(2.9))), 2)
+        self.assertEqual(self.read(prom(vec(0.99))), 0)
+
+    def test_several_series_take_the_minimum_whatever_their_order(self):
+        """res[0] has no defined order. Most restrictive wins, so an
+        unaggregated per-UPS expression just works."""
+        self.assertEqual(self.read(prom(vec(3, 1, 2))), 1)
+        self.assertEqual(self.read(prom(vec(1, 3, 2))), 1)
+        self.assertEqual(self.read(prom(vec(2, 3, 1))), 1)
+
+    def test_a_scalar_result_is_read_too(self):
+        """`query: "2"` is a scalar, not a vector."""
+        self.assertEqual(self.read(prom([1.7e9, "2"], "scalar")), 2)
+
+    def test_a_value_that_is_not_a_node_count_is_unavailable(self):
+        """Never 0, never a clamp: a reading that cannot be trusted must not
+        power anything off."""
+        for bad in ("NaN", "+Inf", "-Inf", "Inf", "-1", "-0.5", "banana", ""):
+            with self.subTest(value=bad):
+                with self.assertRaises(Exception):
+                    self.read(prom(vec(bad)))
+
+    def test_one_bad_series_makes_the_whole_reading_unavailable(self):
+        """Better a loud fail-open than a minimum taken over what could be
+        read: a half-readable signal is not one to act on."""
+        with self.assertRaises(Exception):
+            self.read(prom(vec(0, "NaN")))
+
+    def test_an_error_is_unavailable(self):
+        for resp in (_Resp({}, code=500),
+                     prom([], status="error"),
+                     prom([], result_type="matrix"),
+                     prom([], result_type="string"),
+                     _Resp({"status": "success"}),
+                     _Resp(None)):
+            with self.subTest(resp=resp.body):
+                with self.assertRaises(Exception):
+                    self.read(resp)
+
+    def test_a_connection_error_propagates(self):
+        with mock.patch("requests.get",
+                        side_effect=OSError("unreachable")):
+            with self.assertRaises(OSError):
+                PrometheusCeiling("http://prom", "q").limit()
+
+    def test_the_demand_signal_and_the_ceiling_ask_prometheus_the_same_way(self):
+        """One place asks, so a change to how Prometheus is reached -- auth,
+        TLS, a timeout -- cannot reach the demand signal and miss the ceiling:
+        which would fail open, and quietly stop working."""
+        from metalnap.signal.prometheus import PrometheusSignal
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusSignal("http://prom:9090/", "q", timeout=7).shortfall()
+            PrometheusCeiling("http://prom:9090/", "q", timeout=7).limit()
+        self.assertEqual(get.call_args_list[0], get.call_args_list[1])
+
+    def test_the_query_goes_to_the_query_api(self):
+        with mock.patch("requests.get",
+                        return_value=prom([])) as get:
+            PrometheusCeiling("http://prom:9090/", "up == 0",
+                              timeout=7).limit()
+        get.assert_called_once_with("http://prom:9090/api/v1/query",
+                                    params={"query": "up == 0"}, timeout=7)
+
+
+class TestStaticCeiling(unittest.TestCase):
+    def test_zero_is_a_ceiling(self):
+        self.assertEqual(StaticCeiling(0).limit(), 0)
+        self.assertEqual(StaticCeiling(3).limit(), 3)
+
+    def test_anything_that_is_not_a_node_count_is_refused(self):
+        for bad in (-1, True, 1.5, None, "2"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    StaticCeiling(bad)
+
+
+class TestCeilingConfig(unittest.TestCase):
+    def build(self, **env):
+        saved = dict(os.environ)
+        for k in [k for k in os.environ if k.startswith("CEILING_")]:
+            del os.environ[k]
+        os.environ.update(env)
+        try:
+            return Config()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def test_off_by_default_with_the_documented_timers(self):
+        cfg = self.build()
+        self.assertEqual((cfg.ceiling_query, cfg.ceiling_static), ("", None))
+        self.assertEqual((cfg.ceiling_release_hold_s,
+                          cfg.ceiling_drain_deadline_s), (900, 600))
+
+    def test_static_zero_is_a_value_and_empty_is_not(self):
+        """`static: 0` is a ceiling of zero nodes. An env that tested
+        truthiness would read it as unset -- no ceiling, in the one case it
+        matters most."""
+        self.assertEqual(self.build(CEILING_STATIC="0").ceiling_static, 0)
+        self.assertIsNone(self.build(CEILING_STATIC="").ceiling_static)
+        self.assertEqual(self.build(CEILING_STATIC=" 2 ").ceiling_static, 2)
+
+    def test_the_environment_is_parsed(self):
+        cfg = self.build(CEILING_QUERY=" up == 0 ", CEILING_RELEASE_HOLD_S="30",
+                         CEILING_DRAIN_DEADLINE_S="0")
+        self.assertEqual((cfg.ceiling_query, cfg.ceiling_release_hold_s,
+                          cfg.ceiling_drain_deadline_s), ("up == 0", 30, 0))
+
+    def test_a_query_and_a_static_value_together_are_refused(self):
+        with self.assertRaises(ValueError):
+            Config(mode="on", ceiling_query="up", ceiling_static=1).validate()
+        with self.assertRaises(ValueError):
+            # 0 is a value, so it conflicts too.
+            Config(mode="on", ceiling_query="up", ceiling_static=0).validate()
+
+    def test_negative_values_are_refused(self):
+        for kw in (dict(ceiling_static=-1), dict(ceiling_release_hold_s=-1),
+                   dict(ceiling_drain_deadline_s=-1)):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                Config(mode="on", **kw).validate()
+
+    def test_zero_is_allowed_for_both_durations(self):
+        Config(mode="on", ceiling_release_hold_s=0,
+               ceiling_drain_deadline_s=0).validate()
+
+    def test_a_deadline_of_zero_is_warned_about_at_start(self):
+        warned = Config(mode="on", ceiling_drain_deadline_s=0).warnings()
+        self.assertTrue(any("CEILING_DRAIN_DEADLINE_S" in w for w in warned),
+                        warned)
+        self.assertFalse(any("CEILING" in w for w in Config(mode="on")
+                             .warnings()), "warned about the default")
+
+
+class TestShedNote(unittest.TestCase):
+    """`metalnap.io/shed` is written faithfully and has to be read back, or the
+    drain deadline lives in memory and a restart resets it."""
+
+    def source(self, anns):
+        from metalnap.kube import KubeNodeSource
+        k = TestKubeNodeSource.Kube(anns)
+        return k, KubeNodeSource(k, annotation="metalnap.io/cordoned")
+
+    def test_it_is_read_back(self):
+        _k, src = self.source({"metalnap.io/shed": "2026-09-18T01:17:34Z"})
+        self.assertEqual(src.state("node2").shed_at, 1789694254.0)
+
+    def test_absent_or_unparseable_reads_as_none(self):
+        _k, src = self.source({})
+        self.assertIsNone(src.state("node2").shed_at)
+        _k, src = self.source({"metalnap.io/shed": "soon"})
+        self.assertIsNone(src.state("node2").shed_at)
+
+    def test_it_is_written_as_metadata_only(self):
+        k, src = self.source({})
+        src.note("node2", "shed", 1789694254.0)
+        src.note("node2", "shed", None)
+        self.assertEqual(k.patches[0], {"metadata": {"annotations": {
+            "metalnap.io/shed": "2026-09-18T01:17:34+00:00"}}})
+        self.assertEqual(k.patches[1], {"metadata": {"annotations": {
+            "metalnap.io/shed": None}}})
+
+
+class _Sink:
+    """What the controller publishes each tick, kept."""
+
+    def __init__(self, fail=False):
+        self.reports, self.fail = [], fail
+
+    def publish(self, report):
+        if self.fail:
+            raise RuntimeError("the apiserver said no")
+        self.reports.append(report)
+
+    @property
+    def last(self):
+        return self.reports[-1]
+
+
+class World(Harness):
+    """A Harness whose cluster answers back, for the tests that span ticks.
+
+    A cordon changes the node, a soft shutdown takes it dark and a power-on
+    brings it up: the three effects a shed is made of, which the plain Harness
+    leaves each test to write by hand.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        #: Nodes that ignore a soft shutdown and stay up.
+        self.ignores_off = set()
+
+    def set_cordon(self, n, v):
+        super().set_cordon(n, v)
+        self.sequence.append(("cordon" if v else "uncordon", n))
+        self.states[n] = dataclasses.replace(
+            self.states[n], cordoned=v, ours=v,
+            ours_since=self.t if v else None)
+
+    @property
+    def power(self):
+        return _WorldPower(self)
+
+
+class _WorldPower(_Power):
+    def on(self, n):
+        super().on(n)
+        self.h.states[n] = dataclasses.replace(
+            self.h.states[n], ready=True, ready_since=self.h.t,
+            down_since=None)
+
+    def soft_off(self, n):
+        super().soft_off(n)
+        self.h.sequence.append(("off", n))
+        if n in self.h.ignores_off:
+            return
+        self.h.chassis[n] = "off"
+        self.h.states[n] = dataclasses.replace(
+            self.h.states[n], ready=False, ready_since=None,
+            down_since=self.h.t)
+
+
+class OrderedSpy(Spy):
+    """A notifier that writes into the world's sequence, so a test can say
+    which came first: the announcement or the power-off."""
+
+    def __init__(self, h, fail=False):
+        super().__init__(fail=fail)
+        self.h = h
+
+    def going_down(self, n):
+        super().going_down(n)
+        self.h.sequence.append(("down", n))
+
+
+class WarmSpy:
+    def __init__(self):
+        self.started, self.cleaned = [], []
+
+    def start(self, n):
+        self.started.append(n)
+
+    def done(self, n):
+        return True
+
+    def cleanup(self, n):
+        self.cleaned.append(n)
+
+
+def run(h, c, ticks, dt=60.0):
+    """`ticks` reconciles, `dt` apart; the clock moves after each."""
+    for _ in range(ticks):
+        c.tick()
+        h.t += dt
+
+
+def cordoned(h):
+    return [n for n, v in h.acted["cordon"] if v]
+
+
+def shed_notes(h):
+    return [(n, v) for n, k, v in h.acted["note"] if k == "shed"]
+
+
+def world(states, **kw):
+    h = World(states, **kw)
+    h.t = T0
+    return h
+
+
+#: The Harness sleeps an idle node at once -- no sustain window -- which would
+#: cordon the very nodes a "the ceiling did nothing" test is watching. Where
+#: the ceiling is meant to be the only thing that could, this switches the
+#: ordinary sleep off.
+ONLY_THE_CEILING = dict(sleep_sustain_s=10 ** 9)
+
+
+class TestCeilingFailsOpen(unittest.TestCase):
+    """An unreachable Prometheus never sheds a node; one that goes away in the
+    middle of an event lifts the ceiling at once."""
+
+    def test_a_raising_ceiling_sheds_nothing_and_says_so_once(self):
+        h = world({"a": node(), "b": node()},
+                  ceiling=RuntimeError("prometheus down"))
+        c = h.controller(**ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertEqual((h.acted["cordon"], h.acted["off"]), ([], []))
+        self.assertEqual(len(h.at_level("warn", "unavailable")), 1,
+                         "the outage was logged on every tick, or not at all")
+
+    def test_no_series_sheds_nothing(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        run(h, h.controller(**ONLY_THE_CEILING), 3)
+        self.assertEqual(h.acted["cordon"], [])
+
+    def test_an_error_releases_an_engaged_ceiling_on_the_same_tick(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller()
+        c.tick()
+        self.assertEqual(sorted(cordoned(h)), ["a", "b"])
+        h._ceiling = RuntimeError("prometheus down")
+        h.t += 60
+        c.tick()
+        self.assertEqual(sorted(n for n, v in shed_notes(h) if v is None),
+                         ["a", "b"], "the ceiling outlived its signal")
+
+    def test_an_error_lets_demand_wake_a_node_straight_away(self):
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+        h._ceiling = RuntimeError("prometheus down")
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_an_error_discards_the_hold_it_is_not_averaged_in(self):
+        """engaged, error, engaged-or-none must not leave the hold standing:
+        an unavailable reading is not a looser reading, it is no reading."""
+        # Busy, so the drains are still running when demand turns up and the
+        # mid-sleep rescue is the thing that shows whether a hold stands.
+        h = world({"a": node(), "b": node()}, ceiling=0,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller()
+        c.tick()                                  # engaged: both shed
+        h._ceiling = RuntimeError("prometheus down")
+        h.t += 60
+        c.tick()                                  # released
+        h._ceiling, h._shortfall = None, 400.0
+        h.t += 60
+        c.tick()                                  # no hold left to stand
+        self.assertIn(("a", False), h.acted["cordon"],
+                      "demand was still refused by a hold the error had "
+                      "already discarded")
+
+    def test_a_demand_signal_that_raises_does_not_stop_a_shed(self):
+        """The default shortfall is read off the Kubernetes API, not
+        Prometheus, so the two fail independently -- and a ceiling that waited
+        for demand to read would stop shedding whenever the demand path is
+        failing."""
+        h = world({"a": node(), "b": node()}, ceiling=0,
+                  shortfall=RuntimeError("scrape failed"))
+        c = h.controller()
+        for _ in range(4):
+            c.tick()                                # must not raise
+            h.t += 60
+        self.assertEqual(sorted(cordoned(h)), ["a", "b"])
+        self.assertEqual(sorted(h.acted["off"]), ["a", "b"],
+                         "the shed began and was never carried through")
+
+    def test_without_a_ceiling_a_raising_demand_signal_still_fails_the_tick(self):
+        """Unchanged: raising is treated as "do not act", which is safe."""
+        h = world({"a": node(), "b": node()}, ceiling=None,
+                  shortfall=RuntimeError("scrape failed"))
+        with self.assertRaises(RuntimeError):
+            h.controller().tick()
+
+    def test_the_ceiling_is_read_before_the_demand_signal(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        seen = []
+        h.shortfall = lambda: seen.append(h.ceiling_reads) or 0.0
+        h.controller().tick()
+        self.assertEqual(seen, [1], "the demand signal was read first")
+
+    def test_a_reading_is_clamped_to_the_pool_not_to_every_node(self):
+        """Nodes an operator holds are not the ceiling's to limit, so a reading
+        of 99 over three governed nodes and two held ones is a limit of three --
+        not four -- and one of two stays two."""
+        def states():
+            return {"a": node(), "b": node(), "c": node(),
+                    "d": node(cordoned=True, ours=False),
+                    "e": node(maintenance="firmware")}
+        for reading, limit, engaged in ((99, 3, False), (2, 2, True)):
+            with self.subTest(reading=reading):
+                h = world(states(), ceiling=reading)
+                sink = _Sink()
+                h.controller(nodes=("a", "b", "c", "d", "e"), metrics=sink,
+                             **ONLY_THE_CEILING).tick()
+                self.assertEqual((sink.last["limit"], sink.last["engaged"],
+                                  sink.last["pool"]), (limit, engaged, 3))
+
+    def test_nothing_of_a_tick_survives_into_one_that_returns_early(self):
+        """sleep(), maintain() and the power cycle read what the last tick
+        concluded. A tick that returns before the ceiling is read must not
+        leave a ceiling for them to act on."""
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(**ONLY_THE_CEILING)
+        c.tick()
+        self.assertTrue(c._engaged)
+        h.states["a"] = h.states["b"] = None   # no configured node exists
+        c.tick()
+        self.assertFalse(c._engaged)
+        self.assertIsNone(c._eff)
+
+    def test_mode_off_reads_nothing(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(mode="off")
+        run(h, c, 2)
+        self.assertEqual(h.ceiling_reads, 0)
+        self.assertEqual(h.acted["cordon"], [])
+
+    def test_a_reading_is_clamped_to_the_nodes_there_are(self):
+        h = world({"a": node(), "b": node()}, ceiling=99)
+        sink = _Sink()
+        h.controller(metrics=sink, **ONLY_THE_CEILING).tick()
+        self.assertEqual((sink.last["limit"], sink.last["engaged"]),
+                         (2, False))
+        self.assertEqual(h.acted["cordon"], [])
+
+
+class TestCeilingBlocksWakes(unittest.TestCase):
+    """While a ceiling is in force there are no wakes beyond it, even with
+    demand -- and the refused demand stays visible."""
+
+    def test_a_ceiling_of_zero_wakes_nothing_whatever_the_demand(self):
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        run(h, h.controller(), 3)
+        self.assertEqual(h.acted["on"], [], "woke a node past a ceiling of 0")
+
+    def test_refused_demand_stays_visible_in_the_log(self):
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        h.controller().tick()
+        seen = h.logged("observed")[-1]
+        self.assertEqual((seen["ceiling"], seen["want"], seen["wanted"]),
+                         (0, 0, 2))
+
+    def test_a_full_ceiling_wakes_nothing_more(self):
+        h = world({"a": node(), "b": asleep()}, shortfall=400.0, ceiling=1,
+                  busy={"a": ["j1"]})
+        run(h, h.controller(), 3)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_demand_under_the_ceiling_is_still_met_up_to_it(self):
+        """A ceiling that only ever refused would pass the tests above too."""
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=1)
+        run(h, h.controller(), 5)
+        self.assertEqual(h.acted["on"], ["a"], "one node of two was allowed")
+        self.assertIn(("a", False), h.acted["cordon"],
+                      "the node the ceiling allowed never entered service")
+
+    def test_the_fit_guard_cannot_hold_the_pool_above_the_ceiling(self):
+        """The guard assigns `want = min(wakeable, in_use)` when the waiting
+        work cannot run here, and that can exceed the ceiling. The clamp has
+        to come AFTER it. dry_run, so nothing is shed and the pool stays
+        over the ceiling for the clamp alone to answer for."""
+        h = world({"a": node(), "b": node()}, shortfall=60.0, fits=False,
+                  busy={"a": ["j1"], "b": ["j2"]}, ceiling=1)
+        h.controller(mode="dry_run").tick()
+        self.assertEqual(h.logged("observed")[-1]["want"], 1,
+                         "the fit guard overrode the ceiling")
+
+    def test_a_fit_check_that_fails_cannot_hold_the_pool_above_it_either(self):
+        h = world({"a": node(), "b": node()}, shortfall=60.0, ceiling=1,
+                  fits=RuntimeError("apiserver"))
+        h.controller(mode="dry_run").tick()
+        self.assertEqual(h.logged("observed")[-1]["want"], 1,
+                         "'holding the pool as it is' held it over the ceiling")
+
+    def test_saturation_is_clamped_like_the_rest(self):
+        h = world({"a": asleep(), "b": asleep()}, saturated=2, ceiling=0)
+        run(h, h.controller(), 3)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_no_mid_sleep_rescue_beyond_the_ceiling(self):
+        for ceiling, rescued in ((None, True), (0, False)):
+            with self.subTest(ceiling=ceiling):
+                h = world({"a": node(cordoned=True, ours=True,
+                                     ours_since=T0 - 10), "b": None},
+                          shortfall=400.0, ceiling=ceiling,
+                          busy={"a": ["j1"]})
+                c = h.controller()
+                c.st["a"] = {"phase": "sleeping", "phase_since": T0 - 10}
+                c.tick()
+                self.assertEqual(("a", False) in h.acted["cordon"], rescued)
+
+    def test_no_maintenance_window_takeover_beyond_the_ceiling(self):
+        for ceiling, taken in ((None, True), (0, False)):
+            with self.subTest(ceiling=ceiling):
+                h = world({"a": node(cordoned=True, ours=True,
+                                     ours_since=T0 - 10), "b": None},
+                          shortfall=400.0, ceiling=ceiling)
+                c = h.controller(**TestScheduledMaintenance.MAINT)
+                c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                             "maintenance_until": T0 + 300}
+                c.tick()
+                self.assertEqual(("a", False) in h.acted["cordon"], taken)
+
+    def test_the_stranded_repair_completes_the_sleep_not_the_wake(self):
+        """A Ready node under our cordon and in no operation is returned to
+        service when it is needed -- and not over a ceiling."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 1000),
+                   "b": None}, shortfall=400.0, ceiling=0)
+        c = h.controller()
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "returned a stranded node to service over the ceiling")
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        self.assertEqual(shed_notes(h), [("a", T0)])
+
+    def test_a_shadow_does_not_say_it_would_return_a_stranded_node_over_the_ceiling(self):
+        """The stranded repair reads `unguarded`, which the clamp has to reach
+        as well as `want`. Live, a shed takes the stranded node first and the
+        question never arises; a shadow does not shed, and it must still tell
+        the truth about what it would do."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 1000),
+                   "b": None}, shortfall=400.0, ceiling=0)
+        h.controller(mode="dry_run").tick()
+        self.assertFalse(h.logged("stranded node needed"),
+                         "would have returned a node to service over the "
+                         "ceiling")
+        self.assertTrue(h.logged("stranded node not needed"))
+
+    def test_only_a_shed_advances_while_demand_cannot_be_read(self):
+        """An ordinary drain was begun on demand that could be read. Finishing
+        it with the rescue switched off, on demand that cannot, is a decision
+        on a guess -- and without a ceiling the same outage meant no action at
+        all."""
+        h = world({"a": node(),
+                   "b": node(cordoned=True, ours=True, ours_since=T0 - 100),
+                   "c": asleep(), "d": asleep()},
+                  ceiling=2, shortfall=RuntimeError("scrape failed"))
+        c = h.controller(nodes=("a", "b", "c", "d"))
+        c.st["b"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        for _ in range(4):
+            c.tick()
+            h.t += 60
+        self.assertEqual(h.acted["off"], [], "finished an ordinary sleep on "
+                                             "demand nobody could read")
+        self.assertEqual(c.st["b"]["phase"], "sleeping")
+
+    def test_an_operators_cordon_is_still_honoured_while_demand_cannot_be_read(self):
+        h = world({"a": node(),
+                   "b": node(cordoned=True, ours=False),
+                   "c": asleep(), "d": asleep()},
+                  ceiling=2, shortfall=RuntimeError("scrape failed"))
+        c = h.controller(nodes=("a", "b", "c", "d"))
+        c.st["b"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        c.tick()
+        self.assertIsNone(c.st["b"]["phase"],
+                          "went on draining a node an operator had taken")
+
+    def test_nothing_that_depends_on_demand_is_decided_while_it_cannot_be_read(self):
+        """A failing demand signal lets the shed be seen through -- and no more.
+        The ordinary sleep of an idle node is a decision about demand, and
+        demand is unknown: only what the ceiling requires goes down."""
+        h = world({n: node() for n in ("a", "b", "c")}, ceiling=2,
+                  shortfall=RuntimeError("scrape failed"))
+        c = h.controller(nodes=("a", "b", "c"))
+        for _ in range(3):
+            c.tick()
+            h.t += 60
+        self.assertEqual(cordoned(h), ["c"],
+                         "slept nodes on a guess, with demand unreadable")
+
+    def test_wakes_are_gated_on_nodes_still_powered_including_draining(self):
+        """A shed node is cordoned, so it is not awake -- but it is drawing
+        power until it is off. Counting only awake nodes lets a budget ceiling
+        be exceeded for the length of a drain."""
+        h = Harness({"a": node(cordoned=True, ours=True, ours_since=T0 - 100,
+                               shed_at=T0 - 100),
+                     "b": asleep()}, shortfall=400.0, ceiling=1,
+                    chassis={"a": "on"})
+        h.t = T0
+        c = h.controller()
+        c.st["a"] = {"phase": "powering_off", "phase_since": T0 - 10}
+        c.tick()
+        self.assertEqual(h.acted["on"], [],
+                         "woke a second node while the first was still on")
+        h.states["a"] = dataclasses.replace(h.states["a"], ready=False)
+        h.chassis["a"] = "off"
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"],
+                         "kept refusing after the shed node was off")
+
+    def test_a_cold_boot_in_flight_counts_toward_the_gate(self):
+        h = Harness({"a": node(), "b": asleep(), "c": asleep()},
+                    shortfall=1000.0, ceiling=2, busy={"a": ["j1"]})
+        h.t = T0
+        run(h, h.controller(nodes=("a", "b", "c")), 4)
+        self.assertEqual(h.acted["on"], ["b"],
+                         "a second node was woken beside one already coming")
+
+
+class TestCeilingShedsAtOnce(unittest.TestCase):
+    """Excess nodes are put down through the ordinary sleep, but without
+    waiting out the timers that exist to hold evidence of DEMAND."""
+
+    NODES = ("a", "b", "c")
+
+    def three(self, **kw):
+        states = {n: node(ready_since=T0 - 10) for n in self.NODES}
+        return world(states, **kw)
+
+    def controller(self, h, **kw):
+        """The ceiling is meant to be the only thing that sleeps a node here:
+        the Harness would otherwise put an idle one down at once."""
+        return h.controller(nodes=self.NODES, **dict(ONLY_THE_CEILING, **kw))
+
+    def test_every_excess_node_is_cordoned_on_the_first_tick_in_reverse(self):
+        h = self.three(ceiling=1)
+        # The timers a shed must not wait out: all of them unmet.
+        c = self.controller(h, sleep_sustain_s=1200, min_uptime_s=2700)
+        c.tick()
+        self.assertEqual(cordoned(h), ["c", "b"],
+                         "not all at once, or not the end of the list first")
+        self.assertEqual(h.acted["off"], [], "a tick cordons; it does not "
+                                             "cut power in the same step")
+
+    def test_each_node_is_asked_whether_it_is_busy_once_a_tick(self):
+        """The shed order and the demand decisions ask about the same nodes,
+        and each ask is a listing against the work queue's API -- on the path
+        that runs during an emergency."""
+        h = self.three(ceiling=1)
+        self.controller(h).tick()
+        self.assertEqual(h.busy_calls, {"a": 1, "b": 1, "c": 1})
+
+    def test_none_beyond_the_excess(self):
+        h = self.three(ceiling=2)
+        self.controller(h).tick()
+        self.assertEqual(cordoned(h), ["c"])
+
+    def test_idle_nodes_go_before_busy_ones_even_when_the_busy_one_is_later(self):
+        h = self.three(ceiling=1, busy={"c": ["job"]})
+        self.controller(h).tick()
+        self.assertEqual(cordoned(h), ["b", "a"],
+                         "a node with a job on it went before idle ones")
+
+    def test_a_busy_node_is_shed_when_nothing_else_can_be(self):
+        h = self.three(ceiling=1, busy={"b": ["j1"], "c": ["j2"]})
+        self.controller(h).tick()
+        self.assertEqual(cordoned(h), ["a", "c"],
+                         "idle first, then busy -- each in reverse order")
+
+    def test_a_drain_already_under_way_goes_before_a_node_in_service(self):
+        """Left to finish, an ordinary drain takes its node down anyway -- so
+        shedding one in service beside it leaves the pool one under the ceiling
+        for nothing."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 100),
+                   "b": node(), "c": node()}, ceiling=2)
+        c = self.controller(h)
+        c.st["a"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        c.tick()
+        self.assertEqual(shed_notes(h), [("a", T0)])
+        self.assertEqual(cordoned(h), [], "shed a node in service as well")
+
+    def test_a_node_powered_for_nobody_goes_before_one_in_service(self):
+        """A visit serves nothing and costs power: it is the cheapest to lose.
+        Taken the other way round the visit ends of its own accord as well, and
+        the pool ends one under the ceiling."""
+        h = world({"a": node(),
+                   "b": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "c": node()}, ceiling=2)
+        c = self.controller(h, **TestScheduledMaintenance.MAINT)
+        c.st["b"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(shed_notes(h), [("b", T0)])
+        self.assertNotIn("c", cordoned(h))
+
+    def test_a_node_an_operator_put_back_is_not_picked_the_tick_it_is_spared(self):
+        """It lands in the drains list that tick -- still `sleeping` in memory,
+        its anchor just cleared -- and was picked in the same breath as the
+        log line that says the ceiling leaves it alone."""
+        h = self.three(ceiling=1)
+        c = self.controller(h)
+        c.tick()                                   # c and b are shed
+        self.assertEqual(sorted(cordoned(h)), ["b", "c"])
+        h.states["c"] = dataclasses.replace(h.states["c"], cordoned=False,
+                                            ours=False, ours_since=None)
+        h.t += 60
+        c.tick()
+        again = [v for n, v in shed_notes(h) if n == "c" and v is not None]
+        self.assertEqual(again, [T0], "shed the node it had just said it "
+                                      "would leave alone")
+        self.assertIn(("a", T0 + 60), shed_notes(h),
+                      "another node is shed in its place, since the ceiling "
+                      "still needs one")
+
+    def test_a_ceiling_that_loosens_holds_down_only_as_many_as_it_still_needs(self):
+        """Three nodes shed under a ceiling of 0 and asleep; the reading loosens
+        to 2. One is held down. The other two are merely asleep -- and `status`
+        and the metric must not say otherwise."""
+        h = self.three(ceiling=0)
+        sink = _Sink()
+        c = self.controller(h, ceiling_release_hold_s=0, metrics=sink)
+        for _ in range(5):
+            c.tick()
+            h.t += 60
+        self.assertEqual(sorted(sink.last["shed"]), ["a", "b", "c"])
+        h._ceiling = 2
+        c.tick()
+        self.assertEqual(sink.last["shed"], ["c"])
+        self.assertEqual([n for n, v in shed_notes(h) if v is None],
+                         ["a", "b"], "the first to be woken keep no note")
+
+    def test_a_cooldown_from_an_abandoned_sleep_does_not_protect_a_node(self):
+        h = self.three(ceiling=0)
+        c = self.controller(h)
+        c.st["b"] = {"cooldown_until": T0 + 99_999}
+        c.tick()
+        self.assertIn("b", cordoned(h))
+
+    def test_the_shed_is_recorded_on_the_node_with_the_time_it_began(self):
+        h = self.three(ceiling=1)
+        self.controller(h).tick()
+        self.assertEqual(sorted(shed_notes(h)), [("b", T0), ("c", T0)])
+
+    def test_it_finishes_the_ordinary_way_announced_before_it_is_off(self):
+        h = self.three(ceiling=2)
+        spy = OrderedSpy(h)
+        c = self.controller(h, notifier=spy)
+        run(h, c, 4)
+        self.assertEqual(h.acted["off"], ["c"])
+        seq = [e for e in h.sequence if e[1] == "c"]
+        self.assertLess(seq.index(("down", "c")), seq.index(("off", "c")),
+                        "powered off before announcing")
+
+    def test_a_shed_node_is_muted_like_a_sleep_and_never_trouble(self):
+        h = self.three(ceiling=2, shortfall=0.0)
+        spy = OrderedSpy(h)
+        c = self.controller(h, notifier=spy)
+        run(h, c, 12)
+        self.assertIn("c", spy.down, "a shed node was not muted")
+        self.assertEqual(spy.alerts, {}, "a shed node raised an alert")
+        self.assertIsNone(h.states["c"].trouble)
+        self.assertEqual(h.acted["cycle"], [], "a shed node was power-cycled")
+
+    def test_a_shed_node_stays_down_through_demand_until_the_ceiling_goes(self):
+        h = self.three(ceiling=2)
+        c = self.controller(h)
+        run(h, c, 5)
+        self.assertEqual(h.acted["off"], ["c"])
+        h._shortfall = 1000.0
+        run(h, c, 15)
+        self.assertEqual(h.acted["on"], [], "woke past the ceiling")
+        self.assertEqual(h.acted["cycle"], [])
+
+
+class TestCeilingBusyNodes(unittest.TestCase):
+    """Busy nodes get a graceful drain with a deadline -- the one place this
+    controller deliberately relaxes "never interrupt running work"."""
+
+    def one(self, **kw):
+        kw.setdefault("busy", {"a": ["job-1"]})
+        kw.setdefault("ceiling", 0)
+        return world({"a": node(ready_since=T0 - 10)}, **kw)
+
+    def drive(self, h, c, until):
+        """Tick once a minute until `until` seconds after the first tick."""
+        while h.t - T0 <= until:
+            c.tick()
+            h.t += 60
+
+    def test_it_is_cordoned_and_left_running_until_the_deadline(self):
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        self.drive(h, c, 599)
+        self.assertIn("a", cordoned(h))
+        self.assertEqual(h.acted["off"], [], "cut power to running work early")
+
+    def test_after_the_deadline_it_is_announced_and_soft_shut_down(self):
+        h = self.one()
+        spy = OrderedSpy(h)
+        c = h.controller(nodes=("a",), notifier=spy)
+        self.drive(h, c, 660)
+        self.assertEqual(h.acted["off"], ["a"])
+        self.assertLess(h.sequence.index(("down", "a")),
+                        h.sequence.index(("off", "a")))
+        self.assertEqual(c.forced_total, 1)
+        forced = h.at_level("error", "SHED FORCED")
+        self.assertEqual(len(forced), 1, "work ended without an error line")
+        self.assertEqual(forced[0]["units"], ["job-1"])
+
+    def test_the_deadline_is_exact(self):
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        c.tick()                                   # T0: the shed begins
+        h.t = T0 + 599
+        c.tick()
+        self.assertEqual(h.acted["off"], [])
+        h.t = T0 + 600
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_forced_shed_is_counted_when_it_is_confirmed_not_when_it_is_asked(self):
+        """A soft-off is a request. A node that ignores it has not been
+        interrupted, and a retry is not a second interruption: the error is
+        logged once per shed and the counter moves once, when the power-off is
+        confirmed."""
+        h = self.one()
+        h.ignores_off.add("a")
+        c = h.controller(nodes=("a",))
+        self.drive(h, c, 700)                  # asked at 600, and ignored
+        self.assertEqual(len(h.acted["off"]), 1)
+        self.assertEqual(c.forced_total, 0, "counted a request that was "
+                                            "ignored")
+        self.assertEqual(len(h.at_level("error", "SHED FORCED")), 1)
+        self.drive(h, c, 2200)                 # asked again, and ignored again
+        self.assertGreaterEqual(len(h.acted["off"]), 2)
+        self.assertEqual(c.forced_total, 0)
+        self.assertEqual(len(h.at_level("error", "SHED FORCED")), 1,
+                         "logged again for every retry of one shed")
+        h.ignores_off.discard("a")
+        self.drive(h, c, 3400)
+        self.assertEqual(c.forced_total, 1, "counted once per shed, whatever "
+                                            "it took")
+        self.assertEqual(h.states["a"].ready, False)
+
+    def test_a_deadline_of_zero_never_forces(self):
+        h = self.one()
+        c = h.controller(nodes=("a",), ceiling_drain_deadline_s=0)
+        self.drive(h, c, 20_000)
+        self.assertEqual(h.acted["off"], [], "forced with the deadline off")
+        self.assertEqual(c.forced_total, 0)
+
+    def test_a_shed_note_that_could_not_be_written_is_written_when_it_can(self):
+        """The drain deadline lives on the node, or a restart resets it. A write
+        that failed once is retried until the node agrees -- as the trouble note
+        is -- and not remembered as done."""
+        h = self.one()
+        h.shed_note_fails = 1
+        c = h.controller(nodes=("a",))
+        c.tick()
+        self.assertIsNone(h.states["a"].shed_at, "the write was meant to fail")
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.states["a"].shed_at, T0,
+                         "the anchor never reached the node, and a restart "
+                         "would hand a busy node a fresh deadline")
+        c.st = {}                              # and now a restart
+        h.t = T0 + 601
+        c.tick()
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_drain_on_a_node_cut_off_from_the_cluster_is_still_forced(self):
+        """NotReady is not off: a kubelet cut off from the API server leaves
+        its work running, and the node draws the power the ceiling is about.
+        It counts as powered, and past its deadline it is shut down like any
+        other -- announced first."""
+        h = world({"a": node(ready=False, cordoned=True, ours=True,
+                             ours_since=T0 - 100)},
+                  busy={"a": ["job-1"]}, ceiling=0)
+        spy = OrderedSpy(h)
+        c = h.controller(nodes=("a",), notifier=spy)
+        c.st["a"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        for t in (0, 300, 599):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual(h.acted["off"], [])
+        h.t = T0 + 600
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"], "a node cut off from the "
+                                                "cluster was never shed")
+        self.assertEqual(spy.down, ["a"])
+
+    def test_a_node_woken_under_a_ceiling_drops_the_anchor_of_the_shed_before_it(self):
+        """The anchor is a node's own record of THIS shed. One woken out of an
+        earlier shed, while the ceiling stays in force, and then shed again must
+        be given a fresh deadline -- not judged by one that expired before the
+        wake began. (Released and woken is the easy case: the release clears it.
+        This is the ceiling that never went away.)"""
+        h = world({"a": asleep(shed_at=T0 - 5000, ours_since=T0 - 5000),
+                   "b": asleep()}, shortfall=400.0, ceiling=1)
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        self.assertIn(("a", "shed", None),
+                      [(n, k, v) for n, k, v in h.acted["note"]],
+                      "woke a node and left it carrying the old shed's anchor")
+        h._ceiling = 0                  # tightens: it arrives into no room
+        h.t += 60
+        c.tick()
+        stamped = [v for n, v in shed_notes(h) if n == "a" and v is not None]
+        self.assertEqual(stamped, [T0 + 60],
+                         "shed again against the anchor of the shed before it")
+
+    def test_the_drain_timeout_does_not_return_a_shed_node_to_service(self):
+        """sleep()'s own exits both end in _abandon_sleep(), which uncordons,
+        and a shed that returns its node to service defeats the ceiling."""
+        h = self.one()
+        c = h.controller(nodes=("a",), drain_timeout_s=100)
+        self.drive(h, c, 500)
+        self.assertNotIn(("a", False), h.acted["cordon"])
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_the_attempt_bound_does_not_return_it_either(self):
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"sleep_attempts": 99}
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"])
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_the_deadline_survives_a_restart(self):
+        """In memory, a restart resets the deadline and a busy node is held for
+        as long as the controller keeps restarting."""
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        c.tick()
+        for t in (120, 240, 360, 480, 540):
+            h.t = T0 + t
+            c.st = {}                              # the process restarted
+            c.tick()
+        self.assertEqual(h.acted["off"], [])
+        h.t = T0 + 601
+        c.st = {}
+        c.tick()
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"],
+                         "a restart pushed the deadline out")
+        self.assertEqual(shed_notes(h), [("a", T0)],
+                         "the anchor was rewritten by a restart")
+
+    def test_a_drain_already_running_is_re_anchored_when_the_ceiling_engages(self):
+        """The cordon is as old as the node's last sleep. A deadline measured
+        from it would force a drain that began a second ago."""
+        h = self.one(ceiling=None)
+        h.states["a"] = node(cordoned=True, ours=True, ours_since=T0 - 5000)
+        c = h.controller(nodes=("a",), drain_timeout_s=99_999)
+        c.st["a"] = {"phase": "sleeping", "phase_since": T0 - 5000}
+        c.tick()                                   # an ordinary drain
+        h._ceiling = 0
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["off"], [], "forced a drain at engagement")
+        self.assertEqual(shed_notes(h), [("a", T0 + 60)])
+        h.t = T0 + 60 + 599
+        c.tick()
+        self.assertEqual(h.acted["off"], [])
+        h.t = T0 + 60 + 600
+        c.tick()
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_the_deadline_is_not_enforced_during_the_release_hold(self):
+        """A one-sample spike followed by a long hold must not force a busy
+        node off: the hold keeps nodes down, it does not justify killing
+        work."""
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        c.tick()                                   # the spike
+        h._ceiling = None
+        for t in range(60, 900, 60):               # the hold: 15 minutes
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual(h.acted["off"], [], "forced during the hold")
+        h.t = T0 + 900                             # the hold ends: released
+        c.tick()
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["off"], [])
+        self.assertNotIn(("a", False), h.acted["cordon"])
+
+    def test_a_node_spared_past_its_deadline_says_why_and_not_that_it_has_time(self):
+        h = self.one()
+        c = h.controller(nodes=("a",))
+        c.tick()
+        h._ceiling = None                      # the hold is what keeps it down
+        h.t = T0 + 700
+        c.tick()
+        said = h.logged("current reading no longer asks")
+        self.assertTrue(said, "past its deadline, and said nothing of why it "
+                              "was not forced")
+        self.assertFalse(h.logged("deadline has not passed")[1:],
+                         "said the deadline had not passed when it had")
+
+    def test_it_is_not_forced_if_the_reading_no_longer_asks_for_it(self):
+        """Two nodes, one busy and draining under a ceiling of 1; the reading
+        loosens to 2 -- nothing now needs to go, whatever the hold says."""
+        h = world({"a": node(ready_since=T0 - 10),
+                   "b": node(ready_since=T0 - 10)},
+                  busy={"b": ["job-1"]}, ceiling=0)
+        c = h.controller()
+        c.tick()
+        h._ceiling = 2
+        for t in range(60, 1200, 60):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual([n for n in h.acted["off"] if n == "b"], [])
+
+    def test_a_failed_announcement_blocks_the_power_off_past_the_deadline(self):
+        """metalnap does not power off a node it could not announce, and the
+        ceiling does not override that. The consequence is stated: a shed node
+        stays powered, and it is logged at error every tick."""
+        h = self.one()
+        c = h.controller(nodes=("a",), notifier=OrderedSpy(h, fail=True))
+        self.drive(h, c, 900)
+        self.assertEqual(h.acted["off"], [], "cut power to an unannounced node")
+        late = [kv for kv in h.at_level("error", "announce")]
+        self.assertGreaterEqual(len(late), 3,
+                                "not logged at error on every tick")
+
+    def test_a_busy_check_that_raises_reads_as_busy_until_the_deadline(self):
+        h = self.one(busy=RuntimeError("arc down"))
+        c = h.controller(nodes=("a",))
+        self.drive(h, c, 540)
+        self.assertEqual(h.acted["off"], [])
+        self.drive(h, c, 700)
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_idle_units_are_still_released_when_forced(self):
+        h = self.one(idle=["u1"], holds=False)
+        c = h.controller(nodes=("a",))
+        self.drive(h, c, 700)
+        self.assertEqual(h.acted["released"], ["u1"])
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_unit_that_gained_work_is_left_alone_but_does_not_stop_it(self):
+        h = self.one(idle=["u1"], holds=True)
+        c = h.controller(nodes=("a",))
+        self.drive(h, c, 700)
+        self.assertEqual(h.acted["released"], [], "released a unit with work")
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_node_that_ignores_the_shutdown_is_reported_and_never_forced(self):
+        h = self.one(busy=())
+        h.ignores_off.add("a")
+        spy = OrderedSpy(h)
+        c = h.controller(nodes=("a",), notifier=spy)
+        self.drive(h, c, 1500)
+        self.assertEqual(h.acted["cycle"], [], "a hard cut for a slow shutdown")
+        self.assertIn("a", spy.alerts, "the node that ignored it was not "
+                                       "reported")
+        self.assertGreaterEqual(len(h.acted["off"]), 2,
+                                "metalnap stopped asking")
+
+
+class TestCeilingTakesOnlyWhatItNeeds(unittest.TestCase):
+    """A shed ends running work after a deadline, and bypasses the drain
+    timeout that would hand a node back. Both are for a node the ceiling
+    needs gone -- not for every node that happens to be draining when it
+    engages, which is what the simulation caught: two nodes draining, a
+    ceiling of one, and the one that was not needed pinned cordoned for as long
+    as its hung work ran."""
+
+    def draining(self, **kw):
+        h = world({n: node(cordoned=True, ours=True, ours_since=T0 - 100)
+                   for n in ("a", "b")}, **kw)
+        return h
+
+    def test_only_as_many_drains_as_must_go_become_sheds(self):
+        h = self.draining(busy={"b": ["job"]}, ceiling=1)
+        c = h.controller(**ONLY_THE_CEILING)
+        for n in ("a", "b"):
+            c.st[n] = {"phase": "sleeping", "phase_since": T0 - 100}
+        c.tick()
+        self.assertEqual(shed_notes(h), [("a", T0)],
+                         "the idle one goes; the busy one is not needed gone")
+
+    def test_a_drain_the_ceiling_does_not_need_is_still_an_ordinary_drain(self):
+        """...with an ordinary drain's timeout, which hands it back."""
+        h = self.draining(busy={"b": ["job"]}, ceiling=1)
+        c = h.controller(**ONLY_THE_CEILING)
+        for n in ("a", "b"):
+            c.st[n] = {"phase": "sleeping", "phase_since": T0 - 100}
+        for t in range(0, 2000, 60):
+            h.t = T0 + t
+            c.tick()
+        self.assertIn(("b", False), h.acted["cordon"],
+                      "pinned cordoned by a shed the ceiling did not need")
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_a_shed_the_reading_no_longer_needs_is_given_back(self):
+        """The reading loosens while two busy nodes drain, and the hold runs
+        out: one is needed gone no longer. It returns to an ordinary drain --
+        the one earlier in the list, since the later one is the first to go --
+        and the other, which the ceiling still needs gone, is forced at its
+        deadline as it always was."""
+        h = world({"a": node(), "b": node()}, ceiling=0,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(ceiling_release_hold_s=300)
+        c.tick()
+        self.assertEqual(sorted(n for n, _t in shed_notes(h)), ["a", "b"])
+        h._ceiling = 1
+        for t in range(60, 1000, 60):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual([n for n, v in shed_notes(h) if v is None], ["a"],
+                         "gave back the wrong node, or none")
+        self.assertEqual(h.acted["off"], ["b"],
+                         "forced the node it gave back, or neither")
+
+
+class TestCeilingForcesOnlyWhatTheReadingStillAsks(unittest.TestCase):
+    def test_one_forced_node_is_enough_when_one_must_go(self):
+        """Three nodes, a ceiling that left a in service and shed b and c, both
+        busy. The reading loosens to two: past the deadline ONE of them has to
+        go, not both."""
+        h = world({n: node() for n in ("a", "b", "c")}, ceiling=1,
+                  busy={"a": ["j0"], "b": ["j1"], "c": ["j2"]})
+        c = h.controller(nodes=("a", "b", "c"))
+        c.tick()
+        self.assertEqual(sorted(cordoned(h)), ["b", "c"])
+        h._ceiling = 2
+        h.t = T0 + 600                       # the deadline, the hold running
+        c.tick()
+        self.assertEqual(len(h.acted["off"]), 1,
+                         "forced two nodes where the reading asks for one")
+        h.t += 60
+        c.tick()                              # the power-off is confirmed
+        self.assertEqual(c.forced_total, 1)
+
+
+class TestCeilingHysteresis(unittest.TestCase):
+    """Tighten at once, loosen reluctantly: the effective limit is the minimum
+    of the readings in the trailing hold, and a flapping signal must not cost a
+    wake and a sleep per flap."""
+
+    def test_it_tightens_on_the_first_reading(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(**ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertEqual(h.acted["cordon"], [])
+        h._ceiling = 0
+        c.tick()
+        self.assertEqual(sorted(cordoned(h)), ["a", "b"],
+                         "waited for evidence before tightening")
+
+    def test_a_flapping_signal_costs_no_wake_and_sleep_cycle(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller()
+        for i, reading in enumerate([0, None] * 5):
+            h._ceiling = reading
+            h._shortfall = 400.0 if i >= 3 else 0.0
+            c.tick()
+            h.t += 60
+        self.assertEqual(h.acted["on"], [], "woke a node on a None reading")
+        self.assertEqual(sorted(h.acted["off"]), ["a", "b"],
+                         "each node should go down exactly once")
+        self.assertEqual([n for n, v in h.acted["cordon"] if not v], [])
+
+    def test_it_releases_only_after_the_hold_and_wakes_nothing_by_itself(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(wake_sustain_s=120)
+        c.tick()                                     # T0: engaged
+        h._ceiling, h._shortfall = None, 400.0
+        for t in (60, 120, 600, 840):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual(h.acted["on"], [], "released before the hold ran out")
+        self.assertEqual([k for _n, k, v in h.acted["note"]
+                          if k == "shed" and v is None], [])
+        h.t = T0 + 900
+        c.tick()                                     # the hold has run out
+        self.assertEqual(sorted(n for n, v in shed_notes(h) if v is None),
+                         ["a", "b"], "the notes outlived the ceiling")
+        self.assertEqual(h.acted["on"], [],
+                         "waking at the release, with no sustained demand")
+        h.t = T0 + 1019
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+        h.t = T0 + 1020
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"],
+                         "demand did not wake a node through the usual window")
+
+    def test_a_looser_reading_waits_out_the_hold_too(self):
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        c = h.controller()
+        c.tick()
+        h._ceiling = 1
+        for t in (60, 600, 899):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual(h.acted["on"], [], "loosened before the hold")
+        h.t = T0 + 900
+        run(h, c, 6)
+        self.assertEqual(h.acted["on"], ["a"], "one node of two was allowed")
+
+
+class TestCeilingInteractions(unittest.TestCase):
+    def test_held_and_maintenance_nodes_are_neither_shed_nor_counted(self):
+        def states():
+            return {"a": node(), "b": node(cordoned=True, ours=False),
+                    "c": node(maintenance="kernel")}
+        nodes = ("a", "b", "c")
+        # A ceiling of 1 over a pool of ONE: nothing to shed. Counting the
+        # exempt nodes would shed a, the only node the ceiling governs.
+        h = world(states(), ceiling=1)
+        run(h, h.controller(nodes=nodes, **ONLY_THE_CEILING), 3)
+        self.assertEqual(h.acted["cordon"], [])
+        h = world(states(), ceiling=0)
+        c = h.controller(nodes=nodes, **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual(cordoned(h), ["a"], "touched an exempt node")
+        said = h.logged("capacity ceiling")
+        self.assertTrue(any(kv.get("exempt") == ["b", "c"] for kv in said),
+                        "the log does not say how many nodes are exempt")
+
+    def test_a_shed_in_flight_is_abandoned_when_an_operator_cordons(self):
+        h = world({"a": node(), "b": node()}, ceiling=0,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller()
+        c.tick()
+        h.states["a"] = dataclasses.replace(h.states["a"], ours=False,
+                                            ours_since=None)
+        h.t += 60
+        c.tick()
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertNotIn("a", h.acted["off"])
+        self.assertIn(("a", "shed", None),
+                      [(n, k, v) for n, k, v in h.acted["note"]],
+                      "an exempt node kept its shed note")
+
+    def test_an_operator_uncordon_mid_shed_is_not_fought(self):
+        """The ceiling does not fight a person: the node they put back into
+        service is left alone, and another is shed in its place if the ceiling
+        still needs one."""
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller()
+        c.tick()
+        # kubectl uncordon: the cordon goes; our mark is left behind for the
+        # controller to clear, which is what disown() does.
+        h.states["a"] = dataclasses.replace(h.states["a"], cordoned=False,
+                                            ours=False, ours_since=None)
+        for _ in range(5):
+            h.t += 60
+            c.tick()
+        self.assertEqual(cordoned(h).count("a"), 1,
+                         "re-cordoned a node an operator had just put back")
+        self.assertIn("b", h.acted["off"], "the rest of the shed went on")
+        self.assertTrue(h.logged("leaves it alone"),
+                        "the ceiling did not say it was standing aside")
+
+    def test_a_wake_that_arrives_into_a_full_ceiling_is_shed_not_served(self):
+        """A booting OS cannot be asked to shut down, so a wake already in
+        flight is let to arrive. It is then not put into service and not
+        warmed -- shed, the tick it is Ready, in place of the node that was
+        already serving."""
+        warm = WarmSpy()
+        h = world({"a": asleep(), "b": node()}, shortfall=400.0, ceiling=None,
+                  busy={"b": ["j"]})
+        c = h.controller(warmup=warm)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+        h._ceiling = 1
+        h.t += 60
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "put a node into service over the ceiling")
+        self.assertEqual(warm.started, [], "warmed a node about to be shed")
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        self.assertIn(("a", T0 + 60), shed_notes(h))
+        self.assertNotIn("b", cordoned(h), "shed the node in service instead "
+                                           "of the one that had just arrived")
+
+    def test_a_wake_that_arrives_between_the_look_and_its_own_read(self):
+        """The wake finishes on a fresh read of the node, as the power cycle
+        does, and that read can find it Ready when this tick's observation did
+        not. It completes without being put into service."""
+        warm = WarmSpy()
+        h = Harness({"a": asleep(), "b": node()}, ceiling=1,
+                    busy={"b": ["j"]})
+        h.t = T0
+        h.fresh["a"] = node(ready=True, cordoned=True, ours=True)
+        c = h.controller(warmup=warm)
+        c.st["a"] = {"phase": "waking", "phase_since": T0, "booting": True}
+        c.tick()
+        self.assertNotIn(("a", False), h.acted["cordon"])
+        self.assertEqual(warm.started, [])
+        self.assertIsNone(c.st["a"]["phase"])
+        self.assertTrue(h.logged("leaves no room"))
+
+    def test_a_warming_node_is_cleaned_up_then_shed(self):
+        warm = WarmSpy()
+        h = world({"a": node()}, ceiling=0)
+        c = h.controller(nodes=("a",), warmup=warm)
+        c.st["a"] = {"phase": "warming", "phase_since": T0}
+        c.tick()
+        self.assertEqual(warm.cleaned, ["a"])
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_a_visit_is_ended_at_once_through_the_ordinary_sleep(self):
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10)},
+                  ceiling=0)
+        c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping",
+                         "the visit was left to run out its window")
+        self.assertNotIn("maintenance_until", c.st["a"])
+        self.assertIn(("a", True), h.acted["cordon"],
+                      "ended without refreshing the cordon its drain anchors")
+
+    def test_a_visit_ends_even_while_the_ceiling_has_room(self):
+        """A visit powers hardware on for nobody, so none runs while a ceiling
+        is in force -- whether or not it is binding on this node."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "b": asleep()}, ceiling=1)
+        c = h.controller(**TestScheduledMaintenance.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+        self.assertEqual(shed_notes(h), [], "an ordinary end to a visit was "
+                                            "recorded as a shed")
+
+    def test_a_visit_still_booting_is_ended_the_moment_it_arrives(self):
+        h = Harness({"a": asleep()}, ceiling=0, chassis={"a": "on"})
+        h.t = T0
+        c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "maintaining",
+                         "tore down a node that was still booting")
+        h.states["a"] = node(cordoned=True, ours=True, ours_since=T0 - 500)
+        h.t += 60
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_a_node_already_powering_off_is_left_alone(self):
+        h = Harness({"a": node(cordoned=True, ours=True, ours_since=T0 - 50)},
+                    ceiling=0, chassis={"a": "on"})
+        h.t = T0
+        c = h.controller(nodes=("a",))
+        c.st["a"] = {"phase": "powering_off", "phase_since": T0 - 5}
+        c.tick()
+        self.assertEqual(h.acted["off"], [], "asked a shutting-down node again")
+        self.assertEqual(c.st["a"]["phase"], "powering_off")
+
+    def test_a_cold_boot_is_not_shed_in_place_of_a_node_in_service(self):
+        h = world({"a": node(), "b": asleep()}, shortfall=400.0, ceiling=None,
+                  busy={"a": ["j1"]})
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"])
+        h._ceiling = 1
+        for _ in range(4):
+            h.t += 60
+            c.tick()
+        self.assertNotIn("a", cordoned(h),
+                         "shed a busy node in service to make room for a "
+                         "node still booting")
+        self.assertEqual([n for n, _t in shed_notes(h)], ["b"],
+                         "the node that arrived was not the one shed")
+
+    def test_a_wedged_wake_is_not_power_cycled_while_a_ceiling_is_engaged(self):
+        """A cycle would power back on a node the ceiling wants down. It is
+        handed to a human like any wedged node instead."""
+        for ceiling, cycled in ((None, True), (1, False)):
+            with self.subTest(ceiling=ceiling):
+                h = Harness({"a": crashed(), "b": node()}, ceiling=ceiling,
+                            busy={"b": ["j"]}, chassis={"a": "on"})
+                h.t = T0
+                c = h.controller()
+                c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                             "booting": False}
+                c.tick()
+                self.assertEqual(h.acted["cycle"], ["a"] if cycled else [])
+                if not cycled:
+                    self.assertIn("ceiling", c.st["a"]["trouble"])
+
+    def test_an_operators_maintenance_power_on_is_not_blocked_by_a_ceiling(self):
+        """A person asked. The node is exempt from the ceiling, and nothing a
+        ceiling does stands between them and the machine."""
+        h = world({"a": held(asleep(), reason="firmware"), "b": node()},
+                  ceiling=0)
+        c = h.controller()
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"],
+                         "a ceiling stood in the way of a person's request")
+
+    def test_a_ceiling_that_does_not_limit_the_pool_holds_nothing_back(self):
+        """A standing budget above the pool is no ceiling in practice, and must
+        not hold scheduled visits or a wedged node's power cycle back."""
+        h = world({"a": asleep(), "b": None}, ceiling=5)
+        c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"], "a visit was held back by a "
+                                               "ceiling that limits nothing")
+        h = Harness({"a": crashed()}, shortfall=400.0, chassis={"a": "on"},
+                    ceiling=5)
+        h.t = T0
+        c = wedged(h, h.controller(nodes=("a",)))
+        self.assertEqual(h.acted["cycle"], ["a"],
+                         "the cycle was refused for a ceiling above the pool")
+
+    def test_visits_held_back_by_a_ceiling_say_so_once(self):
+        h = world({"a": asleep(), "b": None}, ceiling=0)
+        c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
+        run(h, c, 4)
+        self.assertEqual(len(h.logged("visits are held back")), 1)
+
+    def test_dry_run_logs_what_it_would_shed_and_touches_nothing(self):
+        spy, sink, status = Spy(), _Sink(), _Sink()
+        h = world({"a": node(), "b": node()}, ceiling=1)
+        c = h.controller(mode="dry_run", notifier=spy, metrics=sink,
+                         status=status, **ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertEqual((h.acted["cordon"], h.acted["note"], h.acted["off"],
+                          h.acted["on"]), ([], [], [], []))
+        self.assertEqual((spy.down, spy.alerts), ([], {}))
+        self.assertEqual(len(h.logged("would shed")), 1,
+                         "a shadow should say it once per change")
+        self.assertEqual(status.reports, [], "wrote outside the process")
+        self.assertEqual((sink.last["engaged"], sink.last["shed"]),
+                         (True, []))
+        h._ceiling = 0                # tightens at once: a different decision
+        c.tick()
+        self.assertEqual(len(h.logged("would shed")), 2,
+                         "a changed decision was not said")
+
+    def test_dry_run_says_it_would_not_wake_and_live_says_it_is_not_waking(self):
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        h.controller(mode="dry_run").tick()
+        self.assertTrue(h.logged("would not wake"))
+        h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
+        h.controller().tick()
+        self.assertTrue(h.logged("not waking"))
+
+    def test_a_failing_status_write_never_stops_a_shed(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(status=_Sink(fail=True), metrics=_Sink(fail=True))
+        run(h, c, 4)
+        self.assertEqual(sorted(cordoned(h)), ["a", "b"])
+        self.assertEqual(sorted(h.acted["off"]), ["a", "b"])
+        self.assertEqual(len(h.at_level("warn", "status")), 1,
+                         "the failure was not logged, or logged every tick")
+
+    def test_status_is_written_only_when_the_controller_is_live(self):
+        for mode, written in (("on", True), ("dry_run", False)):
+            with self.subTest(mode=mode):
+                status = _Sink()
+                h = world({"a": node()}, ceiling=None)
+                h.controller(nodes=("a",), mode=mode, status=status).tick()
+                self.assertEqual(bool(status.reports), written)
+
+
+class TestCeilingReport(unittest.TestCase):
+    """What the controller publishes -- to metrics, and to the status object
+    `metalnap status` reads."""
+
+    def test_nothing_in_force(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        sink = _Sink()
+        h.controller(metrics=sink).tick()
+        r = sink.last
+        self.assertEqual((r["engaged"], r["limit"], r["signal"],
+                          r["signal_ok"], r["shed"], r["draining"]),
+                         (False, None, None, True, [], []))
+
+    def test_engaged_and_draining_with_the_time_it_will_be_forced(self):
+        h = world({"a": node(), "b": node()}, ceiling=0, busy={"a": ["j1"]})
+        sink = _Sink()
+        c = h.controller(metrics=sink)
+        c.tick()
+        r = sink.last
+        self.assertEqual((r["engaged"], r["limit"], r["signal"], r["pool"],
+                          r["since"]), (True, 0, 0, 2, T0))
+        self.assertEqual(sorted(r["shed"]), ["a", "b"])
+        h.t += 60
+        c.tick()
+        h.t += 60
+        c.tick()
+        self.assertEqual(sink.last["draining"],
+                         [{"node": "a", "until": T0 + 600}])
+        self.assertEqual(sorted(sink.last["shed"]), ["a", "b"],
+                         "nodes asleep under the ceiling are still shed")
+
+    def test_unavailable_is_reported_as_no_ceiling(self):
+        h = world({"a": node(), "b": node()}, ceiling=RuntimeError("down"))
+        sink = _Sink()
+        h.controller(metrics=sink).tick()
+        r = sink.last
+        self.assertEqual((r["signal_ok"], r["engaged"], r["limit"],
+                          r["signal"]), (False, False, None, None))
+
+    def test_the_hold_reports_the_limit_it_is_holding(self):
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        sink = _Sink()
+        c = h.controller(metrics=sink)
+        c.tick()
+        h._ceiling = None
+        h.t += 60
+        c.tick()
+        r = sink.last
+        self.assertEqual((r["engaged"], r["limit"], r["signal"]),
+                         (True, 0, None))
+
+    def test_since_survives_a_restart(self):
+        """From the notes on the nodes, not from the process: an operator
+        reading `metalnap status` after a restart is told when it began."""
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        sink = _Sink()
+        c = h.controller(metrics=sink)
+        c.tick()
+        h.t += 3600
+        c.st = {}
+        c.tick()
+        self.assertEqual(sink.last["since"], T0)
+
+    def test_exempt_nodes_are_listed(self):
+        h = world({"a": node(), "b": node(cordoned=True, ours=False)},
+                  ceiling=0)
+        sink = _Sink()
+        h.controller(metrics=sink).tick()
+        self.assertEqual(sink.last["exempt"], ["b"])
+        self.assertEqual(sink.last["pool"], 1)
+
+    def test_forced_sheds_are_counted(self):
+        h = world({"a": node()}, ceiling=0, busy={"a": ["j1"]})
+        sink = _Sink()
+        c = h.controller(nodes=("a",), metrics=sink)
+        for t in (0, 60, 600, 660):
+            h.t = T0 + t
+            c.tick()
+        self.assertEqual(sink.last["forced"], 1)
+
+
+class TestMetrics(unittest.TestCase):
+    def report(self, **kw):
+        base = dict(configured=True, mode="on", engaged=False, limit=None,
+                    signal=None, signal_ok=True, since=None, pool=2, shed=[],
+                    draining=[], exempt=[], forced=0)
+        base.update(kw)
+        return base
+
+    def lines(self, m):
+        return [ln for ln in m.render().splitlines()
+                if ln and not ln.startswith("#")]
+
+    def test_before_the_first_tick_nothing_is_engaged(self):
+        from metalnap.metrics import Metrics
+        got = self.lines(Metrics())
+        self.assertIn("metalnap_capacity_ceiling_engaged 0", got)
+        self.assertIn("metalnap_capacity_ceiling_signal_ok 1", got)
+        self.assertIn("metalnap_nodes_shed 0", got)
+        self.assertIn("metalnap_shed_forced_total 0", got)
+
+    def test_the_limit_is_absent_when_there_is_none(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        m.publish(self.report())
+        self.assertFalse([ln for ln in self.lines(m)
+                          if ln.startswith("metalnap_capacity_ceiling ")],
+                         "reported a limit where there is none")
+        m.publish(self.report(limit=0, engaged=True))
+        self.assertIn("metalnap_capacity_ceiling 0", self.lines(m))
+
+    def test_engaged_shed_forced_and_unavailable(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        m.publish(self.report(engaged=True, limit=1, shed=["a", "b"],
+                              forced=3, signal_ok=False))
+        got = self.lines(m)
+        for want in ("metalnap_capacity_ceiling 1",
+                     "metalnap_capacity_ceiling_engaged 1",
+                     "metalnap_capacity_ceiling_signal_ok 0",
+                     "metalnap_nodes_shed 2", "metalnap_shed_forced_total 3"):
+            self.assertIn(want, got)
+
+    def test_every_metric_is_typed_and_the_counter_is_a_counter(self):
+        from metalnap.metrics import Metrics
+        text = Metrics().render()
+        for name in ("metalnap_capacity_ceiling",
+                     "metalnap_capacity_ceiling_engaged",
+                     "metalnap_capacity_ceiling_signal_ok",
+                     "metalnap_nodes_shed"):
+            self.assertIn("# TYPE %s gauge" % name, text)
+        self.assertIn("# TYPE metalnap_shed_forced_total counter", text)
+        for ln in self.lines(Metrics()):
+            self.assertRegex(ln, r"^[a-z_]+ -?[0-9]+$")
+
+    def test_it_serves_the_text_format_over_http(self):
+        import urllib.error
+        import urllib.request
+        from metalnap.metrics import Metrics, serve
+        m = Metrics()
+        m.publish(self.report(engaged=True, limit=0, shed=["a"]))
+        server = serve(m, 0, host="127.0.0.1")
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            with urllib.request.urlopen(base + "/metrics", timeout=5) as r:
+                body = r.read().decode()
+                self.assertEqual(r.status, 200)
+                self.assertTrue(r.headers["Content-Type"]
+                                .startswith("text/plain; version=0.0.4"))
+            self.assertEqual(body, m.render())
+            self.assertIn("metalnap_nodes_shed 1", body)
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(base + "/elsewhere", timeout=5)
+            self.assertEqual(err.exception.code, 404)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestMetricsListensOnEveryInterface(unittest.TestCase):
+    def test_the_default_host_is_reachable_from_the_pod_network(self):
+        """No host means every interface -- which is how a scraper reaches a
+        pod -- over IPv4 whether or not the machine has IPv6."""
+        import urllib.request
+        from metalnap.metrics import Metrics, serve
+        server = serve(Metrics(), 0)
+        try:
+            url = "http://127.0.0.1:%d/metrics" % server.server_address[1]
+            with urllib.request.urlopen(url, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestMetricsDropsAConnectionThatSaysNothing(unittest.TestCase):
+    def test_a_silent_connection_does_not_hold_a_thread_for_ever(self):
+        """The listener lives in the process that makes every call to the
+        cluster and the BMCs. A client that connects and says nothing must not
+        be able to hold a thread and a descriptor in it indefinitely."""
+        import socket
+        from metalnap.metrics import Metrics, serve
+        server = serve(Metrics(), 0, host="127.0.0.1", timeout=0.3)
+        try:
+            with socket.create_connection(
+                    ("127.0.0.1", server.server_address[1]), timeout=5) as c:
+                self.assertEqual(c.recv(10), b"",
+                                 "held a silent connection open")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class _FakeKube:
+    """The three calls ConfigMapStatus makes, against one stored object."""
+
+    def __init__(self, fail=None):
+        self.cm = {"metadata": {"name": "metalnap-status", "namespace": "ops",
+                                "resourceVersion": "7"},
+                   "data": {"other": "kept"}}
+        self.calls, self.fail = [], fail
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path))
+        if self.fail:
+            raise self.fail
+        if method == "GET":
+            return json.loads(json.dumps(self.cm))
+        self.cm = json.loads(json.dumps(body))
+        return self.cm
+
+    def puts(self):
+        return [c for c in self.calls if c[0] == "PUT"]
+
+
+class TestConfigMapStatus(unittest.TestCase):
+    PATH = "/api/v1/namespaces/ops/configmaps/metalnap-status"
+
+    def writer(self, kube, clock):
+        from metalnap.status import ConfigMapStatus
+        return ConfigMapStatus(kube, "ops", "metalnap-status", clock=clock,
+                               refresh_s=300)
+
+    def test_it_replaces_the_object_it_read_and_keeps_what_else_is_in_it(self):
+        """get/update, the verbs the chart grants: a replace, not a patch."""
+        kube, now = _FakeKube(), [1000.0]
+        self.writer(kube, lambda: now[0]).publish({"engaged": True, "limit": 0})
+        self.assertEqual(kube.calls, [("GET", self.PATH), ("PUT", self.PATH)])
+        self.assertEqual(kube.cm["metadata"]["resourceVersion"], "7")
+        self.assertEqual(kube.cm["data"]["other"], "kept")
+        body = json.loads(kube.cm["data"]["ceiling"])
+        self.assertEqual((body["engaged"], body["limit"], body["updated"],
+                          body["refresh_s"]), (True, 0, 1000.0, 300))
+
+    def test_an_unchanged_report_is_not_rewritten_until_it_is_due(self):
+        kube, now = _FakeKube(), [1000.0]
+        w = self.writer(kube, lambda: now[0])
+        w.publish({"engaged": False})
+        now[0] += 60
+        w.publish({"engaged": False})
+        self.assertEqual(len(kube.puts()), 1, "wrote an unchanged report")
+        now[0] += 300
+        w.publish({"engaged": False})
+        self.assertEqual(len(kube.puts()), 2,
+                         "never refreshed, so a dead controller looks alive")
+
+    def test_a_changed_report_is_written_at_once(self):
+        kube, now = _FakeKube(), [1000.0]
+        w = self.writer(kube, lambda: now[0])
+        w.publish({"engaged": False})
+        now[0] += 60
+        w.publish({"engaged": True})
+        self.assertEqual(len(kube.puts()), 2)
+
+    def test_a_failed_write_raises_and_is_retried_next_time(self):
+        kube, now = _FakeKube(fail=RuntimeError("forbidden")), [1000.0]
+        w = self.writer(kube, lambda: now[0])
+        with self.assertRaises(RuntimeError):
+            w.publish({"engaged": True})
+        kube.fail = None
+        now[0] += 60
+        w.publish({"engaged": True})
+        self.assertEqual(len(kube.puts()), 1,
+                         "a write that failed was remembered as written")
+
+
+class TestCeilingWiring(unittest.TestCase):
+    """python -m metalnap builds the ceiling from the environment."""
+
+    ENV = {"NODES": "a,b", "BMC_HOST_FMT": "{node}-bmc.", "BMC_USER": "u",
+           "BMC_PASS": "p", "PROM_URL": "http://prom", "MODE": "dry_run"}
+
+    def build(self, **extra):
+        from metalnap import __main__ as entry
+        built = {}
+        saved = dict(os.environ)
+        real = entry.Controller.run_forever
+        entry.Controller.run_forever = lambda c: built.update(c=c)
+        try:
+            for k in [k for k in os.environ if k.startswith(
+                    ("CEILING_", "STATUS_", "METRICS_"))]:
+                del os.environ[k]
+            os.environ.update(self.ENV, **extra)
+            entry.main([])
+        finally:
+            entry.Controller.run_forever = real
+            os.environ.clear()
+            os.environ.update(saved)
+        return built["c"]
+
+    def test_no_ceiling_unless_one_is_asked_for(self):
+        c = self.build()
+        self.assertIsInstance(c.ceiling, NullCeiling)
+        self.assertIsNone(c.status)
+
+    def test_a_query_reads_the_prometheus_the_demand_signal_reads(self):
+        c = self.build(CEILING_QUERY="vector(0)")
+        self.assertIsInstance(c.ceiling, PrometheusCeiling)
+        self.assertEqual((c.ceiling.url, c.ceiling.query),
+                         ("http://prom", "vector(0)"))
+
+    def test_a_static_zero_is_a_ceiling(self):
+        c = self.build(CEILING_STATIC="0")
+        self.assertIsInstance(c.ceiling, StaticCeiling)
+        self.assertEqual(c.ceiling.limit(), 0)
+
+    def test_both_sources_are_refused_at_start(self):
+        with self.assertRaises(ValueError):
+            self.build(CEILING_QUERY="vector(0)", CEILING_STATIC="1")
+
+    def test_the_status_object_is_named_by_the_chart_and_found_in_its_namespace(self):
+        import tempfile
+        from metalnap import __main__ as entry
+        from metalnap.status import ConfigMapStatus
+        with tempfile.TemporaryDirectory() as sa:
+            with open(os.path.join(sa, "namespace"), "w") as f:
+                f.write("ops\n")
+            real = entry.Kube
+            entry.Kube = lambda **kw: real(sa=sa, **kw)
+            try:
+                c = self.build(CEILING_STATIC="0",
+                               STATUS_CONFIGMAP="metalnap-status")
+            finally:
+                entry.Kube = real
+        self.assertIsInstance(c.status, ConfigMapStatus)
+        self.assertEqual((c.status.namespace, c.status.name),
+                         ("ops", "metalnap-status"))
+
+    def test_a_metrics_port_that_is_not_one_stops_the_start(self):
+        """The range the chart's schema enforces, held at runtime too: a direct
+        deployment never meets the schema, and the container is unprivileged,
+        so a port below 1024 would start a pod that never listens."""
+        for bad in ("abc", "-1", "80", "1023", "65536", "9100.5"):
+            with self.subTest(port=bad), self.assertRaises(SystemExit) as e:
+                self.build(METRICS_PORT=bad)
+            self.assertIn("METRICS_PORT", str(e.exception))
+
+    def test_the_edges_of_the_allowed_metrics_ports_are_allowed(self):
+        from metalnap import __main__ as entry
+        real = entry.serve_metrics
+        entry.serve_metrics = lambda m, port: None
+        try:
+            for ok in ("0", "1024", "65535"):
+                with self.subTest(port=ok):
+                    self.build(METRICS_PORT=ok)
+        finally:
+            entry.serve_metrics = real
+
+    def test_a_status_object_that_cannot_find_its_namespace_stops_the_start(self):
+        """Skipped, it would read as "has not written its status yet" in
+        `metalnap status` for ever -- the wrong reason. The namespace is read
+        from the directory the token every call to the cluster needs is in, so
+        a pod that cannot read one is not a controller to speak of."""
+        import tempfile
+        from metalnap import __main__ as entry
+        with tempfile.TemporaryDirectory() as empty:
+            real = entry.Kube
+            entry.Kube = lambda **kw: real(sa=empty, **kw)
+            try:
+                with self.assertRaises(SystemExit) as e:
+                    self.build(CEILING_STATIC="0",
+                               STATUS_CONFIGMAP="metalnap-status")
+            finally:
+                entry.Kube = real
+        self.assertIn("STATUS_CONFIGMAP", str(e.exception))
+
+    def test_metrics_listen_only_when_a_port_is_set(self):
+        from metalnap import __main__ as entry
+        served = []
+        real = entry.serve_metrics
+        entry.serve_metrics = lambda m, port: served.append(port)
+        try:
+            c = self.build()
+            self.assertEqual((served, c.metrics is None), ([], True))
+            self.build(METRICS_PORT="0")
+            self.assertEqual(served, [])
+            c = self.build(METRICS_PORT="9100")
+            self.assertEqual(served, [9100])
+            self.assertIsNotNone(c.metrics)
+        finally:
+            entry.serve_metrics = real
 
 
 if __name__ == "__main__":

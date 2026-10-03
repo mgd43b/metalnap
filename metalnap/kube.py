@@ -292,6 +292,7 @@ class KubeNodeSource:
             maintenance=maintenance,
             maintenance_started_at=_timestamp(
                 notes.get("maintenance-started")),
+            shed_at=_timestamp(notes.get("shed")),
         )
 
     def set_cordon(self, name, cordoned):

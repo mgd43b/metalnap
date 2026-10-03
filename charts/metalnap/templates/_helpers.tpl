@@ -24,6 +24,20 @@ app.kubernetes.io/name: {{ include "metalnap.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{- /*
+  Is a capacity ceiling configured? Non-empty (and so true) if a query is set or
+  a static value is. `static: 0` IS a ceiling -- shed everything -- so the test
+  is for null, never for truthiness: `if .static` and `default` both read 0 as
+  unset, in the one case that matters most.
+*/ -}}
+{{- define "metalnap.ceilingEnabled" -}}
+{{- if or .Values.capacityCeiling.query (not (kindIs "invalid" .Values.capacityCeiling.static)) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "metalnap.statusName" -}}
+{{- printf "%s-status" (include "metalnap.fullname" .) -}}
+{{- end -}}
+
 {{- define "metalnap.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "metalnap.fullname" .) .Values.serviceAccount.name -}}

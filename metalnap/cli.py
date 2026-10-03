@@ -20,7 +20,9 @@ and its own configuration -- the node list, the cordon annotation, the mode --
 is read from there, so `status` judges a cordon exactly the way the controller
 does. What it cannot show is what the controller is DOING, a wake or a drain
 in progress: that lives in the controller's memory, and `logs` is where it
-says so.
+says so. The one exception is a capacity ceiling, which belongs to no node: the
+controller publishes it to a small status ConfigMap, `<deployment>-status`, and
+`status` reads that with the same `get configmap` it uses for the configuration.
 """
 import argparse
 import getpass
@@ -28,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import warnings
 
 with warnings.catch_warnings():
@@ -130,6 +133,17 @@ class Target:
         self.source = KubeNodeSource(
             None, annotation=self.env.get("CORDON_ANNOTATION",
                                           "metalnap.io/cordoned"))
+        #: Whether a capacity ceiling is configured at all. `static: 0` is a
+        #: ceiling, so presence and not truthiness -- the value is a string.
+        self.ceiling_configured = bool(
+            self.env.get("CEILING_QUERY", "").strip()
+            or self.env.get("CEILING_STATIC", "").strip())
+        #: The object the controller publishes to is the one it was TOLD to --
+        #: STATUS_CONFIGMAP, which the chart sets -- so that is what is read.
+        #: The Deployment's name plus `-status` is how the chart names it, and
+        #: is the fallback for a controller that was not given one.
+        self.status_name = (self.env.get("STATUS_CONFIGMAP", "").strip()
+                            or self.name + "-status")
 
     @property
     def where(self):
@@ -149,6 +163,30 @@ class Target:
                 if "value" in e:
                     env[e["name"]] = e["value"]
         return env
+
+    def ceiling_status(self):
+        """(report, problem): what the controller last published about its
+        capacity ceiling. One or the other, or neither if it has published
+        nothing yet -- the chart creates the object empty.
+
+        The name is the one the controller was configured with, so nothing
+        about the object has to be configured on this side. A failure to read
+        it is a finding, not an error: `status` has plenty else to say.
+        """
+        try:
+            cm = self.k.json("get", "configmap", self.status_name,
+                             "-n", self.namespace)
+        except CliError as e:
+            return None, str(e)
+        raw = (cm.get("data") or {}).get("ceiling")
+        if not raw:
+            return None, None
+        try:
+            report = json.loads(raw)
+        except ValueError:
+            return None, "its contents are not JSON"
+        return (report, None) if isinstance(report, dict) else (
+            None, "its contents are not what this version of metalnap writes")
 
     def states(self):
         """{node: NodeState or None}, for every node the controller manages."""
@@ -196,6 +234,13 @@ def describe(state):
                                   else "not yet taken up"))
     if state.cordoned and not state.ours:
         return "held", "cordoned by someone other than metalnap; left alone"
+    if state.cordoned and state.shed_at is not None:
+        # Read off the node, so it needs no controller memory -- and only while
+        # it is still ours and cordoned: a note left on a node put back into
+        # service is a stale record, not a node held down.
+        return ("shed", "held down by a capacity ceiling since %s%s"
+                % (_when(state.shed_at),
+                   "; still draining" if state.ready else ""))
     if state.ready and not state.cordoned:
         return "in service", ""
     if state.ready:
@@ -216,6 +261,66 @@ def _when(ts):
         "%Y-%m-%d %H:%M UTC")
 
 
+def _at(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M UTC")
+
+
+def _nodes(n):
+    return "%d node%s" % (n, "" if n == 1 else "s")
+
+
+def ceiling_line(t, now=None):
+    """What to say about the capacity ceiling in `status`'s header, or None
+    when there is nothing to say -- no ceiling is configured.
+
+    Read from the status object the controller publishes, because a ceiling
+    belongs to no node. That object is a report and not a control: it can be
+    old, so its age is checked, and it can be absent, which is said.
+    """
+    if not t.ceiling_configured:
+        return None
+    if t.mode == "off":
+        return ("configured, and suspended: mode=off reads no signal and "
+                "sheds nothing")
+    if t.mode == "dry_run":
+        return ("configured; mode=dry_run -- metalnap only logs what it would "
+                "shed, and publishes no status (see `metalnap logs`)")
+    report, problem = t.ceiling_status()
+    if problem:
+        return ("configured, but its status could not be read: %s" % problem)
+    if report is None:
+        return "configured; the controller has not written its status yet"
+    now = time.time() if now is None else now
+    limit, shed = report.get("limit"), report.get("shed") or []
+    draining = report.get("draining") or []
+    if not report.get("signal_ok", True):
+        line = "signal UNAVAILABLE -- treated as no ceiling"
+    elif report.get("engaged"):
+        signal = report.get("signal")
+        parts = ["%d shed" % len(shed)]
+        if draining:
+            untils = [d.get("until") for d in draining]
+            parts.append("%d draining%s" % (
+                len(draining), " until " + _at(max(untils))
+                if all(u is not None for u in untils) else ", never forced"))
+        line = "%s, ENGAGED since %s (%s; %s)" % (
+            _nodes(limit), _when(report["since"]) if report.get("since")
+            else "an unknown time",
+            "signal %d" % signal if signal is not None
+            else "signal none, held", ", ".join(parts))
+    elif limit is not None:
+        line = "%s, not limiting (the pool is %d)" % (_nodes(limit),
+                                                    report.get("pool", 0))
+    else:
+        line = "none in force"
+    updated, refresh = report.get("updated"), report.get("refresh_s") or 300
+    if updated is not None and now - updated > 3 * refresh:
+        line += (" -- last written %s, the controller may not be running"
+                 % _when(updated))
+    return line
+
+
 def _header(t, out):
     print("context:    %s" % t.k.context, file=out)
     print("controller: %s (mode=%s)" % (t.where, t.mode), file=out)
@@ -228,6 +333,9 @@ def _header(t, out):
 
 def cmd_status(t, args, out):
     _header(t, out)
+    line = ceiling_line(t)
+    if line:
+        print("ceiling:    %s" % line, file=out)
     rows = []
     for n, state in t.states().items():
         what, detail = describe(state)
@@ -296,10 +404,27 @@ def cmd_maintenance(t, args, out):
                   "carries on and new work can still land -- `kubectl "
                   "cordon` to let what is running finish first."
                   % ", ".join(in_service), file=out)
+        report = _engaged_ceiling(t)
+        if report:
+            # A person asked, so it is done -- and a ceiling does not stand in
+            # the way of that. Said, because "engaged" is easy to read as
+            # "nothing will power on".
+            print("a capacity ceiling is engaged (%s): it does not block this "
+                  "power-on, and the node is exempt from it while you hold "
+                  "it." % _nodes(report.get("limit") or 0), file=out)
     else:
         print("gave back %s. metalnap puts each into service or to sleep, as "
               "demand says." % ", ".join(nodes), file=out)
     return 0
+
+
+def _engaged_ceiling(t):
+    """The ceiling's report if one is engaged, else None -- and None when it
+    cannot be read: a warning is not worth failing a request over."""
+    if not (t.ceiling_configured and t.mode == "on"):
+        return None
+    report, problem = t.ceiling_status()
+    return report if report and report.get("engaged") else None
 
 
 def cmd_logs(t, args, out):

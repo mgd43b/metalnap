@@ -30,6 +30,14 @@ spec:
         - name: metalnap
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if gt (int .Values.metrics.port) 0 }}
+          # Only when metrics are on: the controller listens on nothing else,
+          # and there is deliberately no Service.
+          ports:
+            - name: metrics
+              containerPort: {{ int .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "metalnap.fullname" . }}

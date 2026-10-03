@@ -193,6 +193,74 @@
         }
       }
     },
+    "capacityCeiling": {
+      "type": "object",
+      "description": "An external signal that caps how many managed nodes may be awake, down to none. Off unless query or static is set.",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "PromQL on prometheus.url. Its VALUE is the most nodes allowed awake; NO series means no ceiling. Several series take the minimum. End it with a freshness guard: staleness is the expression's job."
+        },
+        "static": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "A fixed ceiling. 0 is a real ceiling (shed every node); null means none. Not with a query."
+        },
+        "releaseHoldS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A looser reading must hold this long before shed nodes are released."
+        },
+        "drainDeadlineS": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A node carrying work is given this long to finish, then shut down anyway (soft, announced). 0 never forces."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "query": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "then": {
+            "properties": {
+              "static": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "anyOf": [
+            {
+              "const": 0
+            },
+            {
+              "minimum": 1024,
+              "maximum": 65535
+            }
+          ],
+          "description": "Serve Prometheus metrics on this port. 0 serves none, and is the default. Otherwise 1024 or more: the container runs unprivileged with every capability dropped, so it cannot bind a lower one. There is no Service."
+        }
+      }
+    },
     "queries": {
       "type": "object",
       "properties": {

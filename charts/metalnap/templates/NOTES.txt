@@ -20,6 +20,35 @@ Roll it back at any time without touching a node:
   helm upgrade {{ .Release.Name }} <chart> --reuse-values --set mode=off
 {{- end }}
 
+{{ if include "metalnap.ceilingEnabled" . -}}
+A CAPACITY CEILING IS CONFIGURED ({{ if .Values.capacityCeiling.query }}from a PromQL query{{ else }}static: at most {{ int64 .Values.capacityCeiling.static }} node(s) awake{{ end }}).
+While one is in force nothing is woken beyond it, and nodes over it are shed
+through the ordinary sleep. It fails open: an unreadable signal is no ceiling,
+and releases one that is engaged.
+{{ if gt (int .Values.capacityCeiling.drainDeadlineS) 0 -}}
+A node still carrying work {{ int64 .Values.capacityCeiling.drainDeadlineS }}s after it was shed is shut down
+anyway (soft, announced first): the one place metalnap ends running work.
+{{- else -}}
+drainDeadlineS is 0, so a node carrying work is never shed, and this cannot by
+itself bring an emergency under control.
+{{- end }}
+
+  metalnap status        # its header says whether one is engaged
+  kubectl -n {{ .Release.Namespace }} get configmap {{ include "metalnap.statusName" . }} -o yaml
+
+{{ if eq .Values.mode "dry_run" -}}
+In dry_run it only logs what it WOULD shed, and writes no status object.
+
+{{ else if eq .Values.mode "off" -}}
+In mode off it reads no signal and sheds nothing.
+
+{{ end -}}
+{{- end -}}
+{{ if gt (int .Values.metrics.port) 0 -}}
+Metrics are served on :{{ .Values.metrics.port }}/metrics of the pod. There is no Service: scrape
+the pod, or add one of your own.
+
+{{ end -}}
 To work on a node, ask for it -- metalnap powers it on once and then leaves
 it alone until you give it back:
 
