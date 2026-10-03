@@ -61,7 +61,9 @@ The cluster model is faithful on the points a controller gets wrong:
     SAFETY is the hooks (no wake or visit begun past it, no node put into
     service over it, no busy node cordoned out of order or powered off outside
     a shed's deadline and the current reading, no deadline re-stamped, no power
-    cycle). LIVENESS is that an engaged ceiling CONVERGES -- the nodes the
+    cycle with the pool over it). A standing budget is one of the episodes -- a
+    cap of one over two nodes for hundreds of ticks -- because visits and a
+    wedged node's power cycle have to keep working inside it. LIVENESS is that an engaged ceiling CONVERGES -- the nodes the
     controller can act on end up at or under it within a drain deadline and a
     shutdown or two -- because safety alone is satisfied by a controller that
     does nothing.
@@ -180,19 +182,23 @@ and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
     a shed's deadline held in memory                   29/30   292/300
     a shed note outliving the ceiling                  29/30   298/300
     an error averaged into the hold                    23/30   194/300
-    a scheduled visit begun under a ceiling            18/30   180/300
+    a visit begun with no slot left under a ceiling    17/30   173/300
     a shed's deadline re-stamped when it is resumed    17/30   171/300
     a node carrying work shed before an idle one        8/30   112/300
     the deadline forced for a ceiling only the hold
       still asks for                                    7/30    67/300
-    a wedged node power-cycled under a ceiling          5/30    38/300
+    a wedged node power-cycled with the pool over       5/30    31/300
+    the wedged node left out of that count              4/30    27/300
     the drain timeout ending a shed                     2/30    26/300
     the hold taken as a maximum, not a minimum          0/30     7/300
     a wake that has just arrived not shed               0/30     3/300
     the attempt bound ending a shed                     0/30     1/300
     clamp before the fit guard                          0/30     0/300
     `unguarded` not clamped                             0/30     0/300
-    a visit in progress left to run its window          0/30     0/300
+    visits held back whenever a ceiling limits, with
+      headroom                                          0/30    10/300
+    a wedged node never cycled under a ceiling, or
+      refused at the limit and not only over it         0/30     0/300
     wakes gated on the nodes in service, not powered    0/30     0/300
     a drain turned into a shed that is not needed       0/30     0/300
     a shed the reading no longer needs not given back   0/30     0/300
@@ -214,6 +220,12 @@ and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
       loosened ceiling no longer holds down             0/30     0/300
     a limit clamped to every node, not to the pool      0/30     0/300
     no series read as a ceiling of 0, in the controller 60/60   600/600
+
+Rates measured against an older harness say nothing about this one, so: the
+rows were measured before a standing-budget episode (a cap of one over two nodes
+for hundreds of ticks) joined the harness and visits and power cycles became a
+matter of headroom. Every row about a visit or a wedged node's cycle was
+re-measured with them; the rest were not, and the episodes they draw differ.
 
 The last row is every seed because the mistake is not confined to the seeds that
 run a ceiling: a controller with none reads "no series" too. The same mistake in
@@ -415,6 +427,9 @@ class Sim:
         self.ceil_over_since, self.ceil_pool_key = None, None
         self.ceil_breaches = []
         self.forced_sheds = self.shed_episodes = self.sheds_begun = 0
+        #: Visits begun, and wedged nodes cycled, WHILE a ceiling was limiting
+        #: the pool -- the two things a steady budget has to keep doing.
+        self.visits_under_ceiling = self.cycles_under_ceiling = 0
 
     @staticmethod
     def default_cfg(seed):
@@ -513,13 +528,18 @@ class Sim:
             self.ceil_kind = None
             if r.random() < 0.012:
                 self.ceil_kind = r.choice(("steady", "steady", "flicker",
-                                           "noisy"))
+                                           "noisy", "budget"))
                 self.ceil_value = r.choice((0, 0, 1))
                 self.ceil_left = r.randint(8, 70)
+                if self.ceil_kind == "budget":
+                    # A standing cap of one node over two, for a long time: not
+                    # an emergency, so visits and the power cycle of a wedged
+                    # node have to keep working inside it.
+                    self.ceil_value, self.ceil_left = 1, r.randint(150, 400)
                 self.shed_episodes += 1
         if self.ceil_kind is None:
             self.ceil_reading = "error" if r.random() < 0.01 else None
-        elif self.ceil_kind == "steady":
+        elif self.ceil_kind in ("steady", "budget"):
             self.ceil_reading = self.ceil_value
         elif self.ceil_kind == "flicker":
             self.ceil_flip = not self.ceil_flip
@@ -570,6 +590,17 @@ class Sim:
         kernel is not one, and neither is one cut off from the cluster."""
         return [n for n in self.pool()
                 if n.powered and not n.hung and n.partitioned is None]
+
+    def visible_pool(self):
+        """...and that it can SEE: Ready, or in an operation of its own. It
+        counts what it can see and no more -- it cannot read every chassis every
+        tick -- so a node that is powered but neither, a machine booting after an
+        operator repaired it, or a visit's reboot a restart made it forget, is
+        not a slot taken until it is Ready. A wake, a visit or a power cycle
+        begun beside one is not past the ceiling as far as it can know."""
+        phases = self.controller.st if self.controller else {}
+        return [n for n in self.powered_pool()
+                if n.ready or (phases.get(n.name) or {}).get("phase")]
 
     def forced_ok(self, name):
         """May a node carrying work be powered off now? Only a shed past its
@@ -658,19 +689,19 @@ class Sim:
         if (self.ceiling_on and not self.observed.get(name)
                 and self.model_binding() and not self.exempt(n)):
             # Not a request an operator made -- those are exempt, and a
-            # person asked. A wake or a visit, while the ceiling is in force.
+            # person asked. A wake or a visit, while the ceiling is in force:
+            # each is for a pool with room, and the same rule judges both.
             visit = (self.controller.st.get(name) or {}
                      ).get("maintenance_at") == self.t
-            others = [m for m in self.powered_pool() if m.name != name]
+            others = [m for m in self.visible_pool() if m.name != name]
+            if len(others) + 1 > self.model_limit():
+                self.ceil_breaches.append(
+                    (self.t, name, "powered a node on past the ceiling for a "
+                     "%s: %d already on, %d allowed"
+                     % ("scheduled visit" if visit else "wake", len(others),
+                        self.model_limit())))
             if visit:
-                self.ceil_breaches.append(
-                    (self.t, name, "began a scheduled visit while a ceiling "
-                     "is in force"))
-            elif len(others) + 1 > self.model_limit():
-                self.ceil_breaches.append(
-                    (self.t, name, "powered a node on past the ceiling: %d "
-                     "already on, %d allowed" % (len(others),
-                                                 self.model_limit())))
+                self.visits_under_ceiling += 1
         if self.observed.get(name):
             # The one thing the controller may do to a node asked for, and
             # only once per request: after that the machine's power is the
@@ -734,9 +765,17 @@ class Sim:
         if name in self.human_held:
             self.stomped.append((self.t, name, "power-cycled while held"))
         if self.model_binding():
-            # It would power back on a node the ceiling wants down.
-            self.bad_cycle.append((self.t, name, "power-cycled while a "
-                                                 "ceiling is in force"))
+            # A cycle is for a pool with room: the wedged node is counted as
+            # powered, so at the limit it keeps its slot and only a pool OVER
+            # it is refused.
+            others = [m for m in self.visible_pool() if m.name != name]
+            if len(others) + 1 > self.model_limit():
+                self.bad_cycle.append(
+                    (self.t, name, "power-cycled with the pool over a "
+                                   "ceiling: %d powered, %d allowed"
+                     % (len(others) + 1, self.model_limit())))
+            else:
+                self.cycles_under_ceiling += 1
         if n.updating:
             self.interrupted_update.append((self.t, name))
             n.updating = None
@@ -1446,10 +1485,13 @@ class Sim:
                              and n.ours is not None
                              and n.name not in self.human_held
                              and n.maintenance is None
-                             # None runs while a ceiling is in force: visits
-                             # power hardware on for nobody. They are owed
-                             # from the release, not from before it.
-                             and not self.model_binding())
+                             # None runs without room for it under a ceiling:
+                             # a visit powers hardware on for nobody, so it
+                             # needs a slot. They are owed from the moment
+                             # there is one, not from before it.
+                             and not (self.model_binding() and
+                                      len(self.visible_pool()) + 1
+                                      > self.model_limit()))
                 if not candidate:
                     self.unvisited_since.pop(n.name, None)
                     continue
@@ -1614,7 +1656,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=60)
     a = ap.parse_args()
     failures = []
-    ceiling = dict(seeds=0, episodes=0, sheds=0, forced=0)
+    ceiling = dict(seeds=0, episodes=0, sheds=0, forced=0, visits=0, cycles=0)
     for seed in range(a.seeds):
         sim = Sim(seed, a.ticks)
         try:
@@ -1629,6 +1671,8 @@ def main():
             ceiling["episodes"] += sim.shed_episodes
             ceiling["sheds"] += sim.sheds_begun
             ceiling["forced"] += sim.forced_sheds
+            ceiling["visits"] += sim.visits_under_ceiling
+            ceiling["cycles"] += sim.cycles_under_ceiling
     total = a.seeds * a.ticks
     if failures:
         print("FAILED  %d/%d seeds  (%d ticks simulated)"
@@ -1641,7 +1685,9 @@ def main():
     # What the ceiling half of it actually reached: a run that never shed a
     # node, or never ran out a deadline, would pass everything above too.
     print("        ceiling: %(seeds)d seeds, %(episodes)d episodes, "
-          "%(sheds)d nodes shed, %(forced)d forced at the deadline" % ceiling)
+          "%(sheds)d nodes shed, %(forced)d forced at the deadline,\n"
+          "                 %(visits)d visits and %(cycles)d power cycles made "
+          "inside a limit" % ceiling)
     return 0
 
 

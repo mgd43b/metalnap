@@ -447,18 +447,21 @@ class Controller:
         operation finishes rather than trusted from where it began.
         """
         cfg = self.cfg
-        if self._engaged:
-            # No power cycle while a ceiling is limiting the pool. A cycle
-            # powers the machine back on, and what it comes back as -- up, with
-            # a ceiling that may want it down -- is not for this controller to
-            # decide mid-event. The wake may have begun before the ceiling did,
-            # or inside its headroom; either way the node is handed to a human
-            # like any other that will not come back, which is where a wedged
-            # node ends up anyway. (A ceiling that never lifts, a standing
-            # budget, therefore never cycles one: said in the README.)
-            return ("a capacity ceiling is limiting the pool, and metalnap "
-                    "does not power-cycle a node while one is",
-                    now + cfg.wake_timeout_s, True)
+        if self._limit is not None:
+            # A cycle powers the machine back on, so it is for a pool with room
+            # for it. The wedged node is counted as powered -- it is drawing the
+            # power the ceiling is about -- so at the limit it keeps its slot
+            # and may be cycled, and only a pool already OVER the limit is
+            # refused: there the node is one the ceiling may need down, and what
+            # it comes back as is not for this controller to decide mid-event.
+            # Counted as a wake is gated: nodes still powered, draining ones
+            # included. A refused node is handed to a human like any wedged one.
+            powered = self._powered(cutting=True)
+            if powered > self._limit:
+                return ("the pool is over its capacity ceiling (%d nodes "
+                        "powered, %d allowed), and a power cycle would power on "
+                        "a node it may need down" % (powered, self._limit),
+                        now + cfg.wake_timeout_s, True)
         cooldown = cfg.power_cycle_cooldown_s
         if not cooldown:
             return ("power-cycle escalation is disabled "
@@ -1038,16 +1041,6 @@ class Controller:
                          node=name)
             return
 
-        if self._engaged:
-            # A visit powers a node on for nobody, and a ceiling is a request
-            # for fewer on. Up and Ready, it is ended now through the ordinary
-            # sleep, skipping what is left of the window; one still booting is
-            # let to arrive, since it cannot be asked to shut down, and ended
-            # here the moment it does.
-            self._end_visit(name, state, "MAINTENANCE ended -- a capacity "
-                                         "ceiling is in force")
-            return
-
         until = s.get("maintenance_until")
         if until is None:
             # Measured from READY, not from power-on: a node that took eleven
@@ -1520,8 +1513,8 @@ class Controller:
             phase = (self.st.get(name) or {}).get("phase")
             if phase == "powering_off":
                 n += bool(cutting and self._states[name].ready)
-            elif self._states[name].ready or phase in ("waking", "sleeping",
-                                                       "maintaining"):
+            elif (self._states[name].ready
+                    or phase in ("waking", "sleeping", "maintaining")):
                 # A drain counts Ready or not: a node that went NotReady
                 # mid-drain -- cut off from the cluster, its work carrying
                 # on -- is as powered as it was a moment ago.
@@ -2473,20 +2466,27 @@ class Controller:
         # left over and nothing more -- not even a tick in which an operator's
         # request has just powered a node on, which serialisation would have
         # stopped had the request been a phase.
-        if self._engaged:
-            # Visits power hardware on for nobody, and a ceiling is a request
-            # for fewer nodes on. They are owed from the release, and the
-            # schedule is measured from when a node went dark, so they come
-            # due the moment it lifts. Said once -- it would otherwise look
-            # like the schedule had silently stopped.
+        #
+        # And only with room for it. A visit powers a node on for nobody, so it
+        # may start only if that cannot take the powered count over the limit:
+        # a steady budget works as it always did, and an emergency -- a limit
+        # of 0, or a pool already at or over it -- holds visits back. Counted as
+        # a wake is gated, so a visit already up, and a node still draining,
+        # take a slot. A visit in progress is ended by the shed when the pool
+        # goes OVER the limit, which takes it first (it serves nothing). They
+        # are owed from the moment there is room, and the schedule is measured
+        # from when a node went dark, so they come due then. Said once: it would
+        # otherwise look like the schedule had silently stopped.
+        if limit is not None and self._powered(cutting=True) + 1 > limit:
             if cfg.maintenance_interval_s and not st.get("_visits_held"):
                 self.log("info", "scheduled maintenance visits are held back "
-                                 "while a capacity ceiling is in force",
-                         ceiling=limit)
+                                 "while a capacity ceiling leaves no headroom",
+                         powered=self._powered(cutting=True), allowed=limit)
                 st["_visits_held"] = True
-        elif not took_up:
+        else:
             st["_visits_held"] = False
-            self._maybe_maintain(present, states, awake, want)
+            if not took_up:
+                self._maybe_maintain(present, states, awake, want)
 
 
 #: Trouble raised from a power reading, which a later reading can take back.

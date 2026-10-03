@@ -4281,6 +4281,159 @@ class TestCeilingForcesOnlyWhatTheReadingStillAsks(unittest.TestCase):
         self.assertEqual(c.forced_total, 1)
 
 
+class TestCeilingHeadroom(unittest.TestCase):
+    """A scheduled visit and a wedged node's power cycle both put a node on, so
+    both are for a pool with room: a steady budget has to work normally, and an
+    emergency -- a limit of 0, or a pool already at or over it -- has to stop
+    them. The count is the one a wake is gated on: nodes still POWERED, draining
+    ones and ones still booting included, held and maintenance nodes not."""
+
+    FOUR = ("a", "b", "c", "d")
+    MAINT = TestScheduledMaintenance.MAINT
+
+    def visit(self, awake, ceiling, **kw):
+        """Four nodes, `awake` of them in service and busy, the rest asleep and
+        due a visit, under `ceiling`."""
+        states = {n: (node(ready_since=T0 - 10) if i < awake else asleep())
+                  for i, n in enumerate(self.FOUR)}
+        busy = {n: ["job"] for i, n in enumerate(self.FOUR) if i < awake}
+        h = world(states, ceiling=ceiling, busy=busy, **kw)
+        c = h.controller(nodes=self.FOUR, **self.MAINT)
+        run(h, c, 3)
+        return h, c
+
+    def wedged_with(self, others, ceiling):
+        """A wake that timed out on a node whose chassis reads on, among
+        `others` nodes in service, under `ceiling`."""
+        states = {"a": crashed()}
+        states.update({n: node() for n in self.FOUR[1:1 + others]})
+        states.update({n: asleep() for n in self.FOUR[1 + others:]})
+        h = Harness(states, ceiling=ceiling, chassis={"a": "on"},
+                    busy={n: ["job"] for n in self.FOUR[1:1 + others]})
+        h.t = T0
+        c = h.controller(nodes=self.FOUR)
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        return h, c
+
+    # -- scheduled visits ----------------------------------------------------
+    def test_a_steady_budget_lets_a_visit_run(self):
+        """`static: 2` over four nodes is a standing budget, not an emergency:
+        with nothing powered, one more node is within it."""
+        h, _c = self.visit(awake=0, ceiling=2)
+        self.assertEqual(h.acted["on"], ["a"],
+                         "a budget with room held a scheduled visit back")
+
+    def test_a_visit_may_use_the_last_slot_but_not_one_beyond(self):
+        h, _c = self.visit(awake=1, ceiling=2)
+        self.assertEqual(len(h.acted["on"]), 1, "a slot was free")
+        h, _c = self.visit(awake=2, ceiling=2)
+        self.assertEqual(h.acted["on"], [],
+                         "a visit took the powered count over the budget")
+
+    def test_a_limit_of_zero_stops_every_visit(self):
+        h, _c = self.visit(awake=0, ceiling=0)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_a_pool_over_the_limit_stops_a_visit(self):
+        h, _c = self.visit(awake=3, ceiling=1)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_the_visit_is_counted_as_powered_while_it_runs(self):
+        """One at a time anyway -- and the node it has up is a slot taken, so a
+        second wake is not made beside it."""
+        h, c = self.visit(awake=0, ceiling=1)
+        self.assertEqual(h.acted["on"], ["a"])
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_a_visit_in_progress_carries_on_while_there_is_headroom(self):
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "b": asleep()}, ceiling=1)
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "maintaining",
+                         "ended a visit the budget had room for")
+        self.assertEqual(shed_notes(h), [])
+
+    def test_a_visit_in_progress_is_ended_when_the_pool_goes_over(self):
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "b": node(), "c": asleep()}, ceiling=1, busy={"b": ["j"]})
+        c = h.controller(nodes=("a", "b", "c"), **self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_a_visit_that_resumes_after_the_headroom_goes_says_why_it_waits(self):
+        h, _c = self.visit(awake=2, ceiling=2)
+        said = h.logged("visits are held back")
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["powered"], said[0]["allowed"]), (2, 2))
+
+    # -- a wedged node's power cycle -----------------------------------------
+    def test_a_steady_budget_lets_a_wedged_node_be_cycled(self):
+        h, _c = self.wedged_with(others=1, ceiling=3)
+        self.assertEqual(h.acted["cycle"], ["a"],
+                         "a budget with room refused to cycle a wedged node")
+
+    def test_a_wedged_node_at_the_limit_keeps_its_slot_and_is_cycled(self):
+        """It is counted as powered, so the pool is AT the limit with it in --
+        not over."""
+        h, _c = self.wedged_with(others=1, ceiling=2)
+        self.assertEqual(h.acted["cycle"], ["a"])
+
+    def test_a_pool_over_the_limit_does_not_cycle_a_wedged_node(self):
+        h, c = self.wedged_with(others=2, ceiling=2)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertIn("over its capacity ceiling (3 nodes powered, 2 allowed)",
+                      c.st["a"]["trouble"])
+
+    def test_a_limit_of_zero_does_not_cycle_a_wedged_node(self):
+        h, c = self.wedged_with(others=0, ceiling=0)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertIn("1 nodes powered, 0 allowed", c.st["a"]["trouble"])
+
+    def test_a_refused_wedged_node_is_still_handed_to_a_human(self):
+        h, c = self.wedged_with(others=2, ceiling=1)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertTrue(c.st["a"]["trouble"])
+
+    def test_every_other_guard_on_a_cycle_still_applies_with_headroom(self):
+        """An operator's cordon, running work and the cooldown are checked as
+        they always were; headroom is one more reason a cycle may happen, not
+        a replacement for the rest."""
+        h = Harness({"a": crashed(cordoned=True, ours=False), "b": node()},
+                    ceiling=2, chassis={"a": "on"}, busy={"b": ["j"]})
+        h.t = T0
+        c = h.controller()
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        self.assertEqual(h.acted["cycle"], [], "cycled a node an operator holds")
+        h = Harness({"a": crashed(), "b": node()}, ceiling=2,
+                    chassis={"a": "on"}, busy={"a": ["running"]})
+        h.t = T0
+        c = h.controller()
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        self.assertEqual(h.acted["cycle"], [], "cycled a node running work")
+
+    # -- no ceiling, and one that limits nothing -----------------------------
+    def test_without_a_ceiling_or_with_one_above_the_pool_nothing_changes(self):
+        for ceiling in (None, 9):
+            with self.subTest(ceiling=ceiling):
+                h, _c = self.visit(awake=3, ceiling=ceiling)
+                self.assertEqual(len(h.acted["on"]), 1)
+                h, _c = self.wedged_with(others=2, ceiling=ceiling)
+                self.assertEqual(h.acted["cycle"], ["a"])
+
+
 class TestCeilingHysteresis(unittest.TestCase):
     """Tighten at once, loosen reluctantly: the effective limit is the minimum
     of the readings in the trailing hold, and a flapping signal must not cost a
@@ -4463,19 +4616,6 @@ class TestCeilingInteractions(unittest.TestCase):
         self.assertIn(("a", True), h.acted["cordon"],
                       "ended without refreshing the cordon its drain anchors")
 
-    def test_a_visit_ends_even_while_the_ceiling_has_room(self):
-        """A visit powers hardware on for nobody, so none runs while a ceiling
-        is in force -- whether or not it is binding on this node."""
-        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
-                   "b": asleep()}, ceiling=1)
-        c = h.controller(**TestScheduledMaintenance.MAINT)
-        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
-                     "maintenance_until": T0 + 250}
-        c.tick()
-        self.assertEqual(c.st["a"]["phase"], "sleeping")
-        self.assertEqual(shed_notes(h), [], "an ordinary end to a visit was "
-                                            "recorded as a shed")
-
     def test_a_visit_still_booting_is_ended_the_moment_it_arrives(self):
         h = Harness({"a": asleep()}, ceiling=0, chassis={"a": "on"})
         h.t = T0
@@ -4560,7 +4700,9 @@ class TestCeilingInteractions(unittest.TestCase):
         h = world({"a": asleep(), "b": None}, ceiling=0)
         c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
         run(h, c, 4)
-        self.assertEqual(len(h.logged("visits are held back")), 1)
+        said = h.logged("visits are held back")
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["powered"], said[0]["allowed"]), (0, 0))
 
     def test_dry_run_logs_what_it_would_shed_and_touches_nothing(self):
         spy, sink, status = Spy(), _Sink(), _Sink()

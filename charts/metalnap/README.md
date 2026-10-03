@@ -112,7 +112,8 @@ Each exists because breaking it cost something real.
   that was slept; only a dark node carrying metalnap's own cordon is silenced.
 - **Escalate once, then hand it to a human.** A wake that times out on a node
   whose BMC reads "on" power-cycles it — once per `timers.powerCycleCooldownS`,
-  never under an operator's cordon or running work — and then unmutes it and
+  never under an operator's cordon or running work, nor while a
+  `capacityCeiling` has the pool over its limit — and then unmutes it and
   raises `MetalnapNodeNeedsAttention`.
 - **Wake readily, sleep reluctantly**, and hold evidence of demand across the
   dips a noisy signal produces. Nodes carrying work count as wanted, and only
@@ -123,7 +124,9 @@ Each exists because breaking it cost something real.
   an operator and to any operation in flight; the node stays cordoned
   throughout; and a node that goes NotReady inside its window is waited for,
   never powered off, because that is what a node rebooting into a kernel
-  update looks like.
+  update looks like. Under a `capacityCeiling` a visit starts only if it cannot
+  take the powered count over the limit, so a steady budget is unaffected and an
+  emergency holds visits back.
 - **When a person asks for a node, give it to them and get out of the way.**
   See [maintenance mode](#maintenance-mode).
 
