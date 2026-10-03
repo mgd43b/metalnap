@@ -204,6 +204,15 @@ and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
     a woken node keeping the anchor of the shed before  0/30     0/300
     a failing demand signal aborting a shed             0/30     0/300
     demand-side decisions made with demand unreadable   0/30     0/300
+    an ordinary drain finished with demand unreadable   0/30     0/300
+    a drain or a visit not shed before a node in
+      service                                           0/30     0/300
+    a forced shed counted at the request, or logged
+      again on every retry                              0/30     0/300
+    a node put back by an operator picked again         0/30     0/300
+    a shed note never retried, or left on nodes the
+      loosened ceiling no longer holds down             0/30     0/300
+    a limit clamped to every node, not to the pool      0/30     0/300
     no series read as a ceiling of 0, in the controller 60/60   600/600
 
 The last row is every seed because the mistake is not confined to the seeds that
@@ -545,10 +554,12 @@ class Sim:
 
     def model_limit(self):
         """The effective limit: the minimum of the trailing hold, clamped to
-        the nodes there are. None when no ceiling is in force."""
+        the pool it counts -- not every node there is, since the ones an
+        operator holds are not its to limit. None when no ceiling is in
+        force."""
         if not self.ceiling_on or not self.ceil_hist:
             return None
-        return min(min(v for _t, v in self.ceil_hist), len(self.nodes))
+        return min(min(v for _t, v in self.ceil_hist), len(self.pool()))
 
     def model_binding(self):
         lim = self.model_limit()

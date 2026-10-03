@@ -48,8 +48,9 @@ class Metrics:
              "Nodes currently held down by the capacity ceiling.",
              len(r.get("shed") or [])),
             ("metalnap_shed_forced_total", "counter",
-             "Nodes powered off at the shed deadline with work still "
-             "running, since the controller started.",
+             "Nodes shut down at the shed deadline with work still running, "
+             "counted once per shed when the power-off is confirmed, since "
+             "the controller started.",
              int(r.get("forced") or 0)),
         )
         out = []
@@ -75,11 +76,17 @@ class _DualStackServer(_Server):
         super().server_bind()
 
 
-def serve(metrics, port, host=""):
+def serve(metrics, port, host="", timeout=10):
     """Start serving /metrics in a daemon thread; the server, for shutdown().
 
     No host means every interface, as a pod's scraper needs: dual-stack where
     the machine has IPv6, and IPv4 where it does not.
+
+    `timeout` is how long one connection may sit silent before it is dropped.
+    Without it a client that connects and says nothing holds a thread and a
+    descriptor for ever, inside the process that also makes every call to the
+    cluster, the BMCs and Alertmanager -- surface that did not exist before this
+    listener did.
     """
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -95,6 +102,8 @@ def serve(metrics, port, host=""):
 
         def log_message(self, *args):
             pass            # a scrape every few seconds is not a log line
+
+    Handler.timeout = timeout
 
     server = None
     if not host:

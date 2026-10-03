@@ -130,8 +130,9 @@ Each exists because breaking it cost something real.
 One of these has a deliberate, bounded exception, and only if you write a
 `capacityCeiling`: **never interrupt running work** gives way, after
 `capacityCeiling.drainDeadlineS`, to the ordinary soft shutdown of a node that
-was shed and is still carrying work — announced first, counted
-(`metalnap_shed_forced_total`), logged at `error`, enforced only while the
+was shed and is still carrying work — announced first, logged at `error`,
+counted (`metalnap_shed_forced_total`, once per shed, when the power-off is
+confirmed), enforced only while the
 current reading still asks for it, and switched off entirely by `0`. It fails
 open: an unreadable signal is no ceiling, and releases one that is engaged. It
 is not a substitute for BMC thermal protection or UPS shutdown.

@@ -670,6 +670,30 @@ class TestCeilingHeader(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("ENGAGED", header(out)[0])
 
+    def test_the_object_read_is_the_one_the_controller_was_told_to_write(self):
+        """STATUS_CONFIGMAP, from the controller's own environment -- not a
+        name guessed from the Deployment's, which a chart override or a hand
+        deployment can make a different one."""
+        cluster = make_cluster(nodes=("a",), env={
+            "CEILING_QUERY": "vector(0)", "STATUS_CONFIGMAP": "elsewhere"})
+        with_status(cluster, ceiling_report(), name="elsewhere")
+        cluster.configmaps[("ops", "metalnap-controller-status")] = {
+            "data": {"ceiling": json.dumps(ceiling_report(
+                engaged=False, limit=None, shed=[], draining=[]))}}
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ENGAGED", header(out)[0],
+                      "read the Deployment-derived object, not the configured "
+                      "one")
+
+    def test_without_one_the_name_is_the_deployments_plus_status(self):
+        cluster = make_cluster(nodes=("a",), env={"CEILING_QUERY": "vector(0)",
+                                                  "STATUS_CONFIGMAP": " "})
+        with_status(cluster, ceiling_report())
+        code, out, err = run_cli(["status", "--context", "ctx"], cluster)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ENGAGED", header(out)[0])
+
     def test_the_read_is_pinned_to_the_context_like_every_other(self):
         cluster, _out = self.status(ceiling_report())
         reads = [a for a in cluster.calls if "metalnap-controller-status" in a]

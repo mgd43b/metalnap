@@ -190,16 +190,41 @@ class TestChart(unittest.TestCase):
                 self.assertNotEqual(code, 0)
 
     def notes(self, values=""):
-        """NOTES.txt as `helm install` prints it. `template` does not render
-        it; a client-side dry run does, and needs no cluster."""
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
-            f.write("nodes: [node1]\n" + values)
-            f.flush()
-            r = subprocess.run([HELM, "install", "metalnap", CHART, "-f",
-                                f.name, "--dry-run=client"],
-                               capture_output=True, text=True)
+        """NOTES.txt as `helm install` would print it, on every helm.
+
+        `helm template` does not render NOTES.txt, and `helm install
+        --dry-run=client` reaches for an API server on some versions and not
+        on others. So the chart is copied, NOTES.txt becomes a named template,
+        and an ordinary manifest carries what it renders -- from the same
+        values and the same template text, on every version, which is all that
+        is being asserted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = os.path.join(tmp, "metalnap")
+            shutil.copytree(CHART, chart)
+            templates = os.path.join(chart, "templates")
+            with open(os.path.join(templates, "NOTES.txt")) as f:
+                text = f.read()
+            os.remove(os.path.join(templates, "NOTES.txt"))
+            with open(os.path.join(templates, "_zz.tpl"), "w") as f:
+                f.write('{{- define "zz.notes" -}}\n%s\n{{- end -}}\n' % text)
+            with open(os.path.join(templates, "zz-notes.yaml"), "w") as f:
+                f.write("apiVersion: v1\nkind: ConfigMap\n"
+                        "metadata:\n  name: notes\ndata:\n  notes: |\n"
+                        '{{ include "zz.notes" . | indent 4 }}\n')
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
+                f.write("nodes: [node1]\n" + values)
+                f.flush()
+                r = subprocess.run(
+                    [HELM, "template", "metalnap", chart, "-f", f.name,
+                     "--show-only", "templates/zz-notes.yaml"],
+                    capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return r.stdout[r.stdout.index("NOTES:"):]
+        block = r.stdout.split("  notes: |\n", 1)[1]
+        out = "\n".join(ln[4:] for ln in block.splitlines())
+        self.assertIn("installed as metalnap", out,
+                      "rendered something, but not the notes")
+        return out
 
     def test_notes_say_nothing_of_a_ceiling_that_is_not_set(self):
         self.assertNotIn("CEILING", self.notes())

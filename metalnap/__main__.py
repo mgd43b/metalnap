@@ -112,7 +112,8 @@ Optional:
                             concluded to, for `metalnap status` (the chart sets
                             it with a ceiling). Its namespace is the pod's own.
     METRICS_PORT            serve Prometheus metrics on this port; 0, the
-                            default, serves none. There is no other listener.
+                            default, serves none. 1024 or more: the container
+                            runs unprivileged. There is no other listener.
     ... plus every timer in metalnap/config.py
 """
 import os
@@ -229,14 +230,23 @@ def main(argv=None):
                 status = ConfigMapStatus(status_kube, f.read().strip(),
                                          status_name)
         except OSError as e:
-            print("metalnap: STATUS_CONFIGMAP is set but this pod's namespace "
-                  "could not be read (%s); `metalnap status` will have no "
-                  "ceiling to show" % e, file=sys.stderr)
+            # Stopped, not skipped. The namespace is read from the same
+            # service-account directory as the token every call to the cluster
+            # needs, so a pod that cannot read one has no controller to speak
+            # of -- and a skipped status would show as "has not written yet"
+            # in `metalnap status`, indefinitely, which is the wrong reason.
+            sys.exit("metalnap: STATUS_CONFIGMAP is set but this pod's "
+                     "namespace could not be read (%s): is the service-account "
+                     "token mounted?" % e)
     metrics = None
     port = os.environ.get("METRICS_PORT", "0").strip() or "0"
-    if not (port.isdigit() and int(port) <= 65535):
-        sys.exit("metalnap: METRICS_PORT must be a port number, or 0 for none; "
-                 "got %r" % port)
+    # The range the chart's schema enforces, repeated here because a direct
+    # deployment never meets the schema: the image runs unprivileged with every
+    # capability dropped, so a port below 1024 would start a pod that never
+    # listens.
+    if not (port.isdigit() and (int(port) == 0 or 1024 <= int(port) <= 65535)):
+        sys.exit("metalnap: METRICS_PORT must be 0 (off) or a port from 1024 to "
+                 "65535 -- the container runs unprivileged; got %r" % port)
     if int(port) > 0:
         metrics = Metrics()
         try:

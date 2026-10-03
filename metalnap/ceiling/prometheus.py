@@ -1,7 +1,7 @@
 """A PromQL-backed CapacityCeiling."""
 import math
 
-import requests
+from ..signal.prometheus import instant_query
 
 
 class PrometheusCeiling:
@@ -39,13 +39,7 @@ class PrometheusCeiling:
         self.timeout = timeout
 
     def limit(self):
-        r = requests.get(self.url + "/api/v1/query",
-                         params={"query": self.query}, timeout=self.timeout)
-        r.raise_for_status()
-        body = r.json()
-        if body.get("status") != "success":
-            raise ValueError("prometheus answered %r" % body.get("status"))
-        data = body["data"]
+        data = instant_query(self.url, self.query, self.timeout)
         kind, result = data["resultType"], data["result"]
         if kind == "scalar":                 # `query: "2"`: [ts, "2"]
             samples = [result]

@@ -138,6 +138,12 @@ class Target:
         self.ceiling_configured = bool(
             self.env.get("CEILING_QUERY", "").strip()
             or self.env.get("CEILING_STATIC", "").strip())
+        #: The object the controller publishes to is the one it was TOLD to --
+        #: STATUS_CONFIGMAP, which the chart sets -- so that is what is read.
+        #: The Deployment's name plus `-status` is how the chart names it, and
+        #: is the fallback for a controller that was not given one.
+        self.status_name = (self.env.get("STATUS_CONFIGMAP", "").strip()
+                            or self.name + "-status")
 
     @property
     def where(self):
@@ -163,12 +169,12 @@ class Target:
         capacity ceiling. One or the other, or neither if it has published
         nothing yet -- the chart creates the object empty.
 
-        The name is the Deployment's, which is how the chart names it, so
-        nothing about the object has to be configured on this side. A failure
-        to read it is a finding, not an error: `status` has plenty else to say.
+        The name is the one the controller was configured with, so nothing
+        about the object has to be configured on this side. A failure to read
+        it is a finding, not an error: `status` has plenty else to say.
         """
         try:
-            cm = self.k.json("get", "configmap", self.name + "-status",
+            cm = self.k.json("get", "configmap", self.status_name,
                              "-n", self.namespace)
         except CliError as e:
             return None, str(e)

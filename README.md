@@ -420,7 +420,8 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
   difference is the whole safety of this feature: an empty result read as `0`
   would be an order to power the pool off the first day the signal is quiet.
 - Several series take the **minimum**, so an unaggregated per-UPS expression
-  just works. Fractions floor, and the result is clamped to the nodes there are.
+  just works. Fractions floor, and the result is clamped to the pool the ceiling
+  counts — not the nodes an operator holds, which are not its to limit.
 - NaN, infinity, a negative, a value that is not a number, an error, a timeout:
   all are **cannot tell**, which is never zero. If any one series cannot be
   read, the whole reading cannot.
@@ -464,9 +465,12 @@ capacityCeiling:
   `SLEEP_SUSTAIN_S`, `MIN_UPTIME_S`, the idle window, a sleep's cooldown — and
   the two exits of a sleep that would hand the node *back* (`DRAIN_TIMEOUT_S` and
   `MAX_SLEEP_ATTEMPTS` both end in an uncordon, which would defeat the ceiling).
-- **Order:** nodes carrying no work first, then nodes carrying work, each in
-  reverse list order — the mirror of the wake order, so `nodes:` still decides
-  within a group and a node with a job on it is the last to go.
+- **Order:** nodes carrying no work first, then nodes carrying work — the mirror
+  of the wake order, with a node that has a job on it the last to go. Within
+  each, the ones that cost nothing to lose go first (a drain already on its way
+  out, then a node powered for nobody — stranded, visiting, just arrived — then
+  one in service), each in reverse list order, so `nodes:` still decides among
+  equals. Only as many are shed as must go.
 - **Busy nodes get a graceful drain with a deadline** (`CEILING_DRAIN_DEADLINE_S`,
   600), measured from the `metalnap.io/shed` note written when the shed began, so
   a restart does not reset it. Past it the wait on running work is skipped, idle
@@ -486,7 +490,9 @@ capacityCeiling:
   release nothing wakes by itself: demand does, through the usual wake window,
   one node per tick. (The hold is in memory, so a restart forgets it.) Nodes
   held down that the loosened reading no longer needs gone go back to being
-  ordinary drains, with an ordinary drain's timeout.
+  ordinary drains, with an ordinary drain's timeout, and nodes already asleep
+  lose their `shed` note in the order demand would wake them, so `status` and
+  the metric count only what the ceiling is still holding down.
 - **A node mid-operation when it engages:** a wake in flight is let to arrive
   (a booting OS cannot be asked to shut down) and is then shed without being
   put into service or warmed; a warmup is cleaned up first; a scheduled visit
@@ -503,9 +509,11 @@ capacityCeiling:
   needs one. (That is held in memory, so a restart forgets it.)
 - **No scheduled visits start** while a ceiling is limiting the pool — they
   power hardware on for nobody — and no wedged node is power-cycled (a cycle
-  would power on a node the ceiling wants down; it is handed to a human like any
-  other). A ceiling that is *always* in force, a budget of `static: 2` over four
-  nodes, so never lets a visit run; the log says so, once.
+  would power a node on that the ceiling may want down; it is handed to a human
+  like any other, even one woken inside the ceiling's headroom). A ceiling that
+  is *always* in force, a budget of `static: 2` over four nodes, so never lets a
+  visit run and never power-cycles a wedged node; the log says so, once, for the
+  visits.
 - **A shed node looks exactly like a slept one** to everything else: silenced
   while it is down, never `trouble`, never power-cycled.
 - **`dry_run`** reads the ceiling and logs what it *would* shed
@@ -549,7 +557,7 @@ and it adds no dependency:
 | `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool |
 | `metalnap_capacity_ceiling_signal_ok` | 0 while the signal is unavailable and treated as no ceiling |
 | `metalnap_nodes_shed` | nodes currently held down by the ceiling |
-| `metalnap_shed_forced_total` | busy nodes powered off at the deadline: work interrupted |
+| `metalnap_shed_forced_total` | busy nodes shut down at the deadline with work still running, counted once per shed when the power-off is confirmed (a node that ignores the request is not counted) |
 
 "Shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
 `increase(metalnap_shed_forced_total[1h]) > 0`.
@@ -565,8 +573,9 @@ operator writes a ceiling; nothing is interrupted before the deadline, and the
 deadline is enforced only while the *current* reading still wants fewer nodes
 powered than there are (a one-sample spike followed by a long hold cannot force a
 busy node off); the interruption is an orderly OS shutdown, announced first,
-never a hard cut; `drainDeadlineS: 0` opts out entirely; and it is counted
-(`metalnap_shed_forced_total`) and logged at `error` with the units it ended.
+never a hard cut; `drainDeadlineS: 0` opts out entirely; and it is logged at
+`error` with the units it ended, once per shed, and counted
+(`metalnap_shed_forced_total`) when the power-off is confirmed.
 How long a node that *ignores* the request can stay powered is
 `drainDeadlineS + SHUTDOWN_TIMEOUT_S` — twenty minutes by default.
 
