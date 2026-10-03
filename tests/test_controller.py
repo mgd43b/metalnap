@@ -5026,11 +5026,20 @@ class _BlockingKube(_FakeKube):
     def __init__(self):
         super().__init__()
         self.entered, self.release = threading.Event(), threading.Event()
+        self._lock = threading.Lock()
+        self.inflight = self.max_inflight = 0
 
     def request(self, method, path, body=None):
-        self.entered.set()
-        self.release.wait(timeout=30)
-        return super().request(method, path, body)
+        with self._lock:
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            self.entered.set()
+            self.release.wait(timeout=30)
+            return super().request(method, path, body)
+        finally:
+            with self._lock:
+                self.inflight -= 1
 
 
 class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
@@ -5079,9 +5088,14 @@ class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
         h = world({"a": node(), "b": node()}, ceiling=None)
         c = h.controller(status=w, **ONLY_THE_CEILING)
         try:
-            self.assertTrue(self.ticks_in_a_thread(h, c, [None, 1, 0, 0],
-                                                   kube))
-            self.assertTrue(kube.entered.wait(timeout=5))
+            # The first report is taken by the writer, which then hangs. Wait
+            # for that: ticks that ran before the writer had started would
+            # leave one report in the slot, not one in flight and one waiting.
+            self.assertTrue(self.ticks_in_a_thread(h, c, [None], kube))
+            self.assertTrue(kube.entered.wait(timeout=5),
+                            "the write was never attempted")
+            self.assertTrue(self.ticks_in_a_thread(h, c, [1, 0, 0], kube),
+                            "a tick waited on the stuck write")
             kube.release.set()                     # the server answers again
             self.assertTrue(w.drain(timeout=5))
         finally:
@@ -5089,8 +5103,13 @@ class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
         body = json.loads(kube.cm["data"]["ceiling"])
         self.assertEqual((body["engaged"], body["limit"]), (True, 0),
                          "an older report overwrote the latest")
-        self.assertEqual(len(kube.puts()), 2,
-                         "queued a write per tick while the first was stuck")
+        # The contract, not an accidental count: one write in flight at a
+        # time, no backlog (the three ticks made while it was stuck leave at
+        # most one more write, never three), and the last thing written is the
+        # latest report -- the one that was waiting when the stuck write ended.
+        self.assertEqual(kube.max_inflight, 1, "two writes in flight at once")
+        self.assertLessEqual(len(kube.puts()), 2,
+                             "queued a write per tick while the first was stuck")
 
     def test_a_failing_write_never_changes_what_a_tick_does(self):
         outcomes = []
