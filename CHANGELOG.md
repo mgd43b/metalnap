@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0](https://github.com/mgd43b/metalnap/compare/v0.5.2...v0.6.0) (2026-10-03)
+
+
+### Features
+
+* capacity ceiling -- let an external signal cap how many managed nodes may be awake ([7ec35c9](https://github.com/mgd43b/metalnap/commit/7ec35c982a9f56b5274b6a94977706ad87f9ab51))
+* capacity ceiling -- let an external signal cap how many managed nodes may be awake ([d0ed860](https://github.com/mgd43b/metalnap/commit/d0ed860f01e0776533b22dd6cf0e57f0559c5815))
+
+
+### Fixes
+
+* an operator's uncordon of any draining node is spared; METRICS_PORT is ASCII digits only ([e586376](https://github.com/mgd43b/metalnap/commit/e586376834d43693adccbdc6b967235d572a7e08))
+* capacity ceiling -- visits and wedged-node power cycles are for a pool with room ([be0120a](https://github.com/mgd43b/metalnap/commit/be0120ad77c1bbb34447e90141c88b8c7173ef73))
+* capacity ceiling follow-up -- headroom rule for visits and power cycles, status write off the tick path ([0c58b5e](https://github.com/mgd43b/metalnap/commit/0c58b5e7b8cedffe310ff21317340e417c4ce73a))
+* capacity ceiling review -- shed order, forced-shed count, demand outage, and CI ([efe169a](https://github.com/mgd43b/metalnap/commit/efe169ad217dcb99b81b48384cced478525040fc))
+* capacity ceiling status is written off the tick path ([165af5d](https://github.com/mgd43b/metalnap/commit/165af5da321dea3223c4b02b1e67e5d08139f21c))
+* read the status write error before handing over the next report ([9ed03cf](https://github.com/mgd43b/metalnap/commit/9ed03cf6367753f024c8540f0af91a4f76235aec))
+
+
+### Testing
+
+* make the status-writer backlog test deterministic ([744af13](https://github.com/mgd43b/metalnap/commit/744af13f4bb2692262aa89b5b3804f28cfaf614c))
+
 ## [0.5.2](https://github.com/mgd43b/metalnap/compare/v0.5.1...v0.5.2) (2026-10-01)
 
 
