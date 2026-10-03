@@ -3,8 +3,9 @@
 # `metalnap status` -- the one controller-wide fact that belongs to no node, and
 # so lives in no annotation. The chart creates the object EMPTY and the
 # controller fills it in. It is reporting, not control: nothing the controller
-# decides is read from it, it is written after the tick's decisions are made, a
-# failed write is logged and changes nothing, and it is not written in dry_run.
+# decides is read from it, it is written by a background thread so the tick never
+# waits on the API server for it, a failed write is logged and changes nothing,
+# and it is not written in dry_run.
 #
 # No `data` here, deliberately: Helm's three-way merge then leaves whatever the
 # controller wrote alone on an upgrade.

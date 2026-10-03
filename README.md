@@ -552,9 +552,12 @@ node3  in service
 That header is read from a small **status ConfigMap** (`<release>-status`)
 because a ceiling belongs to no node. The chart creates it empty and grants the
 controller `get` and `update` on that one name. It is reporting, not control:
-nothing the controller decides is read from it, it is written after the tick's
-decisions are made, with a five-second timeout of its own, a failed write is
-logged and changes nothing, and it is not written in `dry_run`. Every change is
+nothing the controller decides is read from it, it is written by a background
+thread — the tick hands over the latest report and goes on, so it never waits
+on the API server for a status write, a slow or hung one never queues a backlog
+(the newest report wins), and each call has a five-second timeout of its own — a
+failed write is logged once per change and changes nothing, and it is not
+written in `dry_run`. Every change is
 also one log line with `limit`, `signal`, `engaged`, `exempt` and `shed`. If the
 controller stops, the object goes stale rather than clear, so `status` says when
 it was last written once that is older than fifteen minutes.

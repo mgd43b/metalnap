@@ -222,8 +222,9 @@ def main(argv=None):
     status = None
     status_name = os.environ.get("STATUS_CONFIGMAP", "").strip()
     if status_name:
-        # A short timeout of its own: reporting must not be able to hold a
-        # tick for the thirty seconds a decision's read is allowed.
+        # A short timeout of its own, for the status writer thread's calls: a
+        # hung connection must not park that thread for the thirty seconds a
+        # decision's read is allowed. (The tick never waits on it either way.)
         status_kube = Kube(timeout=5)
         try:
             with open(status_kube.sa + "/namespace") as f:

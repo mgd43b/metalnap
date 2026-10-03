@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -4965,6 +4966,9 @@ class _FakeKube:
 
 
 class TestConfigMapStatus(unittest.TestCase):
+    """What one write does. write() is the synchronous step the background
+    writer runs; publish() is the hand-over the tick makes, tested below."""
+
     PATH = "/api/v1/namespaces/ops/configmaps/metalnap-status"
 
     def writer(self, kube, clock):
@@ -4975,7 +4979,7 @@ class TestConfigMapStatus(unittest.TestCase):
     def test_it_replaces_the_object_it_read_and_keeps_what_else_is_in_it(self):
         """get/update, the verbs the chart grants: a replace, not a patch."""
         kube, now = _FakeKube(), [1000.0]
-        self.writer(kube, lambda: now[0]).publish({"engaged": True, "limit": 0})
+        self.writer(kube, lambda: now[0]).write({"engaged": True, "limit": 0})
         self.assertEqual(kube.calls, [("GET", self.PATH), ("PUT", self.PATH)])
         self.assertEqual(kube.cm["metadata"]["resourceVersion"], "7")
         self.assertEqual(kube.cm["data"]["other"], "kept")
@@ -4986,33 +4990,201 @@ class TestConfigMapStatus(unittest.TestCase):
     def test_an_unchanged_report_is_not_rewritten_until_it_is_due(self):
         kube, now = _FakeKube(), [1000.0]
         w = self.writer(kube, lambda: now[0])
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         now[0] += 60
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         self.assertEqual(len(kube.puts()), 1, "wrote an unchanged report")
         now[0] += 300
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         self.assertEqual(len(kube.puts()), 2,
                          "never refreshed, so a dead controller looks alive")
 
     def test_a_changed_report_is_written_at_once(self):
         kube, now = _FakeKube(), [1000.0]
         w = self.writer(kube, lambda: now[0])
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         now[0] += 60
-        w.publish({"engaged": True})
+        w.write({"engaged": True})
         self.assertEqual(len(kube.puts()), 2)
 
     def test_a_failed_write_raises_and_is_retried_next_time(self):
         kube, now = _FakeKube(fail=RuntimeError("forbidden")), [1000.0]
         w = self.writer(kube, lambda: now[0])
         with self.assertRaises(RuntimeError):
-            w.publish({"engaged": True})
+            w.write({"engaged": True})
         kube.fail = None
         now[0] += 60
-        w.publish({"engaged": True})
+        w.write({"engaged": True})
         self.assertEqual(len(kube.puts()), 1,
                          "a write that failed was remembered as written")
+
+
+class _BlockingKube(_FakeKube):
+    """An API server that has stopped answering: the first call blocks until
+    it is released, as a hung connection does until its timeout."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def request(self, method, path, body=None):
+        self.entered.set()
+        self.release.wait(timeout=30)
+        return super().request(method, path, body)
+
+
+class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
+    """The tick hands the latest report over and goes on. It never waits on the
+    API server for a status write: reporting must not be able to delay a
+    decision, however slow or dead the thing it reports to is."""
+
+    def status(self, kube, clock=None):
+        from metalnap.status import ConfigMapStatus
+        return ConfigMapStatus(kube, "ops", "metalnap-status",
+                               clock=clock or (lambda: 1000.0), refresh_s=300)
+
+    def ticks_in_a_thread(self, h, c, readings, kube):
+        """Run one tick per reading in a thread, so a tick that blocks fails
+        the test instead of hanging it. True if they all finished."""
+        def go():
+            for r in readings:
+                h._ceiling = r
+                c.tick()
+                h.t += 60
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        finished = not t.is_alive()
+        if not finished:
+            kube.release.set()           # let the stuck tick go, then fail
+            t.join(timeout=5)
+        return finished
+
+    def test_a_write_that_blocks_does_not_delay_a_tick(self):
+        kube = _BlockingKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        try:
+            self.assertTrue(self.ticks_in_a_thread(h, c, [None] * 5, kube),
+                            "a tick waited on the status write")
+            self.assertTrue(kube.entered.wait(timeout=5),
+                            "the write was never attempted")
+        finally:
+            kube.release.set()
+
+    def test_the_latest_report_wins_and_a_hang_does_not_queue_a_backlog(self):
+        kube = _BlockingKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        try:
+            self.assertTrue(self.ticks_in_a_thread(h, c, [None, 1, 0, 0],
+                                                   kube))
+            self.assertTrue(kube.entered.wait(timeout=5))
+            kube.release.set()                     # the server answers again
+            self.assertTrue(w.drain(timeout=5))
+        finally:
+            kube.release.set()
+        body = json.loads(kube.cm["data"]["ceiling"])
+        self.assertEqual((body["engaged"], body["limit"]), (True, 0),
+                         "an older report overwrote the latest")
+        self.assertEqual(len(kube.puts()), 2,
+                         "queued a write per tick while the first was stuck")
+
+    def test_a_failing_write_never_changes_what_a_tick_does(self):
+        outcomes = []
+        for sink in ("fails", "works"):
+            kube = _FakeKube(fail=RuntimeError("forbidden")
+                             if sink == "fails" else None)
+            w = self.status(kube)
+            h = world({"a": node(), "b": node()}, ceiling=0)
+            c = h.controller(status=w)
+            for _ in range(4):
+                c.tick()
+                w.drain(timeout=5)
+                h.t += 60
+            outcomes.append((sorted(cordoned(h)), sorted(h.acted["off"])))
+            if sink == "fails":
+                self.assertEqual(
+                    len(h.at_level("warn", "ceiling status")), 1,
+                    "the failure was not logged, or logged every tick")
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0], (["a", "b"], ["a", "b"]))
+
+    def test_a_write_that_works_again_is_said_once(self):
+        kube = _FakeKube(fail=RuntimeError("forbidden"))
+        w = self.status(kube, clock=iter(range(1000, 9000, 400)).__next__)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        c.tick()
+        w.drain(timeout=5)
+        c.tick()                                   # sees the failure
+        kube.fail = None
+        h._ceiling = 0                             # a changed report
+        c.tick()
+        w.drain(timeout=5)
+        c.tick()
+        self.assertEqual(len(h.logged("publishing the status again")), 1)
+
+    def test_the_writer_is_a_daemon_that_does_not_keep_the_process_alive(self):
+        """A write stuck on a dead API server must not stop the controller
+        exiting: the thread is a daemon."""
+        import subprocess
+        import textwrap
+        code = textwrap.dedent("""
+            import sys, threading
+            sys.path.insert(0, %r)
+            from metalnap.status import ConfigMapStatus
+
+            class Stuck:
+                entered = threading.Event()
+                def request(self, *a, **kw):
+                    self.entered.set()
+                    threading.Event().wait()     # never answers
+
+            kube = Stuck()
+            w = ConfigMapStatus(kube, "ops", "x")
+            w.publish({"engaged": True})
+            assert kube.entered.wait(5), "the write never started"
+            assert w._thread.daemon, "the writer thread is not a daemon"
+            print("exiting")
+        """ % os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        r = subprocess.run([sys.executable, "-B", "-c", code],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exiting", r.stdout)
+
+    def test_dry_run_still_writes_nothing(self):
+        kube = _FakeKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(mode="dry_run", status=w)
+        run(h, c, 3)
+        self.assertTrue(w.drain(timeout=5))
+        self.assertEqual(kube.calls, [], "wrote outside the process in dry_run")
+        self.assertIsNone(w._thread, "started a writer it has nothing for")
+
+    def test_each_sink_gets_a_snapshot_of_its_own(self):
+        """The metrics listener and the status writer read the report on other
+        threads, after the tick has gone on: one that holds the report must not
+        be able to see, or change, what the other holds."""
+        seen = []
+
+        class Keeps:
+            def publish(self, report):
+                seen.append(report)
+
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(metrics=Keeps(), status=Keeps(), **ONLY_THE_CEILING)
+        c.tick()
+        first, second = seen
+        self.assertEqual(first, second)
+        first["shed"].append("tampered")
+        first["draining"].append("tampered")
+        self.assertNotIn("tampered", second["shed"])
+        self.assertEqual(len(second["draining"]), len(
+            [n for n in ("a", "b")]))
 
 
 class TestCeilingWiring(unittest.TestCase):

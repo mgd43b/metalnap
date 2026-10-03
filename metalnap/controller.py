@@ -45,6 +45,7 @@ this against real hardware and real CI:
     and none is while the CURRENT reading no longer asks for it; and what a
     restart must not forget -- when the shed began -- is on the node.
 """
+import copy
 import dataclasses
 import hashlib
 import math
@@ -67,8 +68,10 @@ class Controller:
         self.ceiling = ceiling or NullCeiling()
         #: Where tick() reports what it concluded -- a status object that
         #: `metalnap status` reads, and the metrics. Both are REPORTING: a
-        #: failure to publish is logged and never touches a decision. The
-        #: first writes outside this process, so dry_run does not use it.
+        #: failure to publish is logged and never touches a decision, and
+        #: neither is waited on -- the status writer is a background thread the
+        #: tick only hands the latest report to. The first writes outside this
+        #: process, so dry_run does not use it.
         self.status, self.metrics = status, metrics
         # Both default to no-ops so a minimal wiring still works, but the
         # defaults are named types rather than `if self.notifier:` scattered
@@ -1875,7 +1878,16 @@ class Controller:
     def _publish(self):
         """Hand the report to whoever is listening. Never raises and never
         waits on a decision: a failure is logged once per change and the next
-        tick tries again."""
+        tick tries again.
+
+        Each sink gets a snapshot of its own, taken here. Both read the report
+        on other threads after the tick has gone on -- the metrics listener when
+        it is scraped, the status writer when its turn comes -- so a report they
+        shared would be one the next tick, or the other reader, could change
+        under them. The status sink is asynchronous, and says whether its last
+        write worked in `error`, read here on the following tick; the metrics
+        sink is a lock and a dict, and raises if it is going to.
+        """
         rep = self._rep
         if rep is None:
             return
@@ -1886,14 +1898,16 @@ class Controller:
                 continue
             key = "_publish_" + what
             try:
-                sink.publish(dict(rep))
+                sink.publish(copy.deepcopy(rep))
+                err = getattr(sink, "error", None)
             except Exception as e:                    # noqa: BLE001
-                if self.st.get(key) != str(e):
-                    self.log("warn", _PUBLISH_FAILED[what], err=str(e))
-                    self.st[key] = str(e)
-            else:
-                if self.st.pop(key, None) is not None:
-                    self.log("info", "publishing the %s again" % what)
+                err = str(e) or type(e).__name__
+            if err:
+                if self.st.get(key) != err:
+                    self.log("warn", _PUBLISH_FAILED[what], err=err)
+                    self.st[key] = err
+            elif self.st.pop(key, None) is not None:
+                self.log("info", "publishing the %s again" % what)
 
     # -- reconcile -------------------------------------------------------
     def tick(self):
