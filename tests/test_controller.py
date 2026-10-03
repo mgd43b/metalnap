@@ -5131,6 +5131,23 @@ class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
         self.assertEqual(outcomes[0], outcomes[1])
         self.assertEqual(outcomes[0], (["a", "b"], ["a", "b"]))
 
+    def test_a_failure_is_read_before_the_next_report_can_clear_it(self):
+        """The worst interleaving, made deterministic: the publish that hands
+        over the next report is the moment the writer's retry succeeds and
+        clears `error`. A failure the controller had not read yet must still
+        be logged, so it is read before that hand-over, not after."""
+        class RetriesAtOnce:
+            error = "forbidden"
+
+            def publish(self, report):
+                self.error = None          # the retry worked, instantly
+
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=RetriesAtOnce(), **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual(len(h.at_level("warn", "ceiling status")), 1,
+                         "a failed write was cleared before it was read")
+
     def test_a_write_that_works_again_is_said_once(self):
         kube = _FakeKube(fail=RuntimeError("forbidden"))
         w = self.status(kube, clock=iter(range(1000, 9000, 400)).__next__)

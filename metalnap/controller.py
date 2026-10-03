@@ -1898,8 +1898,11 @@ class Controller:
                 continue
             key = "_publish_" + what
             try:
-                sink.publish(copy.deepcopy(rep))
+                # Read BEFORE handing over the next report: publishing wakes
+                # the writer, whose retry could succeed and clear `error`
+                # before it was read, and a failure nobody saw is not logged.
                 err = getattr(sink, "error", None)
+                sink.publish(copy.deepcopy(rep))
             except Exception as e:                    # noqa: BLE001
                 err = str(e) or type(e).__name__
             if err:

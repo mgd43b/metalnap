@@ -155,7 +155,8 @@ maintenance:
 # node are for a pool with room: a visit starts only if it cannot take the
 # powered count over the limit, and a wedged node -- counted as powered -- keeps
 # its slot at the limit and is cycled, refused only when the pool is already over
-# it. A limit of 0, or a pool at or over it, holds both back.
+# it. So a pool AT its limit holds visits back but not the cycle; a pool over it
+# (and any pool under a limit of 0) holds both back.
 capacityCeiling:
   query: ""
   static: null
