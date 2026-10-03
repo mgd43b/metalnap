@@ -65,7 +65,10 @@ Every one of these exists because breaking it cost something real.
 
 - **Never interrupt running work.** Not by eviction, not by power. If a check
   cannot tell whether a node is busy, that reads as busy. Reading the wrong
-  field once destroyed four live CI jobs.
+  field once destroyed four live CI jobs. There is one deliberate, bounded
+  exception: a [capacity ceiling](#capacity-ceiling) an operator wrote, whose
+  shed deadline ends work that has outlasted it, with the ordinary soft
+  shutdown, and says so at `error`.
 - **An operator's cordon outranks the controller** — including decisions
   already in flight. Enforce it where operations *finish*, not only where they
   start. A wake begun before the cordon once completed and uncordoned the
@@ -116,6 +119,7 @@ Implement three small duck-typed interfaces (`metalnap/types.py`):
 | `PowerBackend` | how do I turn this box on and off — and power-cycle it when it wedges? | `IpmiPower` (ipmitool) |
 | `Notifier` *(optional)* | mute a node metalnap put down; raise an alert when one needs a human | `AlertmanagerNotifier` |
 | `Warmup` *(optional)* | prepare a node before it takes work | `ImagePrepull` |
+| `CapacityCeiling` *(optional)* | how many managed nodes may be awake right now, if anyone is saying | `PrometheusCeiling`, `StaticCeiling` |
 
 Plus `NodeSource` for reading node state and applying cordons — `KubeNodeSource`
 covers Kubernetes.
@@ -197,8 +201,10 @@ kubectl annotate node <node> metalnap.io/power-cycled-
 Everything metalnap must remember about a node across its own restarts lives
 on the node as a `metalnap.io/` annotation — `power-cycled`, `visited` (a
 maintenance visit's power-on), `shutdown` (a shutdown requested and not yet
-confirmed), `trouble` (why it was handed to a human) and `maintenance-started`
-(an operator's [maintenance request](#maintenance-mode) taken up). Each was
+confirmed), `trouble` (why it was handed to a human), `maintenance-started`
+(an operator's [maintenance request](#maintenance-mode) taken up) and `shed`
+(when a [capacity ceiling](#capacity-ceiling) began holding it down, which is
+what its drain deadline is measured from). Each was
 once held in memory, and each time a restart could undo a safety decision with
 it. `metalnap.io/maintenance` is the one metalnap reads and never writes: it is
 the operator's.
@@ -317,7 +323,10 @@ node the controller does not manage: that annotation would do nothing, and a
 typo would look exactly like a request being ignored.
 
 What `status` cannot show is what the controller is *doing* — a wake or a
-drain in progress lives in its memory. `logs` is where it says so.
+drain in progress lives in its memory. `logs` is where it says so. The one
+exception is a [capacity ceiling](#capacity-ceiling), which belongs to no node:
+`status` prints a `ceiling:` line from a small status ConfigMap the controller
+keeps, and a `shed` state for each node a ceiling is holding down.
 
 ## Scheduled wakeups
 
@@ -376,6 +385,191 @@ The schedule is measured from Kubernetes' own `Ready` condition transition
 time, so it survives a controller restart — a process that forgot a node had
 been dark for a fortnight would visit it a fortnight late.
 
+## Capacity ceiling
+
+metalnap sizes the pool from demand. A **capacity ceiling** is the other half: an
+external signal that says no more than *N* of the managed nodes may be awake,
+down to *N = 0*, so an operator can shed load when the environment demands it —
+a room that is overheating, a UPS that has gone on battery, a circuit that
+cannot carry more than a few machines. The always-on core cannot be shed; the
+managed nodes can.
+
+Nothing else does this without fighting the controller. `MODE=off` sheds
+nothing. Powering nodes off out of band makes metalnap see dark nodes it did not
+put down — alerted on, woken again by the next bit of demand, power-cycled when
+the chassis still reads on. A cordon powers nothing off and is never undone for
+you. So the ceiling lives *inside* the decision.
+
+```yaml
+capacityCeiling:
+  query: 'vector(0) and on() (max(ipmi_temperature_celsius{sensor="Inlet Temp"}) > 35)'
+  releaseHoldS: 900      # a looser reading must hold this long before nodes are released
+  drainDeadlineS: 600    # a node carrying work is given this long; 0 = never force
+```
+
+**Off unless you set `query` (PromQL on the Prometheus metalnap already reads)
+or `static` (a fixed number, to try the shed path with no signal).** Not both.
+`static: 0` is a real ceiling — shed everything — and `null` is none.
+
+### What the signal means
+
+- **The query's value is the ceiling, and no series means no ceiling.** That is
+  what lets you write a gate: `vector(0) and on() (max(temp) > 35)` is absent
+  on every ordinary day and `0` while it is hot. It is the *reverse* of how the
+  demand signal reads an empty result (as zero, "nothing waiting"), and the
+  difference is the whole safety of this feature: an empty result read as `0`
+  would be an order to power the pool off the first day the signal is quiet.
+- Several series take the **minimum**, so an unaggregated per-UPS expression
+  just works. Fractions floor, and the result is clamped to the nodes there are.
+- NaN, infinity, a negative, a value that is not a number, an error, a timeout:
+  all are **cannot tell**, which is never zero. If any one series cannot be
+  read, the whole reading cannot.
+- **It fails open, in both directions.** An error never engages a ceiling, and
+  it *releases one that is engaged, on that same tick*. A Prometheus outage in
+  the middle of an event therefore lifts the ceiling. Nothing wakes at that
+  moment — shed nodes stay asleep until demand wants them, through the usual
+  `WAKE_SUSTAIN_S` — so the exposure is bounded by that and by how long the
+  outage lasts. This is **not a substitute for BMC thermal protection or UPS
+  shutdown**: it is only as available as its signal and the controller.
+- **Staleness is the expression's job.** An instant query is stamped with the
+  time it was *evaluated*, so the age of a metric cannot be read off the
+  response. End the expression with a freshness guard —
+  `... and on() (time() - timestamp(m) < 120)` — and a stale metric returns no
+  series, which is no ceiling.
+- **Combine signals inside the one expression, and beware `A or B`.** Both sides
+  are label-less, and `or` matches on the whole label set, so it keeps the left
+  side and silently drops the right whenever the left has a sample. A thermal
+  gate `or`ed with a power gate is then only ever the thermal one. Give the two
+  sides different labels before combining them, or keep them under one
+  aggregation, and read the result back in Prometheus before trusting it.
+
+```yaml
+# Power: on battery -> keep one node; under 20 minutes of runtime -> none.
+# (Metric names vary by exporter. No series on mains = no ceiling.)
+capacityCeiling:
+  query: >-
+    (1 - (min(ups_battery_runtime_seconds) < bool 1200))
+    and on() (max(ups_on_battery) == 1)
+```
+
+### What it does while it is in force
+
+- **No wakes beyond it**, even with demand — gated on the nodes still
+  *powered*, draining ones included, so a budget is not exceeded for the length
+  of a drain. Refused demand stays visible in the log (`wanted` against `want`).
+- **Excess nodes are shed at once**, all in the same tick, through the ordinary
+  sleep: cordoned as metalnap's own, drained, idle units released only after a
+  fresh `holds_work()`, announced to Alertmanager **before** power is cut, and
+  shut down the soft way. It skips what exists to hold evidence of *demand* —
+  `SLEEP_SUSTAIN_S`, `MIN_UPTIME_S`, the idle window, a sleep's cooldown — and
+  the two exits of a sleep that would hand the node *back* (`DRAIN_TIMEOUT_S` and
+  `MAX_SLEEP_ATTEMPTS` both end in an uncordon, which would defeat the ceiling).
+- **Order:** nodes carrying no work first, then nodes carrying work, each in
+  reverse list order — the mirror of the wake order, so `nodes:` still decides
+  within a group and a node with a job on it is the last to go.
+- **Busy nodes get a graceful drain with a deadline** (`CEILING_DRAIN_DEADLINE_S`,
+  600), measured from the `metalnap.io/shed` note written when the shed began, so
+  a restart does not reset it. Past it the wait on running work is skipped, idle
+  units are still released, and the node is announced and shut down the ordinary
+  soft way. `0` never forces — the controller warns at start, because a ceiling
+  that waits for work cannot by itself bring an emergency under control.
+- **The announce rule holds, the deadline included.** metalnap does not power
+  off a node whose shutdown it could not announce, and the ceiling does not
+  override that. With Alertmanager unreachable a shed node stays powered, logged
+  at `error` on every tick, until it can be announced.
+- **A shed node that ignores the request is reported like any other** (`did not
+  power off within …`), and is never forced: there is no hard power-off.
+- **It loosens reluctantly.** The effective limit is the *minimum of the
+  readings in the trailing `CEILING_RELEASE_HOLD_S`* (900), so a flapping signal
+  (`0, none, 0, none`) holds nodes down and costs no wake-and-sleep cycles. An
+  *unavailable* reading is not a looser one — it empties the window. After the
+  release nothing wakes by itself: demand does, through the usual wake window,
+  one node per tick. (The hold is in memory, so a restart forgets it.) Nodes
+  held down that the loosened reading no longer needs gone go back to being
+  ordinary drains, with an ordinary drain's timeout.
+- **A node mid-operation when it engages:** a wake in flight is let to arrive
+  (a booting OS cannot be asked to shut down) and is then shed without being
+  put into service or warmed; a warmup is cleaned up first; a scheduled visit
+  ends at once; a drain under way *becomes* a shed if the ceiling needs that
+  node gone, its deadline restarting at engagement rather than at a cordon that
+  may be a day old; a node already powering off is left alone.
+- **Pool-wide, and only the pool.** A node an operator cordoned, or asked for in
+  [maintenance mode](#maintenance-mode), is exempt: never shed, and not counted
+  against the ceiling (the log says how many exempt nodes remain powered).
+  Maintenance mode's own one-time power-on is *not* blocked by a ceiling — a
+  person asked — and `metalnap maintenance start` says so. A person who
+  uncordons a node mid-shed is not fought: it is left alone for
+  `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
+  needs one. (That is held in memory, so a restart forgets it.)
+- **No scheduled visits start** while a ceiling is limiting the pool — they
+  power hardware on for nobody — and no wedged node is power-cycled (a cycle
+  would power on a node the ceiling wants down; it is handed to a human like any
+  other). A ceiling that is *always* in force, a budget of `static: 2` over four
+  nodes, so never lets a visit run; the log says so, once.
+- **A shed node looks exactly like a slept one** to everything else: silenced
+  while it is down, never `trouble`, never power-cycled.
+- **`dry_run`** reads the ceiling and logs what it *would* shed
+  (`dry_run: would shed node2 (ceiling 0, awake 2)`, once per change) and what
+  demand it would refuse, and touches nothing — no cordon, no note, no silence,
+  no status. **`MODE=off`** reads nothing.
+
+### Seeing it
+
+`metalnap status` prints the ceiling, whether it is engaged and since when, and
+what is left to do, and a `shed` state per node:
+
+```
+context:    prod-cluster
+controller: ops/metalnap-controller (mode=on)
+ceiling:    0 nodes, ENGAGED since 2024-03-01 14:02 UTC (signal 0; 2 shed, 1 draining until 14:12 UTC)
+
+NODE   STATE  DETAIL
+node1  shed   held down by a capacity ceiling since 2024-03-01 14:02 UTC
+node2  shed   held down by a capacity ceiling since 2024-03-01 14:02 UTC; still draining
+node3  in service
+```
+
+That header is read from a small **status ConfigMap** (`<release>-status`)
+because a ceiling belongs to no node. The chart creates it empty and grants the
+controller `get` and `update` on that one name. It is reporting, not control:
+nothing the controller decides is read from it, it is written after the tick's
+decisions are made, with a five-second timeout of its own, a failed write is
+logged and changes nothing, and it is not written in `dry_run`. Every change is
+also one log line with `limit`, `signal`, `engaged`, `exempt` and `shed`. If the
+controller stops, the object goes stale rather than clear, so `status` says when
+it was last written once that is older than fifteen minutes.
+
+Metrics are served on `METRICS_PORT` (chart `metrics.port`) — the controller
+listened on nothing before, so it is **off by default**, there is no Service,
+and it adds no dependency:
+
+| metric | meaning |
+|---|---|
+| `metalnap_capacity_ceiling` | the limit in force; absent when there is none |
+| `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool |
+| `metalnap_capacity_ceiling_signal_ok` | 0 while the signal is unavailable and treated as no ceiling |
+| `metalnap_nodes_shed` | nodes currently held down by the ceiling |
+| `metalnap_shed_forced_total` | busy nodes powered off at the deadline: work interrupted |
+
+"Shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
+`increase(metalnap_shed_forced_total[1h]) > 0`.
+
+### The rule it touches
+
+*Never interrupt running work.* A forced shed after `drainDeadlineS` is the first
+behaviour here that deliberately relaxes it, and no incident in this project's
+history makes that safe. The argument is the other way round: in a thermal or
+power emergency work is interrupted either way, and the alternatives are an
+uncontrolled stop or losing the machine. What bounds it: it is off unless an
+operator writes a ceiling; nothing is interrupted before the deadline, and the
+deadline is enforced only while the *current* reading still wants fewer nodes
+powered than there are (a one-sample spike followed by a long hold cannot force a
+busy node off); the interruption is an orderly OS shutdown, announced first,
+never a hard cut; `drainDeadlineS: 0` opts out entirely; and it is counted
+(`metalnap_shed_forced_total`) and logged at `error` with the units it ended.
+How long a node that *ignores* the request can stay powered is
+`drainDeadlineS + SHUTDOWN_TIMEOUT_S` — twenty minutes by default.
+
 ## Testing
 
 The controller this came from shipped eight bugs to production. Its unit suite
@@ -390,6 +584,8 @@ So there are two suites, and they do different jobs:
 ```bash
 python3 -B tests/test_controller.py               # deterministic, precise
 python3 -B tests/sim.py --seeds 60 --ticks 900    # ~54k ticks, ~2s
+python3 -B tests/test_cli.py                      # the operator's CLI
+python3 -B tests/test_chart.py                    # the chart, rendered (needs helm)
 ```
 
 `tests/sim.py` drives the controller through thousands of ticks against a fake
@@ -512,6 +708,13 @@ it takes to trust the numbers.
 `MAINTENANCE_INTERVAL_S` enables [scheduled wakeups](#scheduled-wakeups) and is
 `0` — off — by default. [Maintenance mode](#maintenance-mode) has no setting:
 it is asked for on the node.
+
+`CEILING_QUERY` (PromQL; its value is the most nodes awake, no series is none)
+or `CEILING_STATIC` (a number; `0` is a ceiling) enables a [capacity
+ceiling](#capacity-ceiling) and is off by default. `CEILING_RELEASE_HOLD_S`
+(default `900`) and `CEILING_DRAIN_DEADLINE_S` (default `600`; `0` never forces
+a busy node) shape it. `STATUS_CONFIGMAP` names the object `metalnap status`
+reads it from, and `METRICS_PORT` (default `0`, off) serves the metrics.
 
 The pool is sized on **memory and CPU**, whichever needs more nodes
 (set `CPU_SHORTFALL_QUERY=""` to size on memory alone). Runners that run out

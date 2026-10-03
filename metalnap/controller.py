@@ -35,6 +35,15 @@ this against real hardware and real CI:
     sleep, no drain, no power cycle, no mute -- until the request is
     withdrawn. Someone mid-upgrade reboots, and powers off, on purpose, and
     every one of this controller's remedies for a node doing that is wrong.
+  * A capacity ceiling is the one thing that may make nodes go down that
+    demand wants up -- and the one thing that may, after a deadline, end work
+    that is running. It is held to the same rules as everything else here:
+    off unless an operator wrote one; it fails OPEN, in both directions (an
+    error never engages it and releases one that is engaged); it goes through
+    the ordinary sleep, so every node is announced before it is powered off,
+    the deadline included; nothing running is interrupted before the deadline
+    and none is while the CURRENT reading no longer asks for it; and what a
+    restart must not forget -- when the shed began -- is on the node.
 """
 import dataclasses
 import hashlib
@@ -45,13 +54,22 @@ from typing import Dict, List
 
 class Controller:
     def __init__(self, nodes, node_source, power, signal, drain, config,
-                 notifier=None, warmup=None, log=None, clock=time.time):
+                 notifier=None, warmup=None, log=None, clock=time.time,
+                 ceiling=None, status=None, metrics=None):
         self.nodes: List[str] = list(nodes)
         self.node_source = node_source
         self.power = power
         self.signal = signal
         self.drain = drain
-        from .types import NullNotifier, NullWarmup
+        from .types import NullCeiling, NullNotifier, NullWarmup
+        #: The capacity ceiling. A null object, like the two below, so a
+        #: wiring without one is exactly the controller that had none.
+        self.ceiling = ceiling or NullCeiling()
+        #: Where tick() reports what it concluded -- a status object that
+        #: `metalnap status` reads, and the metrics. Both are REPORTING: a
+        #: failure to publish is logged and never touches a decision. The
+        #: first writes outside this process, so dry_run does not use it.
+        self.status, self.metrics = status, metrics
         # Both default to no-ops so a minimal wiring still works, but the
         # defaults are named types rather than `if self.notifier:` scattered
         # through the reconcile -- a null object cannot be forgotten at one
@@ -70,6 +88,19 @@ class Controller:
         #: memory only: a restart must be survivable, so nothing here may be
         #: required for correctness.
         self.st: Dict[str, dict] = {}
+        #: Busy nodes powered off at a shed's deadline, since this process
+        #: began: work ended on purpose, which is what the counter is for.
+        self.forced_total = 0
+        # What the ceiling concluded THIS tick, for the steps below it and for
+        # sleep(), which is called from outside tick() as well and must then
+        # read as "no ceiling". Rebuilt from scratch every tick.
+        self._limit = None      # the effective limit while it binds, else None
+        self._eff = None        # the effective limit, bound or not
+        self._cur = None        # the current reading, None if there is none
+        self._engaged = False   # a limit is in force and below the pool
+        self._ceiling_err = None
+        self._states, self._pool = {}, []
+        self._rep = None        # what to publish, if the tick got that far
 
     def log(self, level, msg, **kv):
         self._log(level, msg, mode=self.cfg.mode, **kv)
@@ -184,8 +215,14 @@ class Controller:
             time.sleep(self.cfg.interval_s)
 
     # -- wake ------------------------------------------------------------
-    def wake(self, name):
-        """One non-blocking step of a wake. True on the step that completes it."""
+    def wake(self, name, room=True):
+        """One non-blocking step of a wake. True on the step that completes it.
+
+        `room` is whether a capacity ceiling leaves space for one more node in
+        service. A wake that began before the ceiling engaged cannot be
+        recalled -- a booting OS cannot be asked to shut down -- so it is let
+        to arrive and then NOT put into service: see where it completes.
+        """
         s = self._node(name)
         phase = s.get("phase")
 
@@ -195,6 +232,11 @@ class Controller:
                 self.log("info", "dry_run: would power on and uncordon",
                          node=name)
                 return False
+            # A node being woken is being brought back, so whatever a shed
+            # last wrote on it is over. Left, a node woken into a ceiling that
+            # has no room for it would be shed again against the OLD anchor --
+            # a deadline that expired before this wake began.
+            self._forget_shed(name)
             power = self.power.state(name)
             if power == "off":
                 self.power.on(name)
@@ -234,6 +276,21 @@ class Controller:
                      maintenance=st.maintenance)
             s["phase"] = None
             s["booting"] = False
+            return False
+        if st and st.ready and not room:
+            # Arrived into a ceiling that has no room for it. Not uncordoned
+            # and not warmed -- putting it into service would be the wake the
+            # ceiling refused, and warming it spends a pull on a node about to
+            # be shed. It is left Ready, cordoned and ours, in no operation,
+            # which the next tick's shed takes first: nothing has been
+            # promised to it that a shed has to take back.
+            s["phase"] = None
+            s["booting"] = False
+            for k in ("cycled", "power_confirmed", "cold_start"):
+                s.pop(k, None)
+            self.log("info", "WAKE complete -- a capacity ceiling leaves no "
+                             "room for the node; not putting it into service",
+                     node=name, ceiling=self._eff)
             return False
         if st and st.ready:
             # Uncordon FIRST. Anything after this point is an optimisation, and
@@ -389,6 +446,15 @@ class Controller:
         operation finishes rather than trusted from where it began.
         """
         cfg = self.cfg
+        if self._engaged:
+            # A cycle powers the machine back on, and this ceiling wants it
+            # down. The wake that timed out began before the ceiling did --
+            # a ceiling never wakes anything, so never times a wake out -- and
+            # the node is left to a human like any other that will not come
+            # back, which is where a wedged node ends up anyway.
+            return ("a capacity ceiling is in force, and a power cycle would "
+                    "power on a node it wants down",
+                    now + cfg.wake_timeout_s, True)
         cooldown = cfg.power_cycle_cooldown_s
         if not cooldown:
             return ("power-cycle escalation is disabled "
@@ -506,8 +572,24 @@ class Controller:
                      node=name, err=str(e))
 
     def sleep(self, name, state=None):
-        """One non-blocking step of a sleep."""
+        """One non-blocking step of a sleep.
+
+        A node a capacity ceiling is holding down -- one with a shed anchor --
+        takes this same path, and every rule below still holds for it: it is
+        cordoned as ours, its idle units are released after a fresh
+        holds_work(), it is announced BEFORE power is cut -- the deadline
+        included -- and a shutdown it ignores is reported, never forced.
+
+        What a shed must not be allowed to do is leave. The drain timeout and
+        the attempt bound both end in _abandon_sleep(), which uncordons: right
+        for a drain that is not working, wrong for one whose reason is a
+        ceiling, since a shed that returns its node to service defeats the
+        ceiling. So a shed has neither. It has a deadline of its own, from the
+        anchor on the node, after which the wait on running work is skipped.
+        """
         s = self._node(name)
+        anchor = self._shed_anchor(name, state)
+        shed = anchor is not None
 
         if s.get("phase") != "sleeping":
             self.log("info", "SLEEP begin", node=name)
@@ -517,7 +599,7 @@ class Controller:
                 return
             attempts = s.get("sleep_attempts", 0) + 1
             s["sleep_attempts"] = attempts
-            if attempts > self.cfg.max_sleep_attempts:
+            if attempts > self.cfg.max_sleep_attempts and not shed:
                 self._abandon_sleep(
                     name, s, "sleep did not complete after repeated attempts; "
                              "returning the node to service and backing off")
@@ -537,14 +619,34 @@ class Controller:
             s["phase_since"] = self.now()
             return
 
+        # Past a shed's deadline -- and only while the current reading still
+        # asks for it -- the node is no longer waited for. Everything that
+        # follows is the ordinary sleep with the waits taken out.
+        forced = shed and self._shed_overdue(anchor)
+        known = True
         try:
             busy = self.drain.busy(name)
         except Exception as e:                        # noqa: BLE001
-            # Could not tell => assume busy => do nothing.
-            self.log("warn", "busy check failed; retrying next tick",
-                     node=name, err=str(e))
-            return
-        if busy:
+            if not forced:
+                # Could not tell => assume busy => do nothing.
+                self.log("warn", "busy check failed; retrying next tick",
+                         node=name, err=str(e))
+                return
+            # Unreadable reads as busy until the deadline, and the deadline
+            # has passed: it is the answer. Said, so that what ended is not a
+            # mystery.
+            busy, known = [], False
+            self.log("warn", "busy check failed past the shed deadline; "
+                             "going on without it", node=name, err=str(e))
+        if busy and not forced:
+            if shed:
+                left = (None if not self.cfg.ceiling_drain_deadline_s else
+                        max(0, int(anchor + self.cfg.ceiling_drain_deadline_s
+                                   - self.now())))
+                self.log("info", "waiting on running work; the shed deadline "
+                                 "has not passed", node=name, busy=len(busy),
+                         units=busy[:5], deadline_in_s=left)
+                return
             # Prefer the DURABLE cordon timestamp over in-memory phase_since.
             # A restart wipes the latter, and the stranded repair then starts a
             # fresh sleep that resets its own deadline -- so a node with hung
@@ -564,26 +666,38 @@ class Controller:
 
         # Nothing here holds work, so anything left is idle -- and idle units
         # never exit by themselves. Waiting for them is waiting forever.
+        skipped = []
         try:
             idle = self.drain.idle(name)
         except Exception as e:                        # noqa: BLE001
-            self.log("warn", "idle check failed; retrying next tick",
-                     node=name, err=str(e))
-            return
+            if not forced:
+                self.log("warn", "idle check failed; retrying next tick",
+                         node=name, err=str(e))
+                return
+            idle = []
         if idle:
             self.log("info", "releasing idle units blocking the drain",
                      node=name, count=len(idle), units=idle[:5])
             for unit in idle:
                 # Re-read each unit immediately before releasing it. The
                 # listing above is already stale; work can land in that window.
-                # Anything uncertain leaves the unit alone and aborts the tick.
+                # Anything uncertain leaves the unit alone and aborts the tick
+                # -- unless the deadline has passed, when it leaves the unit
+                # alone and goes on: the unit is not released, but it no longer
+                # holds the node.
                 try:
                     if self.drain.holds_work(unit):
+                        if forced:
+                            skipped.append(unit)
+                            continue
                         self.log("info", "unit was given work during the "
                                          "drain; waiting", node=name,
                                  unit=unit)
                         return
                 except Exception as e:                # noqa: BLE001
+                    if forced:
+                        skipped.append(unit)
+                        continue
                     self.log("warn", "could not re-check unit before "
                                      "releasing it; retrying next tick",
                              node=name, unit=unit, err=str(e))
@@ -591,19 +705,26 @@ class Controller:
                 try:
                     self.drain.release(unit)
                 except Exception as e:                # noqa: BLE001
+                    if forced:
+                        self.log("warn", "could not release idle unit; "
+                                         "going on", node=name, unit=unit,
+                                 err=str(e))
+                        continue
                     self.log("warn", "could not release idle unit; retrying "
                                      "next tick", node=name, unit=unit,
                              err=str(e))
                     return
-            # Release is asynchronous. Re-observe next tick rather than racing
-            # the teardown.
-            return
+            if not forced:
+                # Release is asynchronous. Re-observe next tick rather than
+                # racing the teardown.
+                return
 
-        residual = self.drain.residual(name)
-        if residual:
-            self.log("info", "units still present; waiting", node=name,
-                     units=residual[:5])
-            return
+        if not forced:
+            residual = self.drain.residual(name)
+            if residual:
+                self.log("info", "units still present; waiting", node=name,
+                         units=residual[:5])
+                return
 
         # Tell the world BEFORE cutting power. A node going down looks exactly
         # like a node dying; without this every sleep pages someone, and people
@@ -612,15 +733,29 @@ class Controller:
             self.notifier.going_down(name)
         except Exception as e:                        # noqa: BLE001
             # Do not power off a node we could not announce -- the alert would
-            # fire and nobody would know it was us.
-            self.log("warn", "could not announce the shutdown; not powering "
-                             "off this tick", node=name, err=str(e))
+            # fire and nobody would know it was us. The deadline does not
+            # change that: a shed past it stays powered until it can be
+            # announced, and says so at error on every tick it does.
+            self.log("error" if shed else "warn",
+                     "could not announce the shutdown; not powering off this "
+                     "tick", node=name, err=str(e))
             return
         # On the node before the request, so a restart in the minute the
         # kubelet goes on reporting Ready resumes waiting instead of reading
         # the node as stranded and asking a second time.
         self._try_note(name, "shutdown", self.now())
         self.power.soft_off(name)
+        ended = list(busy) + skipped
+        if forced and (ended or not known):
+            # Work ended on purpose: the one place this controller does that.
+            # Counted and logged at error, with what it ended, and not before
+            # the request was actually made -- a soft-off that raised is
+            # retried, and must not be counted twice.
+            self.forced_total += 1
+            self.log("error", "SHED FORCED -- the drain deadline passed with "
+                              "work still running; the node is shut down the "
+                              "ordinary way and that work ends", node=name,
+                     units=ended[:5], deadline_s=self.cfg.ceiling_drain_deadline_s)
         # Not done yet: a soft shutdown is a REQUEST. The node stays in flight
         # until the chassis confirms it, which does two jobs. The kubelet keeps
         # reporting Ready for most of a minute after the OS starts going down,
@@ -635,6 +770,23 @@ class Controller:
         s["awake_since"] = None
         self.log("info", "SLEEP shutdown requested -- waiting for power-off",
                  node=name)
+
+    def _shed_overdue(self, anchor):
+        """Has a shed's deadline passed, and does the reading still want it?
+
+        The CURRENT reading, not the effective limit. The limit is held -- the
+        minimum over the release hold -- so that nodes stay down; it is not a
+        reason to end work. A one-sample spike followed by a fifteen-minute
+        hold would otherwise force a busy node off for a ceiling that went
+        away at the next sample. So the deadline is enforced only while the
+        reading in hand allows fewer nodes powered than there are. 0 is never.
+        """
+        deadline = self.cfg.ceiling_drain_deadline_s
+        if not deadline or self._cur is None:
+            return False
+        if self.now() - anchor < deadline:
+            return False
+        return self._cur < self._powered(cutting=False)
 
     def confirm_off(self, name, state=None):
         """One non-blocking step of waiting for a soft shutdown to finish.
@@ -859,6 +1011,16 @@ class Controller:
                 self.log("info", "node went NotReady inside its maintenance "
                                  "window; waiting for it to come back",
                          node=name)
+            return
+
+        if self._engaged:
+            # A visit powers a node on for nobody, and a ceiling is a request
+            # for fewer on. Up and Ready, it is ended now through the ordinary
+            # sleep, skipping what is left of the window; one still booting is
+            # let to arrive, since it cannot be asked to shut down, and ended
+            # here the moment it does.
+            self._end_visit(name, state, "MAINTENANCE ended -- a capacity "
+                                         "ceiling is in force")
             return
 
         until = s.get("maintenance_until")
@@ -1287,8 +1449,406 @@ class Controller:
                      node=name, powered_for_s=int(self.now() - since))
         return state
 
+    # -- capacity ceiling ------------------------------------------------
+    def _shed_anchor(self, name, state):
+        """When a capacity ceiling began holding this node down, or None.
+
+        The note on the node first -- it is the one a restart cannot take --
+        and this process's own copy for a node whose note could not be
+        written. Either one is "held down by a ceiling".
+        """
+        if state is not None and state.shed_at is not None:
+            return state.shed_at
+        return (self.st.get(name) or {}).get("shed_at")
+
+    def _forget_shed(self, name, state=None):
+        """Drop a node's shed anchor, on the node and in memory. Returns the
+        state as it now stands, for the reason _clear_trouble does."""
+        self._node(name).pop("shed_at", None)
+        state = state if state is not None else self._states.get(name)
+        if state is None or state.shed_at is None:
+            return state
+        self._try_note(name, "shed", None)
+        return dataclasses.replace(state, shed_at=None)
+
+    def _powered(self, cutting):
+        """Nodes the ceiling counts that are still drawing power, as far as
+        can be told without asking a BMC: Ready, or on their way up -- waking,
+        or up for a visit.
+
+        `cutting` is whether a node whose shutdown has been requested counts
+        while it still reads Ready. It does when the question is the budget --
+        a wake is not made beside a node that is still on -- and not when it is
+        whether the ceiling still wants somebody gone, which a node on its way
+        out has already answered. Worked out from the phases as they stand,
+        not as the tick began, so a node that went down a moment ago in this
+        same tick is not counted.
+        """
+        n = 0
+        for name in self._pool:
+            phase = (self.st.get(name) or {}).get("phase")
+            if phase == "powering_off":
+                n += bool(cutting and self._states[name].ready)
+            elif self._states[name].ready or phase in ("waking", "sleeping",
+                                                       "maintaining"):
+                # A drain counts Ready or not: a node that went NotReady
+                # mid-drain -- cut off from the cluster, its work carrying
+                # on -- is as powered as it was a moment ago.
+                n += 1
+        return n
+
+    def _read_ceiling(self):
+        """(reading, ok): what the signal says now, or that it cannot say.
+
+        None is a reading -- no series, no ceiling. An exception is not one,
+        and neither is a value that is not a number of nodes: ok is False and
+        it is read as no ceiling. Never as 0, which is an order to power the
+        pool off.
+        """
+        self._ceiling_err = None
+        try:
+            r = self.ceiling.limit()
+        except Exception as e:                        # noqa: BLE001
+            self._ceiling_err = str(e) or type(e).__name__
+            return None, False
+        if r is None:
+            return None, True
+        if (isinstance(r, bool) or not isinstance(r, (int, float))
+                or r != r or r < 0 or r == math.inf):
+            self._ceiling_err = "not a number of nodes: %r" % (r,)
+            return None, False
+        return int(r), True
+
+    def _ceiling_section(self, present, states, held, maint, awake, wakeable):
+        """Read the capacity ceiling, and act on it. Returns the nodes whose
+        shed began this tick.
+
+        Called BEFORE the demand signal is read. That read is not wrapped --
+        an exception from it aborts the tick, which is right for a signal that
+        is down -- and a ceiling read after it would stop shedding whenever the
+        demand path is failing: the two fail independently, one off the
+        Kubernetes API and the other off Prometheus. It mutates `awake` and
+        `states` for what it began, so that nothing after it sees a node it
+        has just cordoned as still in service.
+
+        What it concludes is left on self for the steps below it: `_limit`,
+        the limit while it binds, is what clamps demand; `_engaged` is what
+        holds visits and power cycles back.
+        """
+        cfg, st = self.cfg, self.st
+        now = self.now()
+        self._states, self._pool = states, wakeable
+        self._limit = self._eff = self._cur = None
+        self._engaged = False
+
+        reading, ok = self._read_ceiling()
+        # The effective limit is the minimum of the readings in the trailing
+        # hold: tightening is immediate, loosening waits a whole window of
+        # looser readings, and `0, none, 0, none` costs no wake and no sleep.
+        # An UNAVAILABLE reading is not a looser one -- it is no reading -- so
+        # it empties the window instead of being averaged into it: fail open,
+        # literally, and at once. (The window lives in memory. A restart
+        # forgets the hold, which is the same direction.)
+        window = st.setdefault("_ceiling_window", [])
+        if not ok:
+            window.clear()
+        else:
+            if reading is not None:
+                window.append((now, reading))
+            window[:] = [(t, v) for t, v in window
+                         if t == now or now - t < cfg.ceiling_release_hold_s]
+        eff = min((v for _t, v in window), default=None)
+        if eff is not None:
+            eff = min(eff, len(present))
+        self._eff = eff
+        self._cur = None if reading is None else min(reading, len(present))
+        # It binds only if it is below what it counts. A ceiling at or above
+        # the pool changes nothing, and is treated as none, so that a standing
+        # budget that is not binding does not hold visits or cycles back.
+        engaged = eff is not None and eff < len(wakeable)
+        self._engaged = engaged
+        self._limit = eff if engaged else None
+        exempt = [n for n in present if n in held or n in maint]
+
+        # The note on a node is true only while the ceiling holds it down. Any
+        # other time -- released, brought back by a wake or a rescue, taken by
+        # an operator -- it goes, and a node that is shed again gets a fresh
+        # anchor. One note per concern is the whole reason for a note.
+        for n in present:
+            state = states[n]
+            if self._shed_anchor(n, state) is None:
+                continue
+            if engaged and state.cordoned and state.ours and n not in exempt:
+                continue
+            if (engaged and n not in exempt and not state.cordoned
+                    and (st.get(n) or {}).get("phase") == "sleeping"):
+                # A person uncordoned it mid-shed. The ordinary path backs the
+                # sleep off; the ceiling does not fight them either, and does
+                # not shed that node again until the same interval has passed.
+                self._node(n)["ceiling_spared_until"] = (
+                    now + cfg.sleep_cooldown_s)
+                self.log("info", "node was put back into service mid-shed by "
+                                 "an operator; the capacity ceiling leaves it "
+                                 "alone", node=n, for_s=cfg.sleep_cooldown_s)
+            states[n] = self._forget_shed(n, state)
+
+        begun = set()
+        picks = []
+        if not engaged:
+            st["_shed_dry_last"] = None
+        else:
+            L = eff
+
+            def phase(n):
+                return (st.get(n) or {}).get("phase")
+
+            # How many nodes must go, and which. Every node still drawing
+            # power that is not already on its way out counts, and the ceiling
+            # allows L of them:
+            #   held   already held down by it -- a note on the node -- and
+            #          still up: draining, or Ready and in no operation after
+            #          a restart;
+            #   drains an ordinary drain under way, which a ceiling that needs
+            #          the node gone turns into a shed;
+            #   up     in service, or Ready in no operation of the kind that is
+            #          going down -- stranded, visiting, warming, a wake that
+            #          has just arrived. A node still booting is none of these:
+            #          it cannot be asked to shut down, and is shed the tick it
+            #          is Ready.
+            held_down, drains, up = [], [], []
+            for n in wakeable:
+                ph = phase(n)
+                if ph == "powering_off":
+                    continue            # its power is already being cut
+                mine = self._shed_anchor(n, states[n]) is not None
+                if ph == "sleeping":
+                    (held_down if mine else drains).append(n)
+                elif states[n].ready:
+                    (held_down if mine else up).append(n)
+            required = len(held_down) + len(drains) + len(up) - L
+            spared = {n for n in up if (st.get(n) or {}).get(
+                "ceiling_spared_until", 0) > now}
+
+            def order(nodes):
+                """The order they go in: nodes carrying no work first, then
+                nodes carrying work, each in reverse list order -- the mirror
+                of the wake order, with a node that has a job on it the last to
+                go."""
+                free = [n for n in reversed(wakeable) if n in nodes]
+                working = set(self._in_use(free))
+                return ([n for n in free if n not in working]
+                        + [n for n in free if n in working])
+
+            unshed = []
+            if required > len(held_down):
+                # More must go than are going: the rest are picked.
+                picks = order([n for n in drains + up if n not in spared])[
+                    :required - len(held_down)]
+            elif required < len(held_down) and cfg.mode == "on":
+                # Fewer must go than are held down -- the reading loosened, or
+                # a node went down some other way. The surplus goes back to
+                # being what it was: not shed, with a drain timeout and a
+                # rescue like any other, and no deadline that would end its
+                # work for a ceiling that no longer asks it. The ones that
+                # carry work are given back first.
+                keep = order(held_down)[:max(required, 0)]
+                unshed = [n for n in held_down if n not in keep]
+            if cfg.mode != "on":
+                # A shadow says what it WOULD do, once per change, and does
+                # nothing: no cordon, no note, no silence.
+                if picks and st.get("_shed_dry_last") != (tuple(picks), L):
+                    self.log("info", "dry_run: would shed %s (ceiling %d, "
+                                     "awake %d)" % (", ".join(picks), L,
+                                                    len(awake)),
+                             nodes=picks)
+                st["_shed_dry_last"] = (tuple(picks), L) if picks else None
+            else:
+                for n in unshed:
+                    states[n] = self._forget_shed(n, states[n])
+                    self.log("info", "no longer shed: the ceiling does not ask "
+                                     "for this node to go", node=n, ceiling=L)
+                for n in picks:
+                    if phase(n) == "sleeping":
+                        # A drain that was running when the ceiling engaged
+                        # BECOMES a shed: still cordoned, its deadline anchored
+                        # now and not at a cordon that may be a day old, and no
+                        # drain timeout to give the node back.
+                        self._node(n)["shed_at"] = now
+                        self._try_note(n, "shed", now)
+                        states[n] = dataclasses.replace(states[n], shed_at=now)
+                        self.log("warn", "a drain under way is now a shed; its "
+                                         "deadline starts here", node=n,
+                                 ceiling=L)
+                    else:
+                        self._start_shed(n, states, awake, begun)
+                # A node held down but with no operation -- a restart lost it --
+                # is started again, on the anchor it already carries.
+                for n in held_down:
+                    if (n not in unshed and phase(n) != "sleeping"
+                            and n not in begun):
+                        self._start_shed(n, states, awake, begun)
+        self._ceiling_report(present, states, exempt, ok)
+        return begun
+
+    def _start_shed(self, n, states, awake, begun):
+        """Begin holding one node down: on record first, then through the
+        ordinary sleep. True if it began."""
+        s, state, now = self._node(n), states[n], self.now()
+        phase = s.get("phase")
+        try:
+            if phase == "warming":
+                try:
+                    self.warmup.cleanup(n)
+                except Exception as e:                # noqa: BLE001
+                    self.log("warn", "warmup cleanup failed", node=n,
+                             err=str(e))
+                s["phase"] = None
+            elif phase == "waking":
+                # Arrived this tick, with the wake not yet completed: it is not
+                # put into service, and not warmed -- the wake is let go of
+                # where it stands, as an operator's cordon lets go of one.
+                s["phase"] = None
+                s["booting"] = False
+                for k in ("cycled", "power_confirmed", "cold_start"):
+                    s.pop(k, None)
+            # The anchor is written BEFORE the cordon, as every note here is
+            # written before what it records: a restart between the two finds
+            # a note on a node that is not cordoned, which is cleared, and the
+            # shed begins again -- not a cordon with no deadline. An anchor the
+            # node already carries is KEPT: that is a shed that began earlier,
+            # and its deadline must survive the restart that found it.
+            if self._shed_anchor(n, state) is None:
+                s["shed_at"] = now
+                self._try_note(n, "shed", now)
+                state = states[n] = dataclasses.replace(state, shed_at=now)
+            self.log("warn", "SHED begin -- a capacity ceiling is in force",
+                     node=n, ceiling=self._eff, shed_at=_iso(
+                         self._shed_anchor(n, state)))
+            if phase == "maintaining":
+                self._end_visit(n, state, "MAINTENANCE ended -- a capacity "
+                                          "ceiling is in force")
+            else:
+                self.sleep(n, state)
+        except Exception as e:                        # noqa: BLE001
+            self.log("error", "could not begin the shed; retrying next tick",
+                     node=n, err=str(e))
+            return False
+        states[n] = dataclasses.replace(
+            states[n], cordoned=True, ours=True,
+            ours_since=(states[n].ours_since if self._ours(states[n])
+                        and phase != "maintaining" else now))
+        if n in awake:
+            awake.remove(n)
+        begun.add(n)
+        return True
+
+    def _ceiling_report(self, present, states, exempt, ok):
+        """What this tick concluded about the ceiling, for the status object
+        and the metrics -- and for the one log line a change earns.
+
+        Built whether or not anything is listening: it is a few lists, and the
+        log line is the same facts.
+        """
+        cfg, st = self.cfg, self.st
+        now = self.now()
+        deadline = cfg.ceiling_drain_deadline_s
+        eff, engaged = self._eff, self._engaged
+        # Held down by the ceiling, and not an operator's: asleep or draining.
+        shed, draining = [], []
+        if cfg.mode == "on" and engaged:
+            for n in present:
+                state = states[n]
+                anchor = self._shed_anchor(n, state)
+                if (anchor is None or n in exempt or not self._ours(state)):
+                    continue
+                shed.append(n)
+                phase = (st.get(n) or {}).get("phase")
+                if state.ready or phase == "sleeping":
+                    draining.append({"node": n, "until": (
+                        anchor + deadline if deadline else None)})
+        if engaged:
+            if st.get("_ceiling_since") is None:
+                # From the notes on the nodes where there are any, so a
+                # restart does not move it: it is when this began, not when
+                # this process did.
+                st["_ceiling_since"] = min(
+                    [states[n].shed_at for n in present
+                     if states[n].shed_at is not None] + [now])
+        else:
+            st["_ceiling_since"] = None
+        powered_exempt = [n for n in exempt if states[n].ready]
+        key = (eff, engaged, ok)
+        last = st.get("_ceiling_last")
+        if key != last and not (last is None and key == (None, False, True)):
+            fields = dict(limit=eff, signal=self._cur, engaged=engaged,
+                          exempt=powered_exempt, shed=shed)
+            if not ok:
+                self.log("warn", "capacity ceiling signal unavailable; "
+                                 "treating it as no ceiling",
+                         err=self._ceiling_err, **fields)
+            elif engaged and not (last and last[1]):
+                self.log("warn", "capacity ceiling ENGAGED", **fields)
+            elif engaged:
+                self.log("warn", "capacity ceiling changed", **fields)
+            elif last and last[1]:
+                self.log("info", "capacity ceiling RELEASED", **fields)
+            elif eff is not None:
+                self.log("info", "capacity ceiling does not limit the pool",
+                         **fields)
+            elif last and not last[2]:
+                self.log("info", "capacity ceiling signal readable again",
+                         **fields)
+            else:
+                self.log("info", "capacity ceiling no longer set", **fields)
+        st["_ceiling_last"] = key
+        from .types import NullCeiling
+        self._rep = {
+            "configured": not isinstance(self.ceiling, NullCeiling),
+            "mode": cfg.mode, "engaged": engaged, "limit": eff,
+            "signal": self._cur, "signal_ok": ok,
+            "since": st.get("_ceiling_since"), "pool": len(self._pool),
+            "shed": shed, "draining": draining, "exempt": powered_exempt,
+            "forced": self.forced_total,
+        }
+
+    def _publish(self):
+        """Hand the report to whoever is listening. Never raises and never
+        waits on a decision: a failure is logged once per change and the next
+        tick tries again."""
+        rep = self._rep
+        if rep is None:
+            return
+        rep["forced"] = self.forced_total
+        for what, sink, live_only in (("metrics", self.metrics, False),
+                                      ("status", self.status, True)):
+            if sink is None or (live_only and self.cfg.mode != "on"):
+                continue
+            key = "_publish_" + what
+            try:
+                sink.publish(dict(rep))
+            except Exception as e:                    # noqa: BLE001
+                if self.st.get(key) != str(e):
+                    self.log("warn", _PUBLISH_FAILED[what], err=str(e))
+                    self.st[key] = str(e)
+            else:
+                if self.st.pop(key, None) is not None:
+                    self.log("info", "publishing the %s again" % what)
+
     # -- reconcile -------------------------------------------------------
     def tick(self):
+        """One reconcile, and then the report of it -- whichever way it ends.
+
+        The report is made even when the tick fails: a demand signal that is
+        down must not also silence the one place an operator reads that a
+        ceiling is engaged.
+        """
+        self._rep = None
+        try:
+            self._reconcile()
+        finally:
+            self._publish()
+
+    def _reconcile(self):
         cfg, st = self.cfg, self.st
         if cfg.mode == "off":
             self.log("info", "mode=off; no observation, no action")
@@ -1471,14 +2031,32 @@ class Controller:
                 self.log("info", "operator cordon cleared", released=st["_held_last"])
             st["_held_last"] = held
 
+        # The capacity ceiling: read, and acted on, BEFORE the demand signal.
+        # See _ceiling_section() for why the order is the point.
+        begun = self._ceiling_section(present, states, held, maint, awake,
+                                      wakeable)
+        limit = self._limit
+
         # Read AFTER the notification reconcile, which needs only node state: a
         # demand signal that is down must not also stop re-asserting alerts --
         # they carry a TTL, and would resolve themselves in the outage.
-        shortfall = self.signal.shortfall()
-        capacity, backlog = self._size(shortfall,
-                                       [states[n].capacity for n in present])
+        demand_known = True
         try:
-            saturated = self.signal.saturated_units()
+            shortfall = self.signal.shortfall()
+            capacity, backlog = self._size(
+                shortfall, [states[n].capacity for n in present])
+        except Exception as e:                        # noqa: BLE001
+            if limit is None:
+                raise                  # as it always did: do not act
+            # With a ceiling in force the shed has begun and has to be seen
+            # through, and nothing it needs depends on demand. So the phases
+            # advance -- and nothing that WOULD depend on demand is decided.
+            self.log("error", "demand signal failed; carrying on with the "
+                              "capacity ceiling alone", err=str(e))
+            demand_known = False
+            shortfall, capacity, backlog = 0.0, None, 0
+        try:
+            saturated = (self.signal.saturated_units() if demand_known else 0)
         except Exception as e:                        # noqa: BLE001
             self.log("warn", "saturation check failed; sizing on shortfall "
                              "alone", err=str(e))
@@ -1534,6 +2112,19 @@ class Controller:
                 self.log("warn", "fit check failed; holding the pool as it is",
                          err=str(e))
                 want = len(awake)
+        # The ceiling caps what is wanted -- AFTER the fit guard, which can
+        # hand `want` back as "the pool as it is", and to `unguarded` as well,
+        # which the stranded repair reads: clamped before either, a guard that
+        # holds the pool, or a repair that returns a stranded node to service,
+        # puts nodes in service over the ceiling. One clamp, here, covers the
+        # wake, the mid-sleep rescue, the visit takeover and the visit
+        # schedule below.
+        wanted = want
+        if limit is not None:
+            want = min(want, limit)
+            unguarded = min(unguarded, limit)
+        if not demand_known:
+            want = unguarded = 0       # nothing below may rescue on a guess
 
         # Advance in-flight operations, then CARRY ON. Returning here would
         # reintroduce the starvation the phase machines exist to remove: one
@@ -1542,6 +2133,12 @@ class Controller:
         settling = [n for n in in_flight if st[n]["phase"] == "powering_off"]
         for n in in_flight:
             phase = st[n]["phase"]
+            if n in begun:
+                # Cordoned a moment ago by the ceiling: its first step is next
+                # tick, the cadence an ordinary sleep keeps -- and this tick's
+                # observation of it, from before the cordon, would read as an
+                # operator having uncordoned it.
+                continue
             if n in held:
                 # An operator cordoned this node mid-operation. Finishing a
                 # wake would uncordon them. Their intent wins.
@@ -1629,7 +2226,7 @@ class Controller:
                 continue
             try:
                 if phase == "waking":
-                    if self.wake(n):
+                    if self.wake(n, room=limit is None or len(awake) < limit):
                         # Serving from this tick on. Counted now, or the
                         # decisions below see demand this node already meets.
                         awake.append(n)
@@ -1649,6 +2246,10 @@ class Controller:
         # Before the stranded repair, which ends the tick: a request is an
         # operator waiting, and must not queue behind a repair on another node.
         took_up = self._take_up_maintenance(maint, states, settling)
+        if not demand_known:
+            # What follows decides on demand, which could not be read. The
+            # phases above are already advanced; the rest waits for a signal.
+            return
 
         # A node powered on but cordoned is in NEITHER desired state: burning
         # power, serving nothing. It gets there when an operation is
@@ -1690,7 +2291,20 @@ class Controller:
                   and st[n].get("booting")]
         self.log("info", "observed", shortfall=_show(shortfall),
                  saturated=saturated, want=want, awake=awake, in_use=in_use,
-                 coming=coming)
+                 coming=coming, ceiling=self._eff, wanted=wanted)
+        # Demand the ceiling is refusing stays visible, once per change -- it
+        # is the one reason a node does not come up that is not a fault -- and
+        # a shadow says what it would not have done.
+        refused = (wanted, want) if (
+            limit is not None and wanted > want
+            and wanted > len(awake) + len(coming)) else None
+        if refused != st.get("_refused_last"):
+            if refused:
+                self.log("info", "dry_run: would not wake: a capacity ceiling "
+                                 "forbids it" if cfg.mode != "on" else
+                                 "not waking: a capacity ceiling forbids it",
+                         wanted=wanted, allowed=want, ceiling=limit)
+            st["_refused_last"] = refused
         # A node that joined service last tick carries work a SCRAPED signal
         # may not have seen placed yet: busy() counts it, and a shortfall
         # from before the scrape counts it again. Hold new wakes for that one
@@ -1708,7 +2322,14 @@ class Controller:
             # came up -- measured in production at three and four nodes for
             # want=1, every demand episode, each then held up by min_uptime.
             if (now - st["want_high_since"] >= cfg.wake_sustain_s
-                    and want > len(awake) + len(coming) and not just_joined):
+                    and want > len(awake) + len(coming) and not just_joined
+                    # Gated on nodes still POWERED, draining ones included, and
+                    # not only on those in service: a shed node is cordoned and
+                    # so not awake, but it draws power until it is off, and a
+                    # budget ceiling would otherwise be exceeded for the length
+                    # of every drain.
+                    and (limit is None
+                         or self._powered(cutting=True) < limit)):
                 for n in wakeable:
                     if n in awake or n in in_flight:
                         continue
@@ -1769,7 +2390,19 @@ class Controller:
         # left over and nothing more -- not even a tick in which an operator's
         # request has just powered a node on, which serialisation would have
         # stopped had the request been a phase.
-        if not took_up:
+        if self._engaged:
+            # Visits power hardware on for nobody, and a ceiling is a request
+            # for fewer nodes on. They are owed from the release, and the
+            # schedule is measured from when a node went dark, so they come
+            # due the moment it lifts. Said once -- it would otherwise look
+            # like the schedule had silently stopped.
+            if cfg.maintenance_interval_s and not st.get("_visits_held"):
+                self.log("info", "scheduled maintenance visits are held back "
+                                 "while a capacity ceiling is in force",
+                         ceiling=limit)
+                st["_visits_held"] = True
+        elif not took_up:
+            st["_visits_held"] = False
             self._maybe_maintain(present, states, awake, want)
 
 
@@ -1780,6 +2413,15 @@ _POWERED_UNEXPLAINED = ("powered but not Ready, and nothing metalnap is "
 _NOT_OFF = "did not power off within %ds of a soft shutdown"
 _RECHECKABLE = (_BMC_UNREADABLE, _POWERED_UNEXPLAINED,
                 _NOT_OFF.split("%")[0])
+
+#: What is logged when a report cannot be published. Fixed phrases: the
+#: status one names what `metalnap status` reads, and must not read as a
+#: failure of the thing it reports on.
+_PUBLISH_FAILED = {
+    "status": "could not publish the capacity ceiling status; decisions are "
+              "unaffected",
+    "metrics": "could not update the metrics; decisions are unaffected",
+}
 
 
 class _WithoutAlerts:

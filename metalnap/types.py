@@ -77,6 +77,16 @@ class NodeState:
     #: request; in memory, a restart powered back on a machine the operator
     #: had since switched off to work on.
     maintenance_started_at: Optional[float] = None
+    #: When a capacity ceiling began holding this node down -- the anchor of
+    #: the drain deadline a busy node is given (CEILING_DRAIN_DEADLINE_S). The
+    #: same reasoning as every note above, and the one the ceiling cannot do
+    #: without: in memory, a restart mid-drain resets the deadline and a busy
+    #: node is held for as long as the controller keeps restarting. It is
+    #: deliberately NOT measured from ours_since (the cordon's timestamp): that
+    #: one is as old as the node's last sleep, and a deadline measured from it
+    #: would force a drain that began a second ago. Removed when the node is
+    #: brought back and when the ceiling is released.
+    shed_at: Optional[float] = None
 
 
 class NodeSource(Protocol):
@@ -91,12 +101,13 @@ class NodeSource(Protocol):
     def note(self, name: str, key: str, value) -> None:
         """Durably record one of the notes above; None removes it.
 
-        OPTIONAL. `key` is "power-cycled", "visited", "shutdown" or
+        OPTIONAL. `key` is "power-cycled", "visited", "shutdown", "shed" or
         "maintenance-started" with a unix timestamp, or "trouble" with a
         reason. Without it the controller never power-cycles -- a cycle it
         cannot put on record is one the bound cannot see -- never powers a node
         on for maintenance, for the same reason, and remembers the rest only
-        until it restarts.
+        until it restarts (a shed's drain deadline restarts with it, which is
+        the safe direction: later, never earlier).
 
         Never "maintenance" itself: that one is the operator's to write.
         """
@@ -183,6 +194,25 @@ class DemandSignal(Protocol):
 
         Return True if you cannot tell -- but know that "always True" means
         powering on a machine for work it can never run.
+        """
+
+
+class CapacityCeiling(Protocol):
+    """The most managed nodes that may be awake right now."""
+
+    def limit(self) -> Optional[int]:
+        """Max nodes allowed awake, or None for no ceiling.
+
+        0 is a real answer -- shed everything -- and is NOT None. A ceiling of
+        0 is the whole reason this seam exists, and a source that cannot tell
+        "none" from "zero" has the failure mode the other way round: an empty
+        query result reads as an order to power the pool off.
+
+        Raise if you cannot tell. That reads as "no ceiling", never as 0, and
+        it releases a ceiling that is in force: an outage of the signal must
+        never be what powers a node off, so it is never allowed to look like
+        a reading. Anything that is not a whole number of nodes is "cannot
+        tell" -- NaN, infinity, a negative -- and a fraction is floored.
         """
 
 
@@ -334,6 +364,13 @@ class NullNotifier:
 
     def clear_alert(self, node):
         pass
+
+
+class NullCeiling:
+    """Default. No ceiling, ever, so a wiring without one is unchanged."""
+
+    def limit(self):
+        return None
 
 
 class NullWarmup:

@@ -84,19 +84,51 @@ Optional:
     SHUTDOWN_TIMEOUT_S      how long a soft shutdown may take before the node
                             is reported as one that would not power off
                             (default 600). Never forced.
+    CEILING_QUERY           PromQL on PROM_URL: a capacity ceiling. Its VALUE
+                            is the most managed nodes that may be awake, and NO
+                            SERIES MEANS NO CEILING -- so a gate such as
+                              vector(0) and on() (max(temp) > 35)
+                            is 0 while it is hot and absent otherwise. Several
+                            series take the minimum; an error, NaN or a negative
+                            is "cannot tell", which is never zero: it engages no
+                            ceiling and RELEASES one that is engaged. Staleness
+                            is the expression's job: end it with `and on()
+                            (time() - timestamp(m) < 120)`. Combine signals
+                            INSIDE the one expression, and beware `A or B`: both
+                            sides are label-less, so `or` keeps only A.
+    CEILING_STATIC          a fixed ceiling, to try the shed path with no signal.
+                            0 is a ceiling (shed everything). Not with a query.
+                            Neither set (the default) is no ceiling at all.
+    CEILING_RELEASE_HOLD_S  a looser reading must hold this long before shed
+                            nodes are released (default 900): the ceiling
+                            tightens at once and loosens only after this.
+    CEILING_DRAIN_DEADLINE_S
+                            a node carrying work is given this long to finish
+                            before a shed shuts it down anyway, the ordinary soft
+                            way, announced first (default 600). 0 never forces,
+                            and is warned about. The one place metalnap ends
+                            running work on purpose.
+    STATUS_CONFIGMAP        the ConfigMap the controller publishes what it has
+                            concluded to, for `metalnap status` (the chart sets
+                            it with a ceiling). Its namespace is the pod's own.
+    METRICS_PORT            serve Prometheus metrics on this port; 0, the
+                            default, serves none. There is no other listener.
     ... plus every timer in metalnap/config.py
 """
 import os
 import sys
 
 from . import Config, Controller, cli
+from .ceiling import from_config as ceiling_from_config
 from .drain import ArcDrain
 from .drain.arc import ARC_SATURATION_QUERY
 from .kube import (Kube, KubeNodeSource, PendingPodFit, PendingPodShortfall,
                    allocatable)
+from .metrics import Metrics, serve as serve_metrics
 from .notify import AlertmanagerNotifier
 from .power import IpmiPower
 from .signal import PrometheusSignal
+from .status import ConfigMapStatus
 from .warmup import ImagePrepull
 
 
@@ -178,10 +210,48 @@ def main(argv=None):
                                 "WARMUP_PULL_SECRETS", "").split(","))],
     ) if warm_image else None
 
+    # Refused at start, with the setting named: a ceiling with two sources, or a
+    # negative one, would otherwise surface as a controller that sheds nothing.
+    cfg = Config().validate()
+    prom_url = require("PROM_URL")
+    ceiling = ceiling_from_config(cfg, prom_url)
+
+    # Reporting, both of it, and neither is read back: the status object that
+    # `metalnap status` reads, and a metrics listener. Off unless asked for.
+    status = None
+    status_name = os.environ.get("STATUS_CONFIGMAP", "").strip()
+    if status_name:
+        # A short timeout of its own: reporting must not be able to hold a
+        # tick for the thirty seconds a decision's read is allowed.
+        status_kube = Kube(timeout=5)
+        try:
+            with open(status_kube.sa + "/namespace") as f:
+                status = ConfigMapStatus(status_kube, f.read().strip(),
+                                         status_name)
+        except OSError as e:
+            print("metalnap: STATUS_CONFIGMAP is set but this pod's namespace "
+                  "could not be read (%s); `metalnap status` will have no "
+                  "ceiling to show" % e, file=sys.stderr)
+    metrics = None
+    port = os.environ.get("METRICS_PORT", "0").strip() or "0"
+    if not (port.isdigit() and int(port) <= 65535):
+        sys.exit("metalnap: METRICS_PORT must be a port number, or 0 for none; "
+                 "got %r" % port)
+    if int(port) > 0:
+        metrics = Metrics()
+        try:
+            serve_metrics(metrics, int(port))
+        except OSError as e:
+            sys.exit("metalnap: cannot serve metrics on port %s: %s"
+                     % (port, e))
+
     Controller(
         nodes=nodes,
         notifier=notifier,
         warmup=warmup,
+        ceiling=ceiling,
+        status=status,
+        metrics=metrics,
         node_source=KubeNodeSource(
             kube, annotation=os.environ.get("CORDON_ANNOTATION",
                                             "metalnap.io/cordoned"),
@@ -189,12 +259,12 @@ def main(argv=None):
         power=IpmiPower(host_for=lambda n: host_fmt.format(node=n),
                         user=require("BMC_USER"), password=require("BMC_PASS")),
         signal=PrometheusSignal(
-            require("PROM_URL"),
+            prom_url,
             queries,
             sat_q or None,
             fit_check=PendingPodFit(kube, ns, taint=taint)),
         drain=ArcDrain(kube, namespace=ns),
-        config=Config(),
+        config=cfg,
     ).run_forever()
     return 0
 

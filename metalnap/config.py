@@ -1,6 +1,7 @@
 """Tunables. Every one is an operational knob, so every one is settable."""
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 # Each default is read from the environment when a Config is BUILT, not when
 # this module is imported. As plain default expressions they were read once,
@@ -18,6 +19,15 @@ def _i(name, default):
 
 def _s(name, default):
     return field(default_factory=lambda: os.environ.get(name, default).strip())
+
+
+def _opt_i(name):
+    """An integer that may be absent. Unset and empty are both absent, and 0 is
+    a value: `static: 0` is a ceiling of zero nodes, not "no ceiling"."""
+    def read():
+        v = os.environ.get(name, "").strip()
+        return int(v) if v else None
+    return field(default_factory=read)
 
 
 @dataclass
@@ -94,11 +104,33 @@ class Config:
     #: avoid.
     maintenance_timeout_s: int = _i("MAINTENANCE_TIMEOUT_S", 3600)
 
+    # -- capacity ceiling -------------------------------------------------
+    # An external signal that caps how many managed nodes may be awake, down
+    # to none. Off unless one of the two sources below is set.
+    #: PromQL on PROM_URL. Its value is the most nodes allowed awake; NO series
+    #: means no ceiling. Parsed by metalnap.ceiling.PrometheusCeiling, which
+    #: reads an empty result as "none" -- the opposite of the demand signal,
+    #: where empty is zero.
+    ceiling_query: str = _s("CEILING_QUERY", "")
+    #: A fixed ceiling, to exercise the shed path without a signal. 0 is a
+    #: ceiling (shed everything), and unset is not. Not with a query.
+    ceiling_static: Optional[int] = _opt_i("CEILING_STATIC")
+    #: A looser reading must hold this long before shed nodes are released:
+    #: the ceiling tightens at once and loosens only after this, so a signal
+    #: that flaps does not cost a wake and a sleep per flap. Held in memory,
+    #: so a restart forgets it -- which is the fail-open direction.
+    ceiling_release_hold_s: int = _i("CEILING_RELEASE_HOLD_S", 900)
+    #: How long a node carrying work is given to finish before a shed powers
+    #: it off anyway, with the ordinary soft shutdown. 0 never forces: a busy
+    #: node then holds the ceiling open for as long as its work runs.
+    ceiling_drain_deadline_s: int = _i("CEILING_DRAIN_DEADLINE_S", 600)
+
     def validate(self):
         if self.mode not in ("off", "dry_run", "on"):
             raise ValueError("MODE must be off|dry_run|on, got %r" % self.mode)
         self._validate_maintenance()
         self._validate_escalation()
+        self._validate_ceiling()
         return self
 
     def warnings(self):
@@ -108,6 +140,11 @@ class Config:
             out.append("WAKE_SUSTAIN_S >= SLEEP_SUSTAIN_S: the controller will "
                        "sleep as readily as it wakes, and every cold start "
                        "costs real latency to whatever was queued")
+        if self.ceiling_drain_deadline_s == 0:
+            out.append("CEILING_DRAIN_DEADLINE_S=0: a node carrying work is "
+                       "never shed, so a capacity ceiling cannot by itself "
+                       "bring an emergency under control -- it waits for "
+                       "that work for as long as the work takes")
         return out
 
     def _validate_escalation(self):
@@ -124,6 +161,25 @@ class Config:
                 % (self.power_cycle_cooldown_s, self.wake_timeout_s))
         if self.shutdown_timeout_s <= 0:
             raise ValueError("SHUTDOWN_TIMEOUT_S must be > 0")
+
+    def _validate_ceiling(self):
+        """Reject a ceiling that is ambiguous, rather than pick a source.
+
+        Two sources would have to be combined, and which of them wins is
+        exactly the decision somebody should make on purpose -- in the query,
+        with min(), where they can see it.
+        """
+        if self.ceiling_query and self.ceiling_static is not None:
+            raise ValueError("CEILING_QUERY and CEILING_STATIC are mutually "
+                             "exclusive: set one source of the ceiling")
+        if self.ceiling_static is not None and self.ceiling_static < 0:
+            raise ValueError("CEILING_STATIC must be >= 0 (0 sheds every "
+                             "node; leave it unset for no ceiling)")
+        if self.ceiling_release_hold_s < 0:
+            raise ValueError("CEILING_RELEASE_HOLD_S must be >= 0")
+        if self.ceiling_drain_deadline_s < 0:
+            raise ValueError("CEILING_DRAIN_DEADLINE_S must be >= 0 "
+                             "(0 never forces a busy node)")
 
     def _validate_maintenance(self):
         """Reject schedules that cannot work, rather than half-working.

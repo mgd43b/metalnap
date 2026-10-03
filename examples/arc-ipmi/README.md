@@ -78,6 +78,13 @@ the delete with `resourceNames`. An unqualified grant silently hands back the
 permission the ClusterRole above is carefully withholding — we shipped exactly
 that mistake.
 
+A [capacity ceiling](../../README.md#capacity-ceiling) wires in as one more seam
+(`ceiling=PrometheusCeiling(url, query)` or `StaticCeiling(n)`), needs no RBAC of
+its own, and sheds through the same cordon and ordinary sleep. To let
+`metalnap status` show it, pass `status=ConfigMapStatus(kube, namespace, name)`
+(from `metalnap.status`) and grant `get`/`update` on that one ConfigMap by name,
+in its own namespace — never a wider `configmaps` grant.
+
 ## Taint the burst nodes
 
 ```

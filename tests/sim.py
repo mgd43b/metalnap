@@ -50,6 +50,21 @@ The cluster model is faithful on the points a controller gets wrong:
     until the partition heals. From outside it looks exactly like a wedge, and
     it is the case that makes "never interrupt running work" apply to a power
     cycle too.
+  * on half the seeds a CAPACITY CEILING comes and goes in episodes -- steady at
+    0 or 1, flickering between a value and no series, or noisy, with outright
+    errors in it -- and restarts are drawn into those episodes, because a
+    restart in the middle of a shed is where a deadline held in memory is
+    caught. What the controller ought to do is written out again here, from the
+    readings served -- the trailing hold, what is exempt, who may be forced --
+    and not read off the controller: an invariant asserted against the
+    controller's own idea of the ceiling would pass whatever that idea was.
+    SAFETY is the hooks (no wake or visit begun past it, no node put into
+    service over it, no busy node cordoned out of order or powered off outside
+    a shed's deadline and the current reading, no deadline re-stamped, no power
+    cycle). LIVENESS is that an engaged ceiling CONVERGES -- the nodes the
+    controller can act on end up at or under it within a drain deadline and a
+    shutdown or two -- because safety alone is satisfied by a controller that
+    does nothing.
 
 Four things this harness got WRONG before it got them right, each of which made
 it report OK while testing nothing:
@@ -159,7 +174,53 @@ measured without requests and with them (60 x 900, then 600 x 900):
 The rest have not been re-measured. The other half of the seeds draw nothing
 for requests, and play out exactly as they did before them.
 
-Every row in all four tables -- the zeroes and the ones -- also fails a
+and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
+300 of 600), each mistake reintroduced afresh:
+
+    a shed's deadline held in memory                   29/30   292/300
+    a shed note outliving the ceiling                  29/30   298/300
+    an error averaged into the hold                    23/30   194/300
+    a scheduled visit begun under a ceiling            18/30   180/300
+    a shed's deadline re-stamped when it is resumed    17/30   171/300
+    a node carrying work shed before an idle one        8/30   112/300
+    the deadline forced for a ceiling only the hold
+      still asks for                                    7/30    67/300
+    a wedged node power-cycled under a ceiling          5/30    38/300
+    the drain timeout ending a shed                     2/30    26/300
+    the hold taken as a maximum, not a minimum          0/30     7/300
+    a wake that has just arrived not shed               0/30     3/300
+    the attempt bound ending a shed                     0/30     1/300
+    clamp before the fit guard                          0/30     0/300
+    `unguarded` not clamped                             0/30     0/300
+    a visit in progress left to run its window          0/30     0/300
+    wakes gated on the nodes in service, not powered    0/30     0/300
+    a drain turned into a shed that is not needed       0/30     0/300
+    a shed the reading no longer needs not given back   0/30     0/300
+    the end of the list not shed first                  0/30     0/300
+    forcing counted a node already powering off         0/30     0/300
+    a node cut off from the cluster not counted         0/30     0/300
+    a power-off with no announcement, past the deadline 0/30     0/300
+    a ceiling above the pool counted as engaged         0/30     0/300
+    a woken node keeping the anchor of the shed before  0/30     0/300
+    a failing demand signal aborting a shed             0/30     0/300
+    demand-side decisions made with demand unreadable   0/30     0/300
+    no series read as a ceiling of 0, in the controller 60/60   600/600
+
+The last row is every seed because the mistake is not confined to the seeds that
+run a ceiling: a controller with none reads "no series" too. The same mistake in
+PrometheusCeiling is out of this harness's reach -- it supplies the ceiling's
+readings itself -- and is pinned in test_controller.py.
+
+The zeroes are the same kind as the ones above: caught deterministically, and out
+of this harness's reach rather than missed. The clamp rows are the clearest case:
+a shed takes a stranded node, and every node over the ceiling, BEFORE the
+demand-side decisions the clamp governs, so the pool never sits over the ceiling
+for the clamp alone to answer for. A shadow does not shed, so a test in dry_run
+is where both are seen. The wake gate, the in-flight visit, and who is forced
+or given back are each one choice among several that all converge, which this
+harness's convergence bound cannot tell apart.
+
+Every row in all five tables -- the zeroes and the ones -- also fails a
 deterministic test in test_controller.py. The low rows are the ones that need
 two rare things at once (a restart inside a shutdown, a partition that
 outlasts a wake timeout, a visit's reboot that wedges), which is exactly why
@@ -254,6 +315,10 @@ class Node:
         self.maintenance = None
         #: Ignored the last soft shutdown, and is still up because of it.
         self.ignored_off = False
+        #: When a capacity ceiling began holding this node down -- durable,
+        #: like the notes above, because the drain deadline of a node carrying
+        #: work is measured from it and has to outlive a restart.
+        self.shed_at = None
 
 
 class Sim:
@@ -320,6 +385,27 @@ class Sim:
         #: own phase, which is the only honest way to tell a maintenance visit
         #: apart from a drain that happens to look identical from outside.
         self.controller = None
+        #: A capacity ceiling runs on half the seeds, split on seed // 5 so it
+        #: is independent of the visit (seed % 2), cooldown (seed % 3) and
+        #: per-resource (seed % 4) splits and of the operator-request one; the
+        #: other half keep no ceiling at all and play out exactly as before,
+        #: because every die it rolls is its own.
+        self.ceiling_on = (seed // 5) % 2 == 1
+        self.ceil_rnd = random.Random("ceiling-%d" % seed)
+        #: The signal's episode: what shape it takes, for how many more ticks.
+        self.ceil_kind, self.ceil_left = None, 0
+        self.ceil_value, self.ceil_flip = 0, False
+        #: What the signal says THIS tick: an int, None for no series, or
+        #: "error" for an unreachable Prometheus.
+        self.ceil_reading = None
+        #: [(t, reading)] -- the harness's own model of the controller's
+        #: trailing hold, kept independently so it can be asserted against. An
+        #: error empties it; a restart does too, which is the documented
+        #: direction (the hold is in memory, and a restart fails open).
+        self.ceil_hist = []
+        self.ceil_over_since, self.ceil_pool_key = None, None
+        self.ceil_breaches = []
+        self.forced_sheds = self.shed_episodes = self.sheds_begun = 0
 
     @staticmethod
     def default_cfg(seed):
@@ -388,7 +474,8 @@ class Sim:
                          visited_at=n.visited_at,
                          shutdown_at=n.shutdown_at, trouble=n.trouble,
                          maintenance=n.maintenance,
-                         maintenance_started_at=n.maintenance_started_at)
+                         maintenance_started_at=n.maintenance_started_at,
+                         shed_at=n.shed_at)
 
     def _asked_for(self, name, what):
         """Record `what` as an intrusion if an operator's request stood on
@@ -401,6 +488,94 @@ class Sim:
         if self.observed.get(name):
             self.intruded.append((self.t, name, what))
 
+    # -- the capacity ceiling, as the harness models it ---------------------
+    # Kept apart from the controller's bookkeeping on purpose: an invariant
+    # asserted against the controller's own idea of the ceiling would pass
+    # whatever that idea was. This is the same rule written out again, from
+    # the readings the signal served.
+    def step_ceiling(self):
+        """What the signal says this tick. An episode is a stretch of one
+        shape -- steady, flickering, or noisy with errors -- and between them
+        there is no series, with the odd lone error that must change nothing."""
+        r = self.ceil_rnd
+        if self.ceil_left > 0:
+            self.ceil_left -= 1
+        else:
+            self.ceil_kind = None
+            if r.random() < 0.012:
+                self.ceil_kind = r.choice(("steady", "steady", "flicker",
+                                           "noisy"))
+                self.ceil_value = r.choice((0, 0, 1))
+                self.ceil_left = r.randint(8, 70)
+                self.shed_episodes += 1
+        if self.ceil_kind is None:
+            self.ceil_reading = "error" if r.random() < 0.01 else None
+        elif self.ceil_kind == "steady":
+            self.ceil_reading = self.ceil_value
+        elif self.ceil_kind == "flicker":
+            self.ceil_flip = not self.ceil_flip
+            self.ceil_reading = self.ceil_value if self.ceil_flip else None
+        else:
+            x = r.random()
+            self.ceil_reading = (self.ceil_value if x < 0.6
+                                 else None if x < 0.85 else "error")
+        # The model is advanced HERE, by the world, and not when the
+        # controller reads: one that never read the signal would otherwise
+        # leave the model believing there was no ceiling, and pass.
+        if self.ceil_reading == "error":
+            self.ceil_hist = []
+        elif self.ceil_reading is not None:
+            self.ceil_hist.append((self.t, self.ceil_reading))
+        hold = self.cfg.ceiling_release_hold_s
+        self.ceil_hist = [(t, v) for t, v in self.ceil_hist
+                          if t == self.t or self.t - t < hold]
+
+    def limit(self):
+        """The CapacityCeiling seam: what the signal says this tick."""
+        if self.ceil_reading == "error":
+            raise RuntimeError("prometheus unreachable")
+        return self.ceil_reading
+
+    def exempt(self, n):
+        """Held by an operator, by cordon or by request: not the ceiling's."""
+        return n.name in self.human_held or n.maintenance is not None
+
+    def pool(self):
+        return [n for n in self.nodes.values() if not self.exempt(n)]
+
+    def model_limit(self):
+        """The effective limit: the minimum of the trailing hold, clamped to
+        the nodes there are. None when no ceiling is in force."""
+        if not self.ceiling_on or not self.ceil_hist:
+            return None
+        return min(min(v for _t, v in self.ceil_hist), len(self.nodes))
+
+    def model_binding(self):
+        lim = self.model_limit()
+        return lim is not None and lim < len(self.pool())
+
+    def powered_pool(self):
+        """Powered nodes the controller can do something about: a locked
+        kernel is not one, and neither is one cut off from the cluster."""
+        return [n for n in self.pool()
+                if n.powered and not n.hung and n.partitioned is None]
+
+    def forced_ok(self, name):
+        """May a node carrying work be powered off now? Only a shed past its
+        deadline, while the CURRENT reading still wants fewer nodes powered
+        than there are -- the one place work is interrupted on purpose."""
+        n = self.nodes[name]
+        cur = self.ceil_reading
+        deadline = self.cfg.ceiling_drain_deadline_s
+        # Counting a node cut off from the cluster too -- one the controller is
+        # draining is as powered as any other, and forcing is what is being
+        # bounded here, so the count errs on the side of allowing it.
+        powered = [m for m in self.pool() if m.powered and not m.hung]
+        return bool(deadline and self.model_limit() is not None
+                    and n.shed_at is not None
+                    and self.t - n.shed_at >= deadline
+                    and isinstance(cur, int) and cur < len(powered))
+
     def set_cordon(self, name, cordoned):
         n = self.nodes[name]
         self._asked_for(name, "uncordoned" if not cordoned else "cordoned")
@@ -410,18 +585,48 @@ class Sim:
                 w.node == name and w.work for w in self.workers):
             # Taking a node out of service while it carries work: the drain
             # then holds it, serving nothing new, for as long as the work
-            # takes. Sleeps are for idle nodes.
-            self.cordoned_busy.append((self.t, name))
+            # takes. Sleeps are for idle nodes -- and the one other reason is
+            # a shed, which is on record before it is made and which takes
+            # idle nodes first.
+            idle_awake = [m for m in self.pool()
+                          if m.name != name and m.ready and not m.cordoned
+                          and not any(w.node == m.name and w.work
+                                      for w in self.workers)]
+            if not (self.model_binding() and n.shed_at is not None):
+                self.cordoned_busy.append((self.t, name))
+            elif idle_awake:
+                self.ceil_breaches.append(
+                    (self.t, name, "shed a node carrying work while %s sat "
+                     "awake and idle" % idle_awake[0].name))
+        if not cordoned and self.model_binding() and not self.exempt(n):
+            serving = [m for m in self.pool() if m.name != name and m.ready
+                       and not m.cordoned]
+            if len(serving) + 1 > self.model_limit():
+                self.ceil_breaches.append(
+                    (self.t, name, "put a node into service over the "
+                     "ceiling (%d allowed)" % self.model_limit()))
         n.cordoned = cordoned
         n.ours = self.t if cordoned else None
 
     def note(self, name, key, value):
-        setattr(self.nodes[name], {"power-cycled": "power_cycled_at",
-                                   "visited": "visited_at",
-                                   "shutdown": "shutdown_at",
-                                   "trouble": "trouble",
-                                   "maintenance-started":
-                                       "maintenance_started_at"}[key], value)
+        node = self.nodes[name]
+        if (key == "shed" and value is not None and node.shed_at is not None
+                and node.cordoned and node.ours is not None
+                and value != node.shed_at):
+            # The deadline's anchor, written again under the same cordon: a
+            # restart, or a shed that forgot it had begun, handing a busy node
+            # a fresh ten minutes -- for ever, if it keeps happening.
+            self.ceil_breaches.append(
+                (self.t, name, "re-stamped the shed deadline of a node it "
+                 "was already holding down"))
+        if key == "shed" and value is not None and node.shed_at is None:
+            self.sheds_begun += 1
+        setattr(node, {"power-cycled": "power_cycled_at",
+                       "visited": "visited_at",
+                       "shutdown": "shutdown_at",
+                       "trouble": "trouble",
+                       "maintenance-started": "maintenance_started_at",
+                       "shed": "shed_at"}[key], value)
         req = self.requests.get(name)
         if key == "maintenance-started" and req is not None:
             # Taken up, by the controller's own account. Kept apart from the
@@ -439,6 +644,22 @@ class Sim:
 
     def power_on(self, name):
         n = self.nodes[name]
+        if (self.ceiling_on and not self.observed.get(name)
+                and self.model_binding() and not self.exempt(n)):
+            # Not a request an operator made -- those are exempt, and a
+            # person asked. A wake or a visit, while the ceiling is in force.
+            visit = (self.controller.st.get(name) or {}
+                     ).get("maintenance_at") == self.t
+            others = [m for m in self.powered_pool() if m.name != name]
+            if visit:
+                self.ceil_breaches.append(
+                    (self.t, name, "began a scheduled visit while a ceiling "
+                     "is in force"))
+            elif len(others) + 1 > self.model_limit():
+                self.ceil_breaches.append(
+                    (self.t, name, "powered a node on past the ceiling: %d "
+                     "already on, %d allowed" % (len(others),
+                                                 self.model_limit())))
         if self.observed.get(name):
             # The one thing the controller may do to a node asked for, and
             # only once per request: after that the machine's power is the
@@ -472,8 +693,13 @@ class Sim:
         if self.nodes[name].updating:
             self.interrupted_update.append((self.t, name))
             self.nodes[name].updating = None
-        for w in self.workers:
-            if w.node == name and w.work:
+        busy = [w for w in self.workers if w.node == name and w.work]
+        if busy and self.forced_ok(name):
+            # A shed past its deadline: work ended, on purpose, by the
+            # ordinary soft shutdown. Counted, so a run can say it was reached.
+            self.forced_sheds += 1
+        else:
+            for w in busy:
                 self.powered_off_busy.append((self.t, name, w.name, w.work))
         n = self.nodes[name]
         if n.hung:
@@ -496,6 +722,10 @@ class Sim:
         self._asked_for(name, "power cycle")
         if name in self.human_held:
             self.stomped.append((self.t, name, "power-cycled while held"))
+        if self.model_binding():
+            # It would power back on a node the ceiling wants down.
+            self.bad_cycle.append((self.t, name, "power-cycled while a "
+                                                 "ceiling is in force"))
         if n.updating:
             self.interrupted_update.append((self.t, name))
             n.updating = None
@@ -1002,6 +1232,53 @@ class Sim:
             fail("tick() called time.sleep(%s) -- the reconcile loop must "
                  "never block" % self.blocked)
 
+        # ---- CAPACITY CEILING ----
+        # The SAFETY half is in the hooks above -- a wake or a visit begun past
+        # the ceiling, a node put into service over it, a busy node taken out
+        # of service or powered off outside a shed's deadline, a deadline
+        # re-stamped, a power cycle -- and arrives here as a breach. The
+        # LIVENESS half is below, and is the one that matters more: safety
+        # alone is satisfied by a controller that does nothing.
+        if self.ceil_breaches:
+            when, who, what = self.ceil_breaches[0]
+            fail("capacity ceiling: %s %s (t=%.0f)" % (who, what, when))
+        if self.ceiling_on:
+            lim = self.model_limit()
+            for n in self.nodes.values():
+                if n.shed_at is not None and lim is None:
+                    fail("%s still carries a shed note with no ceiling in "
+                         "force" % n.name)
+            # An engaged ceiling CONVERGES: once settled, no more than `limit`
+            # nodes the controller can do anything about are powered. The
+            # settle bound is every term that can be reached together --
+            #   drain deadline   a node carrying work is given this long first
+            #   2 x shutdown     one that ignores the request is asked again
+            #                    after its bound, and answers the second time
+            #   boot             a wake in flight at engagement has to arrive
+            #                    before it can be asked to go down
+            #   12 ticks         the ticks a shed is begun, stepped, announced
+            #                    and confirmed in, with slack for the order
+            # Restarted whenever the pool changes, so a node an operator gives
+            # back is judged from the tick it returned, not from one before it.
+            pool = self.pool()
+            key = frozenset(n.name for n in pool)
+            if key != self.ceil_pool_key:
+                self.ceil_over_since, self.ceil_pool_key = None, key
+            powered = len(self.powered_pool())
+            if lim is not None and lim < len(pool) and powered > lim:
+                if self.ceil_over_since is None:
+                    self.ceil_over_since = self.t
+                budget = (self.cfg.ceiling_drain_deadline_s
+                          + 2 * self.cfg.shutdown_timeout_s + BOOT_S
+                          + 12 * self.cfg.interval_s)
+                if self.t - self.ceil_over_since > budget:
+                    fail("a ceiling of %d has been engaged for %.0fs with %d "
+                         "nodes still powered (budget %.0fs) -- it does not "
+                         "converge" % (lim, self.t - self.ceil_over_since,
+                                       powered, budget))
+            else:
+                self.ceil_over_since = None
+
         # The controller catches its own exceptions and logs them, so a defect
         # arrives here as a log line and never as a traceback.
         for _t, lvl, msg in self.log[-60:]:
@@ -1157,7 +1434,11 @@ class Sim:
                 candidate = (not n.powered and n.cordoned
                              and n.ours is not None
                              and n.name not in self.human_held
-                             and n.maintenance is None)
+                             and n.maintenance is None
+                             # None runs while a ceiling is in force: visits
+                             # power hardware on for nobody. They are owed
+                             # from the release, not from before it.
+                             and not self.model_binding())
                 if not candidate:
                     self.unvisited_since.pop(n.name, None)
                     continue
@@ -1229,6 +1510,19 @@ class Sim:
         need = min(sum(1 for n in pool
                        if not n.hung and n.partitioned is None),
                    max(backlog, self.saturated))
+        if self.model_limit() is not None:
+            # A ceiling in force -- the hold included -- is a cap on the
+            # capacity demand may be given, so it is a cap on what is owed.
+            # Less the nodes it is spending on a machine that is powered and
+            # serves nothing -- wedged, or cut off -- while the controller is
+            # still bringing it up: it draws the power the ceiling is about,
+            # and a second node is not woken beside it.
+            phases = self.controller.st if self.controller else {}
+            wedged = sum(1 for n in pool
+                         if n.powered and (n.hung or n.partitioned is not None)
+                         and (phases.get(n.name) or {}).get("phase")
+                         in ("waking", "maintaining"))
+            need = min(need, max(self.model_limit() - wedged, 0))
         # A wedged node is powered and serves nothing, so it is not capacity.
         powered = sum(1 for n in pool
                       if n.powered and not n.hung and n.partitioned is None)
@@ -1245,6 +1539,7 @@ class Sim:
         c = Controller(nodes=["a", "b"], node_source=self, power=_Power(self),
                        signal=self, drain=self, config=self.cfg,
                        notifier=self, warmup=self,
+                       ceiling=self if self.ceiling_on else None,
                        log=lambda lvl, msg, **kv: self.log.append(
                            (self.t, lvl, msg)),
                        clock=self.now)
@@ -1257,10 +1552,20 @@ class Sim:
         try:
             for i in range(self.ticks):
                 self.step_workload()
-                if self.rnd.random() < restart_prob:
+                restart = self.rnd.random() < restart_prob
+                # Restarts are rare enough that few land in the middle of a
+                # shed, which is where a deadline held in memory is caught; so
+                # an episode draws its own, from its own dice.
+                if (self.ceiling_on and self.ceil_kind is not None
+                        and self.ceil_rnd.random() < 0.04):
+                    restart = True
+                if restart:
                     c.st = {}          # a restart loses in-memory state
                     self.muted_hung_since.clear()
                     self.stuck_wake_since.clear()
+                    self.ceil_hist = []     # the hold was in memory
+                if self.ceiling_on:
+                    self.step_ceiling()
                 self.blocked = None
                 self.observed = {k: v.maintenance
                                  for k, v in self.nodes.items()}
@@ -1298,14 +1603,21 @@ def main():
     ap.add_argument("--seeds", type=int, default=60)
     a = ap.parse_args()
     failures = []
+    ceiling = dict(seeds=0, episodes=0, sheds=0, forced=0)
     for seed in range(a.seeds):
+        sim = Sim(seed, a.ticks)
         try:
-            Sim(seed, a.ticks).run()
+            sim.run()
         except InvariantError as e:
             failures.append(str(e))
         except Exception as e:                        # noqa: BLE001
             failures.append("seed=%d unhandled %s: %s"
                             % (seed, type(e).__name__, e))
+        if sim.ceiling_on:
+            ceiling["seeds"] += 1
+            ceiling["episodes"] += sim.shed_episodes
+            ceiling["sheds"] += sim.sheds_begun
+            ceiling["forced"] += sim.forced_sheds
     total = a.seeds * a.ticks
     if failures:
         print("FAILED  %d/%d seeds  (%d ticks simulated)"
@@ -1315,6 +1627,10 @@ def main():
         return 1
     print("OK      %d seeds x %d ticks = %d ticks, all invariants held"
           % (a.seeds, a.ticks, total))
+    # What the ceiling half of it actually reached: a run that never shed a
+    # node, or never ran out a deadline, would pass everything above too.
+    print("        ceiling: %(seeds)d seeds, %(episodes)d episodes, "
+          "%(sheds)d nodes shed, %(forced)d forced at the deadline" % ceiling)
     return 0
 
 

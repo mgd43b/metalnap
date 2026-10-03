@@ -86,6 +86,11 @@ nodes stay asleep with nothing to explain why.
 | `maintenance.staggerS` | `3600` | Per-node spread, so a rack does not power on in unison. |
 | `maintenance.timeoutS` | `3600` | Bound on one visit, from power-on. Must be at least `maintenance.windowS + timers.wakeTimeoutS`, or the chart refuses to install. |
 | `timers.powerCycleCooldownS` | `86400` | A node still powered but not Ready at its wake timeout is power-cycled at most once per node per this long; `0` disables. Must be `0` or at least `timers.wakeTimeoutS`, or the chart refuses to install. |
+| `capacityCeiling.query` | `""` (off) | PromQL on `prometheus.url`: a [capacity ceiling](https://github.com/mgd43b/metalnap#capacity-ceiling). Its value is the most managed nodes allowed awake, and **no series means no ceiling**. Several series take the minimum; NaN, a negative or an error is "cannot tell", which sheds nothing and releases a ceiling that is engaged. End it with a freshness guard (`... and on() (time() - timestamp(m) < 120)`). Not with `static`. |
+| `capacityCeiling.static` | `null` (off) | A fixed ceiling, to watch the shed path without a signal. **`0` is a real ceiling** (shed every node); `null` is none. Not with `query`; the chart refuses both. |
+| `capacityCeiling.releaseHoldS` | `900` | A looser reading must hold this long before shed nodes are released. The ceiling tightens at once. |
+| `capacityCeiling.drainDeadlineS` | `600` | A node carrying work is given this long after it was shed, then shut down anyway — soft, announced first, logged at `error`. `0` never forces, and the controller warns at start. |
+| `metrics.port` | `0` (off) | Serve Prometheus metrics (`metalnap_capacity_ceiling`, `..._engaged`, `..._signal_ok`, `metalnap_nodes_shed`, `metalnap_shed_forced_total`) on this container port. There is no Service: scrape the pod, or add one of your own. |
 | `queries.cpuShortfall` | `""` (read off the pods) | PromQL for unmet CPU in cores. The pool is sized on whichever of memory and CPU needs more nodes; `-` sizes on memory alone. |
 | `timers.*` | see `values.yaml` | Sustain windows, timeouts, retry bounds. |
 
@@ -122,6 +127,15 @@ Each exists because breaking it cost something real.
 - **When a person asks for a node, give it to them and get out of the way.**
   See [maintenance mode](#maintenance-mode).
 
+One of these has a deliberate, bounded exception, and only if you write a
+`capacityCeiling`: **never interrupt running work** gives way, after
+`capacityCeiling.drainDeadlineS`, to the ordinary soft shutdown of a node that
+was shed and is still carrying work — announced first, counted
+(`metalnap_shed_forced_total`), logged at `error`, enforced only while the
+current reading still asks for it, and switched off entirely by `0`. It fails
+open: an unreadable signal is no ceiling, and releases one that is engaged. It
+is not a substitute for BMC thermal protection or UPS shutdown.
+
 ## Maintenance mode
 
 To work on a node, ask for it — no value to set, nothing to redeploy:
@@ -154,11 +168,24 @@ scheduler's API, which deregisters them before teardown.
 With `warmup.image` set it also gets `pods: create`, plus `delete` scoped by
 name to exactly its own warmup pods.
 
+With a `capacityCeiling` set it also gets a namespaced Role granting `get` and
+`update` on **one ConfigMap, by name** — `<release>-status`, which the chart
+creates empty. That is where the controller publishes what `metalnap status`
+shows about the ceiling, because a ceiling belongs to no node. It is a replace,
+not a patch, so no third verb is granted; `create` is not (it is the one verb
+`resourceNames` cannot constrain, which is why the chart creates the object);
+and no other ConfigMap is touched. Nothing the controller decides is read from
+it. Still no `pods/eviction`, and no `pods/delete`: a shed goes through the
+ordinary sleep.
+
 None of that is needed by a person asking for a node — the controller's own
 account does the work. The person needs their own `patch` on `nodes` to
 annotate one; with the CLI, also `get`/`list` on the controller's Deployment
 and ConfigMap and on `nodes`, and `list` on `pods` plus `get` on `pods/log`
 for `metalnap logs` -- `kubectl logs deployment/...` has to find the pods
-before it can read them.
+before it can read them. With a ceiling, `metalnap status` also reads the
+status ConfigMap, with the same `get configmap` it already needs for the
+controller's configuration; without it `status` says it could not read it and
+shows everything else.
 
 [Source and full documentation](https://github.com/mgd43b/metalnap)

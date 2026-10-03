@@ -62,6 +62,16 @@ jobs:
         # and nothing written for a node the controller does not manage.
         run: .venv/bin/python -B tests/test_cli.py
 
+      - name: Chart tests
+        # The chart is RENDERED, not just linted: `static: 0` is a capacity
+        # ceiling of zero nodes, and a template that reads it as unset renders
+        # no ceiling at all -- which no other check here can see. helm is on
+        # the runner image; REQUIRE_HELM makes its absence a failure rather
+        # than a suite of skipped tests that reads as green.
+        env:
+          REQUIRE_HELM: "1"
+        run: .venv/bin/python -B tests/test_chart.py
+
       - name: Simulation harness
         # Thousands of ticks against a fake cluster with phased demand, hung
         # work, operator cordons and maintenance requests, and injected
