@@ -149,6 +149,14 @@ maintenance:
 # `static` is a fixed ceiling, to watch the shed path (in dry_run first) without
 # a signal, or a hard budget. 0 is a real ceiling: shed everything. Not with a
 # `query`.
+#
+# A steady budget (`static: 2` over four nodes) works normally. Scheduled
+# maintenance visits (`maintenance.intervalS`) and the power cycle of a wedged
+# node are for a pool with room: a visit starts only if it cannot take the
+# powered count over the limit, and a wedged node -- counted as powered -- keeps
+# its slot at the limit and is cycled, refused only when the pool is already over
+# it. So a pool AT its limit holds visits back but not the cycle; a pool over it
+# (and any pool under a limit of 0) holds both back.
 capacityCeiling:
   query: ""
   static: null

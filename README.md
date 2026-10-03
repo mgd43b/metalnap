@@ -175,7 +175,9 @@ depends on what its BMC says:
     `metalnap.io/power-cycled` annotation on the node;
   - a maintenance visit powered it on within two `MAINTENANCE_TIMEOUT_S`, and
     it may be rebooting into an update — unless this wake found it off and
-    powered it on itself.
+    powered it on itself;
+  - a [capacity ceiling](#capacity-ceiling) is limiting the pool and the pool is
+    already over it — at the limit, with this node counted, a cycle is fine.
 
 A node that is still not Ready after its cycle, or that may not be cycled, is
 **handed to a human**: unmuted, alerted on as `MetalnapNodeNeedsAttention`
@@ -504,16 +506,27 @@ capacityCeiling:
   against the ceiling (the log says how many exempt nodes remain powered).
   Maintenance mode's own one-time power-on is *not* blocked by a ceiling — a
   person asked — and `metalnap maintenance start` says so. A person who
-  uncordons a node mid-shed is not fought: it is left alone for
-  `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
+  uncordons a node mid-drain -- one the ceiling was already holding down, or an
+  ordinary drain it had not yet picked -- is not fought: the node is *spared*,
+  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
   needs one. (That is held in memory, so a restart forgets it.)
-- **No scheduled visits start** while a ceiling is limiting the pool — they
-  power hardware on for nobody — and no wedged node is power-cycled (a cycle
-  would power a node on that the ceiling may want down; it is handed to a human
-  like any other, even one woken inside the ceiling's headroom). A ceiling that
-  is *always* in force, a budget of `static: 2` over four nodes, so never lets a
-  visit run and never power-cycles a wedged node; the log says so, once, for the
-  visits.
+- **Scheduled visits and a wedged node's power cycle are for a pool with room.**
+  A steady budget — `static: 2` over four nodes — works normally; an emergency
+  holds them back. Both count the nodes still *powered*, as a wake is gated:
+  Ready ones, ones on their way up, draining ones, and a visit already up, but
+  not the nodes an operator holds. A **visit** starts only if it cannot take that
+  count over the limit (`powered + 1 <= limit`), so a limit of 0, or a pool at
+  the limit, holds visits back — said once in the log — and they are owed from
+  the moment there is room. A **visit in progress** carries on while there is
+  headroom, and the shed ends it first, since it serves nothing, when the pool
+  goes over. A **wedged node** is counted as powered — it is drawing the power
+  the ceiling is about — so at the limit it keeps its slot and is power-cycled as
+  ever, and only a pool already *over* the limit refuses the cycle, with the
+  counts in the reason; it is then handed to a human like any wedged node. Every
+  other guard on a cycle is unchanged. (The count is what it can see. A node
+  powered but neither Ready nor in an operation of its own — one booting after an
+  operator repaired it, a visit's reboot a restart made it forget — is not a
+  slot taken until it is Ready: it cannot read every chassis every tick.)
 - **A shed node looks exactly like a slept one** to everything else: silenced
   while it is down, never `trouble`, never power-cycled.
 - **`dry_run`** reads the ceiling and logs what it *would* shed
@@ -540,9 +553,12 @@ node3  in service
 That header is read from a small **status ConfigMap** (`<release>-status`)
 because a ceiling belongs to no node. The chart creates it empty and grants the
 controller `get` and `update` on that one name. It is reporting, not control:
-nothing the controller decides is read from it, it is written after the tick's
-decisions are made, with a five-second timeout of its own, a failed write is
-logged and changes nothing, and it is not written in `dry_run`. Every change is
+nothing the controller decides is read from it, it is written by a background
+thread — the tick hands over the latest report and goes on, so it never waits
+on the API server for a status write, a slow or hung one never queues a backlog
+(the newest report wins), and each call has a five-second timeout of its own — a
+failed write is logged once per change and changes nothing, and it is not
+written in `dry_run`. Every change is
 also one log line with `limit`, `signal`, `engaged`, `exempt` and `shed`. If the
 controller stops, the object goes stale rather than clear, so `status` says when
 it was last written once that is older than fifteen minutes.

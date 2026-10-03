@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -4281,6 +4282,159 @@ class TestCeilingForcesOnlyWhatTheReadingStillAsks(unittest.TestCase):
         self.assertEqual(c.forced_total, 1)
 
 
+class TestCeilingHeadroom(unittest.TestCase):
+    """A scheduled visit and a wedged node's power cycle both put a node on, so
+    both are for a pool with room: a steady budget has to work normally, and an
+    emergency -- a limit of 0, or a pool already at or over it -- has to stop
+    them. The count is the one a wake is gated on: nodes still POWERED, draining
+    ones and ones still booting included, held and maintenance nodes not."""
+
+    FOUR = ("a", "b", "c", "d")
+    MAINT = TestScheduledMaintenance.MAINT
+
+    def visit(self, awake, ceiling, **kw):
+        """Four nodes, `awake` of them in service and busy, the rest asleep and
+        due a visit, under `ceiling`."""
+        states = {n: (node(ready_since=T0 - 10) if i < awake else asleep())
+                  for i, n in enumerate(self.FOUR)}
+        busy = {n: ["job"] for i, n in enumerate(self.FOUR) if i < awake}
+        h = world(states, ceiling=ceiling, busy=busy, **kw)
+        c = h.controller(nodes=self.FOUR, **self.MAINT)
+        run(h, c, 3)
+        return h, c
+
+    def wedged_with(self, others, ceiling):
+        """A wake that timed out on a node whose chassis reads on, among
+        `others` nodes in service, under `ceiling`."""
+        states = {"a": crashed()}
+        states.update({n: node() for n in self.FOUR[1:1 + others]})
+        states.update({n: asleep() for n in self.FOUR[1 + others:]})
+        h = Harness(states, ceiling=ceiling, chassis={"a": "on"},
+                    busy={n: ["job"] for n in self.FOUR[1:1 + others]})
+        h.t = T0
+        c = h.controller(nodes=self.FOUR)
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        return h, c
+
+    # -- scheduled visits ----------------------------------------------------
+    def test_a_steady_budget_lets_a_visit_run(self):
+        """`static: 2` over four nodes is a standing budget, not an emergency:
+        with nothing powered, one more node is within it."""
+        h, _c = self.visit(awake=0, ceiling=2)
+        self.assertEqual(h.acted["on"], ["a"],
+                         "a budget with room held a scheduled visit back")
+
+    def test_a_visit_may_use_the_last_slot_but_not_one_beyond(self):
+        h, _c = self.visit(awake=1, ceiling=2)
+        self.assertEqual(len(h.acted["on"]), 1, "a slot was free")
+        h, _c = self.visit(awake=2, ceiling=2)
+        self.assertEqual(h.acted["on"], [],
+                         "a visit took the powered count over the budget")
+
+    def test_a_limit_of_zero_stops_every_visit(self):
+        h, _c = self.visit(awake=0, ceiling=0)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_a_pool_over_the_limit_stops_a_visit(self):
+        h, _c = self.visit(awake=3, ceiling=1)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_the_visit_is_counted_as_powered_while_it_runs(self):
+        """One at a time anyway -- and the node it has up is a slot taken, so a
+        second wake is not made beside it."""
+        h, c = self.visit(awake=0, ceiling=1)
+        self.assertEqual(h.acted["on"], ["a"])
+        h.t += 60
+        c.tick()
+        self.assertEqual(h.acted["on"], ["a"])
+
+    def test_a_visit_in_progress_carries_on_while_there_is_headroom(self):
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "b": asleep()}, ceiling=1)
+        c = h.controller(**self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "maintaining",
+                         "ended a visit the budget had room for")
+        self.assertEqual(shed_notes(h), [])
+
+    def test_a_visit_in_progress_is_ended_when_the_pool_goes_over(self):
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
+                   "b": node(), "c": asleep()}, ceiling=1, busy={"b": ["j"]})
+        c = h.controller(nodes=("a", "b", "c"), **self.MAINT)
+        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
+                     "maintenance_until": T0 + 250}
+        c.tick()
+        self.assertEqual(c.st["a"]["phase"], "sleeping")
+
+    def test_a_visit_that_resumes_after_the_headroom_goes_says_why_it_waits(self):
+        h, _c = self.visit(awake=2, ceiling=2)
+        said = h.logged("visits are held back")
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["powered"], said[0]["allowed"]), (2, 2))
+
+    # -- a wedged node's power cycle -----------------------------------------
+    def test_a_steady_budget_lets_a_wedged_node_be_cycled(self):
+        h, _c = self.wedged_with(others=1, ceiling=3)
+        self.assertEqual(h.acted["cycle"], ["a"],
+                         "a budget with room refused to cycle a wedged node")
+
+    def test_a_wedged_node_at_the_limit_keeps_its_slot_and_is_cycled(self):
+        """It is counted as powered, so the pool is AT the limit with it in --
+        not over."""
+        h, _c = self.wedged_with(others=1, ceiling=2)
+        self.assertEqual(h.acted["cycle"], ["a"])
+
+    def test_a_pool_over_the_limit_does_not_cycle_a_wedged_node(self):
+        h, c = self.wedged_with(others=2, ceiling=2)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertIn("over its capacity ceiling (3 nodes powered, 2 allowed)",
+                      c.st["a"]["trouble"])
+
+    def test_a_limit_of_zero_does_not_cycle_a_wedged_node(self):
+        h, c = self.wedged_with(others=0, ceiling=0)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertIn("1 nodes powered, 0 allowed", c.st["a"]["trouble"])
+
+    def test_a_refused_wedged_node_is_still_handed_to_a_human(self):
+        h, c = self.wedged_with(others=2, ceiling=1)
+        self.assertEqual(h.acted["cycle"], [])
+        self.assertTrue(c.st["a"]["trouble"])
+
+    def test_every_other_guard_on_a_cycle_still_applies_with_headroom(self):
+        """An operator's cordon, running work and the cooldown are checked as
+        they always were; headroom is one more reason a cycle may happen, not
+        a replacement for the rest."""
+        h = Harness({"a": crashed(cordoned=True, ours=False), "b": node()},
+                    ceiling=2, chassis={"a": "on"}, busy={"b": ["j"]})
+        h.t = T0
+        c = h.controller()
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        self.assertEqual(h.acted["cycle"], [], "cycled a node an operator holds")
+        h = Harness({"a": crashed(), "b": node()}, ceiling=2,
+                    chassis={"a": "on"}, busy={"a": ["running"]})
+        h.t = T0
+        c = h.controller()
+        c.st["a"] = {"phase": "waking", "phase_since": T0 - 901,
+                     "booting": False}
+        c.tick()
+        self.assertEqual(h.acted["cycle"], [], "cycled a node running work")
+
+    # -- no ceiling, and one that limits nothing -----------------------------
+    def test_without_a_ceiling_or_with_one_above_the_pool_nothing_changes(self):
+        for ceiling in (None, 9):
+            with self.subTest(ceiling=ceiling):
+                h, _c = self.visit(awake=3, ceiling=ceiling)
+                self.assertEqual(len(h.acted["on"]), 1)
+                h, _c = self.wedged_with(others=2, ceiling=ceiling)
+                self.assertEqual(h.acted["cycle"], ["a"])
+
+
 class TestCeilingHysteresis(unittest.TestCase):
     """Tighten at once, loosen reluctantly: the effective limit is the minimum
     of the readings in the trailing hold, and a flapping signal must not cost a
@@ -4402,6 +4556,65 @@ class TestCeilingInteractions(unittest.TestCase):
         self.assertTrue(h.logged("leaves it alone"),
                         "the ceiling did not say it was standing aside")
 
+    def _busy_pair_with_b_draining(self, ceiling):
+        """a in service and busy; b an ordinary drain (cordoned, ours, phase
+        sleeping) and busy -- the one a ceiling of 1 would turn into a shed."""
+        h = world({"a": node(), "b": node(cordoned=True, ours=True,
+                                          ours_since=T0 - 100)},
+                  ceiling=ceiling, busy={"a": ["j"], "b": ["k"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        c.st["b"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        return h, c
+
+    def _uncordon(self, h, name):
+        # kubectl uncordon: the cordon goes, our mark is left behind.
+        h.states[name] = dataclasses.replace(h.states[name], cordoned=False)
+
+    def _assert_b_left_alone(self, h, c, ticks=6):
+        for _ in range(ticks):
+            h.t += 60
+            c.tick()
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had just put back")
+        self.assertEqual([x for x in shed_notes(h) if x[0] == "b"], [],
+                         "stamped the node as a shed")
+        self.assertNotIn("b", h.acted["off"])
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_an_uncordoned_ordinary_drain_is_spared_not_shed(self):
+        """The unanchored case: the drain carried no shed note, so it was
+        never one the ceiling held down -- and was still taken as one."""
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        self._uncordon(h, "b")
+        self._assert_b_left_alone(h, c)
+
+    def test_an_uncordon_on_the_tick_the_ceiling_engages_is_spared(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=None)
+        c.tick()
+        h._ceiling = 1
+        self._uncordon(h, "b")
+        self._assert_b_left_alone(h, c)
+
+    def test_an_uncordoned_shed_with_its_note_is_spared_too(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        c.tick()
+        self.assertTrue(shed_notes(h), "setup: b was not shed")
+        h.acted["note"].clear()
+        self._uncordon(h, "b")
+        for _ in range(6):
+            h.t += 60
+            c.tick()
+        self.assertEqual(h.acted["cordon"].count(("b", True)), 0)
+        self.assertNotIn("b", h.acted["off"])
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_the_sparing_ends_after_the_sleep_cooldown(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        self._uncordon(h, "b")
+        c.tick()
+        until = c.st["b"]["ceiling_spared_until"]
+        self.assertEqual(until, h.t + c.cfg.sleep_cooldown_s)
+
     def test_a_wake_that_arrives_into_a_full_ceiling_is_shed_not_served(self):
         """A booting OS cannot be asked to shut down, so a wake already in
         flight is let to arrive. It is then not put into service and not
@@ -4462,19 +4675,6 @@ class TestCeilingInteractions(unittest.TestCase):
         self.assertNotIn("maintenance_until", c.st["a"])
         self.assertIn(("a", True), h.acted["cordon"],
                       "ended without refreshing the cordon its drain anchors")
-
-    def test_a_visit_ends_even_while_the_ceiling_has_room(self):
-        """A visit powers hardware on for nobody, so none runs while a ceiling
-        is in force -- whether or not it is binding on this node."""
-        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 10),
-                   "b": asleep()}, ceiling=1)
-        c = h.controller(**TestScheduledMaintenance.MAINT)
-        c.st["a"] = {"phase": "maintaining", "phase_since": T0 - 10,
-                     "maintenance_until": T0 + 250}
-        c.tick()
-        self.assertEqual(c.st["a"]["phase"], "sleeping")
-        self.assertEqual(shed_notes(h), [], "an ordinary end to a visit was "
-                                            "recorded as a shed")
 
     def test_a_visit_still_booting_is_ended_the_moment_it_arrives(self):
         h = Harness({"a": asleep()}, ceiling=0, chassis={"a": "on"})
@@ -4560,7 +4760,9 @@ class TestCeilingInteractions(unittest.TestCase):
         h = world({"a": asleep(), "b": None}, ceiling=0)
         c = h.controller(nodes=("a",), **TestScheduledMaintenance.MAINT)
         run(h, c, 4)
-        self.assertEqual(len(h.logged("visits are held back")), 1)
+        said = h.logged("visits are held back")
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["powered"], said[0]["allowed"]), (0, 0))
 
     def test_dry_run_logs_what_it_would_shed_and_touches_nothing(self):
         spy, sink, status = Spy(), _Sink(), _Sink()
@@ -4823,6 +5025,9 @@ class _FakeKube:
 
 
 class TestConfigMapStatus(unittest.TestCase):
+    """What one write does. write() is the synchronous step the background
+    writer runs; publish() is the hand-over the tick makes, tested below."""
+
     PATH = "/api/v1/namespaces/ops/configmaps/metalnap-status"
 
     def writer(self, kube, clock):
@@ -4833,7 +5038,7 @@ class TestConfigMapStatus(unittest.TestCase):
     def test_it_replaces_the_object_it_read_and_keeps_what_else_is_in_it(self):
         """get/update, the verbs the chart grants: a replace, not a patch."""
         kube, now = _FakeKube(), [1000.0]
-        self.writer(kube, lambda: now[0]).publish({"engaged": True, "limit": 0})
+        self.writer(kube, lambda: now[0]).write({"engaged": True, "limit": 0})
         self.assertEqual(kube.calls, [("GET", self.PATH), ("PUT", self.PATH)])
         self.assertEqual(kube.cm["metadata"]["resourceVersion"], "7")
         self.assertEqual(kube.cm["data"]["other"], "kept")
@@ -4844,33 +5049,237 @@ class TestConfigMapStatus(unittest.TestCase):
     def test_an_unchanged_report_is_not_rewritten_until_it_is_due(self):
         kube, now = _FakeKube(), [1000.0]
         w = self.writer(kube, lambda: now[0])
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         now[0] += 60
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         self.assertEqual(len(kube.puts()), 1, "wrote an unchanged report")
         now[0] += 300
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         self.assertEqual(len(kube.puts()), 2,
                          "never refreshed, so a dead controller looks alive")
 
     def test_a_changed_report_is_written_at_once(self):
         kube, now = _FakeKube(), [1000.0]
         w = self.writer(kube, lambda: now[0])
-        w.publish({"engaged": False})
+        w.write({"engaged": False})
         now[0] += 60
-        w.publish({"engaged": True})
+        w.write({"engaged": True})
         self.assertEqual(len(kube.puts()), 2)
 
     def test_a_failed_write_raises_and_is_retried_next_time(self):
         kube, now = _FakeKube(fail=RuntimeError("forbidden")), [1000.0]
         w = self.writer(kube, lambda: now[0])
         with self.assertRaises(RuntimeError):
-            w.publish({"engaged": True})
+            w.write({"engaged": True})
         kube.fail = None
         now[0] += 60
-        w.publish({"engaged": True})
+        w.write({"engaged": True})
         self.assertEqual(len(kube.puts()), 1,
                          "a write that failed was remembered as written")
+
+
+class _BlockingKube(_FakeKube):
+    """An API server that has stopped answering: the first call blocks until
+    it is released, as a hung connection does until its timeout."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+        self._lock = threading.Lock()
+        self.inflight = self.max_inflight = 0
+
+    def request(self, method, path, body=None):
+        with self._lock:
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            self.entered.set()
+            self.release.wait(timeout=30)
+            return super().request(method, path, body)
+        finally:
+            with self._lock:
+                self.inflight -= 1
+
+
+class TestStatusIsWrittenOffTheTickPath(unittest.TestCase):
+    """The tick hands the latest report over and goes on. It never waits on the
+    API server for a status write: reporting must not be able to delay a
+    decision, however slow or dead the thing it reports to is."""
+
+    def status(self, kube, clock=None):
+        from metalnap.status import ConfigMapStatus
+        return ConfigMapStatus(kube, "ops", "metalnap-status",
+                               clock=clock or (lambda: 1000.0), refresh_s=300)
+
+    def ticks_in_a_thread(self, h, c, readings, kube):
+        """Run one tick per reading in a thread, so a tick that blocks fails
+        the test instead of hanging it. True if they all finished."""
+        def go():
+            for r in readings:
+                h._ceiling = r
+                c.tick()
+                h.t += 60
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        finished = not t.is_alive()
+        if not finished:
+            kube.release.set()           # let the stuck tick go, then fail
+            t.join(timeout=5)
+        return finished
+
+    def test_a_write_that_blocks_does_not_delay_a_tick(self):
+        kube = _BlockingKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        try:
+            self.assertTrue(self.ticks_in_a_thread(h, c, [None] * 5, kube),
+                            "a tick waited on the status write")
+            self.assertTrue(kube.entered.wait(timeout=5),
+                            "the write was never attempted")
+        finally:
+            kube.release.set()
+
+    def test_the_latest_report_wins_and_a_hang_does_not_queue_a_backlog(self):
+        kube = _BlockingKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        try:
+            # The first report is taken by the writer, which then hangs. Wait
+            # for that: ticks that ran before the writer had started would
+            # leave one report in the slot, not one in flight and one waiting.
+            self.assertTrue(self.ticks_in_a_thread(h, c, [None], kube))
+            self.assertTrue(kube.entered.wait(timeout=5),
+                            "the write was never attempted")
+            self.assertTrue(self.ticks_in_a_thread(h, c, [1, 0, 0], kube),
+                            "a tick waited on the stuck write")
+            kube.release.set()                     # the server answers again
+            self.assertTrue(w.drain(timeout=5))
+        finally:
+            kube.release.set()
+        body = json.loads(kube.cm["data"]["ceiling"])
+        self.assertEqual((body["engaged"], body["limit"]), (True, 0),
+                         "an older report overwrote the latest")
+        # The contract, not an accidental count: one write in flight at a
+        # time, no backlog (the three ticks made while it was stuck leave at
+        # most one more write, never three), and the last thing written is the
+        # latest report -- the one that was waiting when the stuck write ended.
+        self.assertEqual(kube.max_inflight, 1, "two writes in flight at once")
+        self.assertLessEqual(len(kube.puts()), 2,
+                             "queued a write per tick while the first was stuck")
+
+    def test_a_failing_write_never_changes_what_a_tick_does(self):
+        outcomes = []
+        for sink in ("fails", "works"):
+            kube = _FakeKube(fail=RuntimeError("forbidden")
+                             if sink == "fails" else None)
+            w = self.status(kube)
+            h = world({"a": node(), "b": node()}, ceiling=0)
+            c = h.controller(status=w)
+            for _ in range(4):
+                c.tick()
+                w.drain(timeout=5)
+                h.t += 60
+            outcomes.append((sorted(cordoned(h)), sorted(h.acted["off"])))
+            if sink == "fails":
+                self.assertEqual(
+                    len(h.at_level("warn", "ceiling status")), 1,
+                    "the failure was not logged, or logged every tick")
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0], (["a", "b"], ["a", "b"]))
+
+    def test_a_failure_is_read_before_the_next_report_can_clear_it(self):
+        """The worst interleaving, made deterministic: the publish that hands
+        over the next report is the moment the writer's retry succeeds and
+        clears `error`. A failure the controller had not read yet must still
+        be logged, so it is read before that hand-over, not after."""
+        class RetriesAtOnce:
+            error = "forbidden"
+
+            def publish(self, report):
+                self.error = None          # the retry worked, instantly
+
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=RetriesAtOnce(), **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual(len(h.at_level("warn", "ceiling status")), 1,
+                         "a failed write was cleared before it was read")
+
+    def test_a_write_that_works_again_is_said_once(self):
+        kube = _FakeKube(fail=RuntimeError("forbidden"))
+        w = self.status(kube, clock=iter(range(1000, 9000, 400)).__next__)
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(status=w, **ONLY_THE_CEILING)
+        c.tick()
+        w.drain(timeout=5)
+        c.tick()                                   # sees the failure
+        kube.fail = None
+        h._ceiling = 0                             # a changed report
+        c.tick()
+        w.drain(timeout=5)
+        c.tick()
+        self.assertEqual(len(h.logged("publishing the status again")), 1)
+
+    def test_the_writer_is_a_daemon_that_does_not_keep_the_process_alive(self):
+        """A write stuck on a dead API server must not stop the controller
+        exiting: the thread is a daemon."""
+        import subprocess
+        import textwrap
+        code = textwrap.dedent("""
+            import sys, threading
+            sys.path.insert(0, %r)
+            from metalnap.status import ConfigMapStatus
+
+            class Stuck:
+                entered = threading.Event()
+                def request(self, *a, **kw):
+                    self.entered.set()
+                    threading.Event().wait()     # never answers
+
+            kube = Stuck()
+            w = ConfigMapStatus(kube, "ops", "x")
+            w.publish({"engaged": True})
+            assert kube.entered.wait(5), "the write never started"
+            assert w._thread.daemon, "the writer thread is not a daemon"
+            print("exiting")
+        """ % os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        r = subprocess.run([sys.executable, "-B", "-c", code],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exiting", r.stdout)
+
+    def test_dry_run_still_writes_nothing(self):
+        kube = _FakeKube()
+        w = self.status(kube)
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(mode="dry_run", status=w)
+        run(h, c, 3)
+        self.assertTrue(w.drain(timeout=5))
+        self.assertEqual(kube.calls, [], "wrote outside the process in dry_run")
+        self.assertIsNone(w._thread, "started a writer it has nothing for")
+
+    def test_each_sink_gets_a_snapshot_of_its_own(self):
+        """The metrics listener and the status writer read the report on other
+        threads, after the tick has gone on: one that holds the report must not
+        be able to see, or change, what the other holds."""
+        seen = []
+
+        class Keeps:
+            def publish(self, report):
+                seen.append(report)
+
+        h = world({"a": node(), "b": node()}, ceiling=0)
+        c = h.controller(metrics=Keeps(), status=Keeps(), **ONLY_THE_CEILING)
+        c.tick()
+        first, second = seen
+        self.assertEqual(first, second)
+        first["shed"].append("tampered")
+        first["draining"].append("tampered")
+        self.assertNotIn("tampered", second["shed"])
+        self.assertEqual(len(second["draining"]), len(
+            [n for n in ("a", "b")]))
 
 
 class TestCeilingWiring(unittest.TestCase):
@@ -4939,7 +5348,10 @@ class TestCeilingWiring(unittest.TestCase):
         """The range the chart's schema enforces, held at runtime too: a direct
         deployment never meets the schema, and the container is unprivileged,
         so a port below 1024 would start a pod that never listens."""
-        for bad in ("abc", "-1", "80", "1023", "65536", "9100.5"):
+        # "\u00b2" and the Arabic-Indic "\u0661\u0662\u0663\u0664" are digits to
+        # str.isdigit() and not to int(): a traceback, not this message.
+        for bad in ("abc", "-1", "80", "1023", "65536", "9100.5", "\u00b2",
+                    "\u0661\u0662\u0663\u0664", "9\u00b2\u00b2\u00b2"):
             with self.subTest(port=bad), self.assertRaises(SystemExit) as e:
                 self.build(METRICS_PORT=bad)
             self.assertIn("METRICS_PORT", str(e.exception))
