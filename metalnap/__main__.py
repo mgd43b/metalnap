@@ -245,7 +245,9 @@ def main(argv=None):
     # deployment never meets the schema: the image runs unprivileged with every
     # capability dropped, so a port below 1024 would start a pod that never
     # listens.
-    if not (port.isdigit() and (int(port) == 0 or 1024 <= int(port) <= 65535)):
+    # ASCII digits only: str.isdigit() is true for characters int() rejects.
+    if not (port.isascii() and port.isdigit()
+            and (int(port) == 0 or 1024 <= int(port) <= 65535)):
         sys.exit("metalnap: METRICS_PORT must be 0 (off) or a port from 1024 to "
                  "65535 -- the container runs unprivileged; got %r" % port)
     if int(port) > 0:

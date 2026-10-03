@@ -506,8 +506,9 @@ capacityCeiling:
   against the ceiling (the log says how many exempt nodes remain powered).
   Maintenance mode's own one-time power-on is *not* blocked by a ceiling — a
   person asked — and `metalnap maintenance start` says so. A person who
-  uncordons a node mid-shed is not fought: it is left alone for
-  `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
+  uncordons a node mid-drain -- one the ceiling was already holding down, or an
+  ordinary drain it had not yet picked -- is not fought: the node is *spared*,
+  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
   needs one. (That is held in memory, so a restart forgets it.)
 - **Scheduled visits and a wedged node's power cycle are for a pool with room.**
   A steady budget — `static: 2` over four nodes — works normally; an emergency

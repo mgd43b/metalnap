@@ -4556,6 +4556,65 @@ class TestCeilingInteractions(unittest.TestCase):
         self.assertTrue(h.logged("leaves it alone"),
                         "the ceiling did not say it was standing aside")
 
+    def _busy_pair_with_b_draining(self, ceiling):
+        """a in service and busy; b an ordinary drain (cordoned, ours, phase
+        sleeping) and busy -- the one a ceiling of 1 would turn into a shed."""
+        h = world({"a": node(), "b": node(cordoned=True, ours=True,
+                                          ours_since=T0 - 100)},
+                  ceiling=ceiling, busy={"a": ["j"], "b": ["k"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        c.st["b"] = {"phase": "sleeping", "phase_since": T0 - 100}
+        return h, c
+
+    def _uncordon(self, h, name):
+        # kubectl uncordon: the cordon goes, our mark is left behind.
+        h.states[name] = dataclasses.replace(h.states[name], cordoned=False)
+
+    def _assert_b_left_alone(self, h, c, ticks=6):
+        for _ in range(ticks):
+            h.t += 60
+            c.tick()
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had just put back")
+        self.assertEqual([x for x in shed_notes(h) if x[0] == "b"], [],
+                         "stamped the node as a shed")
+        self.assertNotIn("b", h.acted["off"])
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_an_uncordoned_ordinary_drain_is_spared_not_shed(self):
+        """The unanchored case: the drain carried no shed note, so it was
+        never one the ceiling held down -- and was still taken as one."""
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        self._uncordon(h, "b")
+        self._assert_b_left_alone(h, c)
+
+    def test_an_uncordon_on_the_tick_the_ceiling_engages_is_spared(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=None)
+        c.tick()
+        h._ceiling = 1
+        self._uncordon(h, "b")
+        self._assert_b_left_alone(h, c)
+
+    def test_an_uncordoned_shed_with_its_note_is_spared_too(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        c.tick()
+        self.assertTrue(shed_notes(h), "setup: b was not shed")
+        h.acted["note"].clear()
+        self._uncordon(h, "b")
+        for _ in range(6):
+            h.t += 60
+            c.tick()
+        self.assertEqual(h.acted["cordon"].count(("b", True)), 0)
+        self.assertNotIn("b", h.acted["off"])
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_the_sparing_ends_after_the_sleep_cooldown(self):
+        h, c = self._busy_pair_with_b_draining(ceiling=1)
+        self._uncordon(h, "b")
+        c.tick()
+        until = c.st["b"]["ceiling_spared_until"]
+        self.assertEqual(until, h.t + c.cfg.sleep_cooldown_s)
+
     def test_a_wake_that_arrives_into_a_full_ceiling_is_shed_not_served(self):
         """A booting OS cannot be asked to shut down, so a wake already in
         flight is let to arrive. It is then not put into service and not
@@ -5289,7 +5348,10 @@ class TestCeilingWiring(unittest.TestCase):
         """The range the chart's schema enforces, held at runtime too: a direct
         deployment never meets the schema, and the container is unprivileged,
         so a port below 1024 would start a pod that never listens."""
-        for bad in ("abc", "-1", "80", "1023", "65536", "9100.5"):
+        # "\u00b2" and the Arabic-Indic "\u0661\u0662\u0663\u0664" are digits to
+        # str.isdigit() and not to int(): a traceback, not this message.
+        for bad in ("abc", "-1", "80", "1023", "65536", "9100.5", "\u00b2",
+                    "\u0661\u0662\u0663\u0664", "9\u00b2\u00b2\u00b2"):
             with self.subTest(port=bad), self.assertRaises(SystemExit) as e:
                 self.build(METRICS_PORT=bad)
             self.assertIn("METRICS_PORT", str(e.exception))

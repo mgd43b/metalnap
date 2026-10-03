@@ -1606,6 +1606,23 @@ class Controller:
         # anchor. One note per concern is the whole reason for a note.
         for n in present:
             state = states[n]
+            if (engaged and n not in exempt and not state.cordoned
+                    and (st.get(n) or {}).get("phase") == "sleeping"):
+                # A person uncordoned a node that was draining -- one the
+                # ceiling was holding down (it carries a shed note) or an
+                # ordinary drain it had not yet picked. The ordinary path backs
+                # the sleep off; the ceiling does not fight them either. SPARED
+                # means: counted as powered, but never picked to be shed, until
+                # `sleep_cooldown_s` has passed -- the same interval an
+                # ordinary sleep is backed off for. It is not stamped as a shed
+                # on the way.
+                if (st.get(n) or {}).get("ceiling_spared_until", 0) <= now:
+                    self.log("info", "node was put back into service mid-drain "
+                                     "by an operator; the capacity ceiling "
+                                     "leaves it alone", node=n,
+                             for_s=cfg.sleep_cooldown_s)
+                self._node(n)["ceiling_spared_until"] = (
+                    now + cfg.sleep_cooldown_s)
             if self._shed_anchor(n, state) is None:
                 continue
             if engaged and state.cordoned and state.ours and n not in exempt:
@@ -1619,16 +1636,6 @@ class Controller:
                     if self._try_note(n, "shed", mine):
                         states[n] = dataclasses.replace(state, shed_at=mine)
                 continue
-            if (engaged and n not in exempt and not state.cordoned
-                    and (st.get(n) or {}).get("phase") == "sleeping"):
-                # A person uncordoned it mid-shed. The ordinary path backs the
-                # sleep off; the ceiling does not fight them either, and does
-                # not shed that node again until the same interval has passed.
-                self._node(n)["ceiling_spared_until"] = (
-                    now + cfg.sleep_cooldown_s)
-                self.log("info", "node was put back into service mid-shed by "
-                                 "an operator; the capacity ceiling leaves it "
-                                 "alone", node=n, for_s=cfg.sleep_cooldown_s)
             states[n] = self._forget_shed(n, state)
 
         begun = set()
