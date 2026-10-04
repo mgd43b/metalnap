@@ -131,6 +131,10 @@ class Harness:
 
     def disown(self, n):
         self.acted["disown"].append(n)
+        # As on a cluster: the mark is gone once it has been cleared, so it is
+        # not seen again on the next tick.
+        self.states[n] = dataclasses.replace(self.states[n], ours=False,
+                                             ours_since=None)
 
     # PowerBackend lives on its own object: NodeSource.state() and
     # PowerBackend.state() share a name, so one class implementing both hands
@@ -3852,6 +3856,90 @@ class TestCeilingOutageKeepsTheSheds(unittest.TestCase):
         self.at(h, c, 240, 1)
         self.assertEqual(h.acted["cordon"].count((shed, True)), 1,
                          "re-cordoned a node an operator put back")
+
+    def restarted_then_uncordoned(self):
+        """a and b busy, a ceiling of one: b is shed, with an anchor on the
+        node. The process restarts (no phase, no memory), and the operator
+        uncordons b: Ready, uncordoned, still carrying its note and our mark."""
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        c.st = {}                                  # the process restarted
+        h.states[shed] = dataclasses.replace(h.states[shed], cordoned=False)
+        h.acted["cordon"].clear()
+        h.acted["note"].clear()
+        return h, c, shed
+
+    def test_an_uncordon_after_a_restart_is_spared_during_an_outage(self):
+        """No in-memory phase to say it was draining: the note on the node and
+        our mark left behind are what say so."""
+        h, c, shed = self.restarted_then_uncordoned()
+        for offset in (60, 120):
+            self.at(h, c, offset, self.DOWN)
+        self.at(h, c, 180, 1)                      # the binding reading
+        for offset in (240, 300):
+            self.at(h, c, offset, 1)
+        self.assertNotIn((shed, True), h.acted["cordon"],
+                         "re-cordoned a node an operator put back after a "
+                         "restart")
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_an_uncordon_after_a_restart_is_spared_while_engaged_too(self):
+        h, c, shed = self.restarted_then_uncordoned()
+        for offset in (60, 120, 180, 240):
+            self.at(h, c, offset, 1)
+        self.assertNotIn((shed, True), h.acted["cordon"],
+                         "re-cordoned a node an operator put back after a "
+                         "restart")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == shed and v is not None], [],
+                         "stamped the uncordoned node as a shed again")
+
+    def test_an_ordinary_drain_uncordoned_after_a_restart_is_spared_too(self):
+        """No anchor, no phase: only our ownership mark, left behind by the
+        uncordon and cleared the moment it is seen, says it was ours."""
+        h = world({"a": node(), "b": node(ours=True, ours_since=T0 - 100)},
+                  ceiling=1, busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        for offset in (0, 60, 120, 180):
+            self.at(h, c, offset, 1)
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had just put back")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == "b" and v is not None], [])
+
+    def test_a_shed_note_on_an_uncordoned_ready_node_is_spared(self):
+        """Not cordoned, no mark, no phase: the note on the node is all that
+        says the ceiling had it, and a person has since put it back."""
+        h = world({"a": node(), "b": node(shed_at=T0 - 100)}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        for offset in (0, 60, 120):
+            self.at(h, c, offset, 1)
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had put back")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == "b" and v is not None], [])
+
+    def test_a_node_the_controller_itself_took_back_is_not_an_operators_uncordon(self):
+        """Demand takes a draining shed node back during an outage. That is
+        the controller's own release: its anchor goes with the cordon, and the
+        next reading does not mistake it for a person having put it back."""
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        h._shortfall = 400.0
+        self.at(h, c, 60, self.DOWN)
+        self.assertIn((shed, False), h.acted["cordon"], "setup: not rescued")
+        self.assertIn((shed, None), shed_notes(h),
+                      "the anchor outlived the controller's own uncordon")
+        self.at(h, c, 120, 1)
+        self.assertFalse(h.logged("leaves it alone"),
+                         "took its own rescue for an operator's uncordon")
 
     def test_an_anchor_on_a_node_that_is_no_longer_held_down_goes(self):
         """The anchor is kept for a node that is still cordoned and ours.

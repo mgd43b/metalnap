@@ -535,7 +535,10 @@ capacityCeiling:
   person asked — and `metalnap maintenance start` says so. A person who
   uncordons a node mid-drain -- one the ceiling was already holding down, or an
   ordinary drain it had not yet picked -- is not fought: the node is *spared*,
-  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
+  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S` (a
+  node is known to have been draining by its phase, or, after a restart, by the
+  shed note or the ownership mark still on it, both while engaged and through
+  an outage's hold), and another node is shed in its place if the ceiling still
   needs one. (That is held in memory, so a restart forgets it.)
 - **Scheduled visits and a wedged node's power cycle are for a pool with room.**
   A steady budget — `static: 2` over four nodes — works normally; an emergency

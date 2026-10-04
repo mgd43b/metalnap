@@ -366,6 +366,12 @@ class Sim:
         self.busy_phase, self.big, self.capped = True, True, False
         self.phase_left, self.quiet_ticks, self.busy_ticks = 30, 0, 0
         self.human_held, self.need_window = set(), []
+        #: Nodes an operator uncordoned with plain kubectl while the controller
+        #: had them cordoned -- our mark left behind -- and when. The ceiling
+        #: does not fight a person: none of them may be cordoned again for a
+        #: shed within the sleep cooldown. (A restart in between is the case
+        #: that has no in-memory phase to say it was draining.)
+        self.put_back, self.put_back_pending = {}, {}
         self.log = []
         # invariant violations, collected rather than raised so the tick that
         # caused them finishes and the report shows full context
@@ -444,6 +450,10 @@ class Sim:
         #: Visits begun, and wedged nodes cycled, WHILE a ceiling was limiting
         #: the pool -- the two things a steady budget has to keep doing.
         self.visits_under_ceiling = self.cycles_under_ceiling = 0
+
+    #: How often, per drained node per tick in a ceiling episode, an operator
+    #: puts it back into service with plain `kubectl uncordon`.
+    PUT_BACK_P = 0.02
 
     @staticmethod
     def default_cfg(seed):
@@ -600,6 +610,13 @@ class Sim:
                 and self.t - self.ceil_down_since
                 <= self.cfg.ceiling_release_hold_s)
 
+    def spared(self, name):
+        """An operator put this node back into service while the ceiling was in
+        force, lately: it is not the ceiling's to shed, so a busy node may go
+        while it sits idle."""
+        return (self.t - self.put_back.get(name, -10 ** 9)
+                < self.cfg.sleep_cooldown_s)
+
     def exempt(self, n):
         """Held by an operator, by cordon or by request: not the ceiling's."""
         return n.name in self.human_held or n.maintenance is not None
@@ -667,6 +684,7 @@ class Sim:
             # idle nodes first.
             idle_awake = [m for m in self.pool()
                           if m.name != name and m.ready and not m.cordoned
+                          and not self.spared(m.name)
                           and not any(w.node == m.name and w.work
                                       for w in self.workers)]
             if not (self.model_binding() and n.shed_at is not None):
@@ -682,6 +700,11 @@ class Sim:
                 self.ceil_breaches.append(
                     (self.t, name, "put a node into service over the "
                      "ceiling (%d allowed)" % self.model_limit()))
+        if cordoned and self.ceiling_on and n.shed_at is not None \
+                and self.spared(name):
+            self.ceil_breaches.append(
+                (self.t, name, "cordoned a node for a shed that an operator "
+                 "had just put back into service"))
         if not cordoned and self.ceiling_on and self.in_outage_grace():
             # Demand took a node back while the ceiling was released: the
             # signal being down is "no ceiling", and a node the pool needs is
@@ -1077,6 +1100,18 @@ class Sim:
 
         self.step_maintenance_requests()
 
+        # An operator puts back into service a node the controller is draining
+        # -- plain `kubectl uncordon`, which leaves our mark behind.
+        if self.ceiling_on and self.ceil_kind is not None:
+            for n in self.nodes.values():
+                if (n.cordoned and n.ours is not None and n.ready
+                        and n.powered and n.shutdown_at is None
+                        and n.name not in self.human_held
+                        and n.maintenance is None
+                        and self.ceil_rnd.random() < self.PUT_BACK_P):
+                    n.cordoned = False
+                    self.put_back_pending[n.name] = self.t
+
         # PHASED demand. Rerolling every tick never held demand below capacity
         # for the consecutive ticks a sleep needs, so the sleep path never ran.
         if not self.busy_phase:
@@ -1367,7 +1402,11 @@ class Sim:
             key = frozenset(n.name for n in pool)
             if key != self.ceil_pool_key:
                 self.ceil_over_since, self.ceil_pool_key = None, key
-            powered = len(self.powered_pool())
+            # A node an operator put back is the operator's for the sleep
+            # cooldown: the ceiling does not fight a person, so it is not held
+            # against the ceiling's bound until then.
+            powered = len([n for n in self.powered_pool()
+                           if not self.spared(n.name)])
             if lim is not None and lim < len(pool) and powered > lim:
                 if self.ceil_over_since is None:
                     self.ceil_over_since = self.t
@@ -1685,8 +1724,19 @@ class Sim:
                     self.stuck_wake_since.clear()
                     self.ceil_hist = []     # the hold was in memory
                     self.ceil_down_since = None
+                    # What was spared was remembered in memory; what has not
+                    # been seen yet is on the node, and is seen after the restart.
+                    self.put_back.clear()
                 if self.ceiling_on:
                     self.step_ceiling()
+                    # An uncordon is spared if the ceiling is engaged -- or in
+                    # the grace of an outage -- when the controller sees it;
+                    # seen while the ceiling is not in force, the node is
+                    # simply in service, and a ceiling that engages afterwards
+                    # may shed it like any other.
+                    if self.model_binding() or self.in_outage_grace():
+                        self.put_back.update(self.put_back_pending)
+                    self.put_back_pending.clear()
                 self.blocked = None
                 self.observed = {k: v.maintenance
                                  for k, v in self.nodes.items()}

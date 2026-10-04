@@ -151,6 +151,10 @@ class Controller:
         self._grace = False     # the signal is down, but not for long enough
                                 # to forget the sheds already under way
         self._ceiling_err = None
+        #: Nodes whose ownership mark outlived its cordon THIS tick: somebody
+        #: uncordoned a node we had cordoned. The mark is cleared as it is seen,
+        #: so this is the only record of it left by the time the ceiling reads.
+        self._outlived = set()
         self._states, self._pool = {}, []
         self._busy_seen = {}    # busy() answers already read this tick
         self._rep = None        # what to publish, if the tick got that far
@@ -181,6 +185,12 @@ class Controller:
                      ("cordon" if cordoned else "uncordon"), node=name)
             return
         self.node_source.set_cordon(name, cordoned)
+        if not cordoned:
+            # A node we put back in service is not held down by a ceiling any
+            # more, so the note that said it was goes with the cordon. Left,
+            # the next tick finds a note on an uncordoned node, which is how an
+            # operator's uncordon looks.
+            self._forget_shed(name)
 
     def _note(self, name, key, value):
         """Durably record a note on the node; False if there is nowhere to.
@@ -1723,11 +1733,17 @@ class Controller:
             state = states[n]
             if ((engaged or grace) and n not in exempt
                     and not state.cordoned
-                    and (st.get(n) or {}).get("phase") == "sleeping"):
+                    and ((st.get(n) or {}).get("phase") == "sleeping"
+                         or n in self._outlived
+                         or self._shed_anchor(n, state) is not None)):
                 # A person uncordoned a node that was draining -- one the
                 # ceiling was holding down (it carries a shed note) or an
-                # ordinary drain it had not yet picked. The ordinary path backs
-                # the sleep off; the ceiling does not fight them either. SPARED
+                # ordinary drain it had not yet picked. Told by the phase when
+                # this process remembers one, and by what the node itself still
+                # carries when it does not (after a restart): our ownership mark
+                # seen to outlive its cordon this tick, or a shed note on a node
+                # that is no longer cordoned. The ordinary path backs the sleep off; the
+                # ceiling does not fight them either. SPARED
                 # means: counted as powered, but never picked to be shed, until
                 # `sleep_cooldown_s` has passed -- the same interval an
                 # ordinary sleep is backed off for. It is not stamped as a shed
@@ -2103,8 +2119,10 @@ class Controller:
         # that defers to an operator stops deferring: the stranded repair would
         # uncordon them, a visit would power the node on under their hands, a
         # wedged one would be power-cycled. Clear it the moment it is seen.
+        self._outlived = set()
         for n in present:
             if states[n].ours and not states[n].cordoned:
+                self._outlived.add(n)      # the ceiling reads this: see there
                 self.log("warn", "our ownership mark outlived its cordon -- "
                                  "the node was uncordoned by someone else; "
                                  "clearing the mark", node=n)
