@@ -87,11 +87,16 @@ class TestChart(unittest.TestCase):
         self.assertIn('CEILING_TIMEOUT_S: "5"', self.ok())
         self.assertIn('CEILING_TIMEOUT_S: "2"',
                       self.ok("capacityCeiling: {timeoutS: 2}\n"))
-        for values in ("capacityCeiling: {timeoutS: 0}\n",
-                       "capacityCeiling: {timeoutS: -1}\n",
-                       "capacityCeiling: {timeoutS: 61}\n",
+        # No query, no read: a small interval with the default timeout, and a
+        # static ceiling, still render.
+        self.ok("timers: {intervalS: 10}\ncapacityCeiling: {timeoutS: 11}\n")
+        self.ok("timers: {intervalS: 10}\ncapacityCeiling: "
+                "{static: 1, timeoutS: 11}\n")
+        for values in ("capacityCeiling: {query: up, timeoutS: 0}\n",
+                       "capacityCeiling: {query: up, timeoutS: -1}\n",
+                       "capacityCeiling: {query: up, timeoutS: 61}\n",
                        "timers: {intervalS: 10}\ncapacityCeiling: "
-                       "{timeoutS: 11}\n"):
+                       "{query: up, timeoutS: 11}\n"):
             with self.subTest(values=values):
                 code, _out, _err = self.render(values)
                 self.assertNotEqual(code, 0, "rendered a timeout the "

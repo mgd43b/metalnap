@@ -188,7 +188,10 @@ class Config:
         if self.ceiling_drain_deadline_s < 0:
             raise ValueError("CEILING_DRAIN_DEADLINE_S must be >= 0 "
                              "(0 never forces a busy node)")
-        if not 0 < self.ceiling_timeout_s <= self.interval_s:
+        # Only a query is read, so only a query has a read to bound: a
+        # deployment with a small INTERVAL_S and no ceiling must still start.
+        if self.ceiling_query and not (
+                0 < self.ceiling_timeout_s <= self.interval_s):
             raise ValueError(
                 "CEILING_TIMEOUT_S (%d) must be > 0 and no more than "
                 "INTERVAL_S (%d): the read is made on the tick, and one that "

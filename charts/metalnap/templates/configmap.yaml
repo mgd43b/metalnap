@@ -59,7 +59,7 @@
 {{- if lt (int .drainDeadlineS) 0 }}
 {{- fail (printf "capacityCeiling.drainDeadlineS (%v) must be 0 or more; 0 never forces a busy node" .drainDeadlineS) }}
 {{- end }}
-{{- if or (le (int .timeoutS) 0) (gt (int .timeoutS) (int $.Values.timers.intervalS)) }}
+{{- if and .query (or (le (int .timeoutS) 0) (gt (int .timeoutS) (int $.Values.timers.intervalS))) }}
 {{- fail (printf "capacityCeiling.timeoutS (%v) must be above 0 and no more than timers.intervalS (%v): the read is made on the tick, and one that can outlast the interval stretches every tick" .timeoutS $.Values.timers.intervalS) }}
 {{- end }}
 {{- end }}

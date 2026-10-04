@@ -3337,10 +3337,26 @@ class TestCeilingConfig(unittest.TestCase):
                    dict(ceiling_timeout_s=61),
                    dict(ceiling_timeout_s=31, interval_s=30)):
             with self.subTest(kw=kw), self.assertRaises(ValueError) as e:
-                Config(mode="on", **kw).validate()
+                Config(mode="on", ceiling_query="up", **kw).validate()
             self.assertIn("CEILING_TIMEOUT_S", str(e.exception))
-        Config(mode="on", ceiling_timeout_s=60).validate()      # == interval
-        Config(mode="on", ceiling_timeout_s=1, interval_s=1).validate()
+        Config(mode="on", ceiling_query="up",
+               ceiling_timeout_s=60).validate()                 # == interval
+        Config(mode="on", ceiling_query="up", ceiling_timeout_s=1,
+               interval_s=1).validate()
+
+    def test_no_query_means_the_timeout_is_not_checked(self):
+        """Nothing reads Prometheus for a ceiling, so a deployment with a small
+        INTERVAL_S and no ceiling (or a static one) must still start."""
+        Config(mode="on", interval_s=2).validate()
+        Config(mode="on", interval_s=2, ceiling_static=1).validate()
+        Config(mode="on", interval_s=2, ceiling_timeout_s=0).validate()
+        saved = dict(os.environ)
+        os.environ["INTERVAL_S"] = "2"
+        try:
+            Config().validate()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
     def test_a_deadline_of_zero_is_warned_about_at_start(self):
         warned = Config(mode="on", ceiling_drain_deadline_s=0).warnings()
