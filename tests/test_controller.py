@@ -5277,6 +5277,136 @@ class TestMetricsDropsAConnectionThatSaysNothing(unittest.TestCase):
             server.server_close()
 
 
+class TestMetricsListenerIsBounded(unittest.TestCase):
+    """One thread per connection, unbounded, in the process that makes every
+    call to the cluster and the BMCs: a few hundred silent connections would
+    cost a few hundred threads. A small cap on concurrent handlers, and the
+    rest closed at once."""
+
+    def serve(self, cap, timeout=10, metrics=None):
+        from metalnap.metrics import Metrics, serve
+        server = serve(metrics or Metrics(), 0, host="127.0.0.1",
+                       timeout=timeout, max_connections=cap)
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        return server, server.server_address[1]
+
+    def connect(self, port):
+        import socket
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(c.close)
+        return c
+
+    def wait_for(self, what, ok, seconds=5.0):
+        import time
+        end = time.time() + seconds
+        while time.time() < end:
+            if ok():
+                return
+            time.sleep(0.005)
+        self.fail("timed out waiting for " + what)
+
+    def scrape(self, port):
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:%d/metrics" % port,
+                                    timeout=5) as r:
+            return r.read().decode()
+
+    def test_more_silent_connections_than_the_cap_never_start_more_threads(self):
+        server, port = self.serve(cap=3)
+        before = threading.active_count()
+        for _ in range(12):
+            self.connect(port)
+        self.wait_for("the surplus to be turned away",
+                      lambda: server.refused == 9)
+        self.assertEqual(threading.active_count() - before, 3,
+                         "a handler thread was started past the cap")
+
+    def test_a_refused_connection_is_closed_at_once(self):
+        server, port = self.serve(cap=1)
+        self.connect(port)                         # holds the one slot
+        self.wait_for("the slot to be taken",
+                      lambda: server.slots_in_use == 1)
+        extra = self.connect(port)
+        self.assertEqual(extra.recv(10), b"",
+                         "a connection past the cap was held open")
+
+    def test_a_real_scrape_works_while_slow_clients_hold_slots(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        server, port = self.serve(cap=4, metrics=m)
+        for _ in range(3):
+            self.connect(port)                     # silent, holding 3 of 4
+        self.wait_for("the slots to be taken",
+                      lambda: server.slots_in_use == 3)
+        self.assertEqual(self.scrape(port), m.render())
+
+    def test_a_slot_frees_when_a_slow_client_is_dropped_by_the_timeout(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        server, port = self.serve(cap=2, timeout=0.3, metrics=m)
+        self.connect(port)
+        self.connect(port)
+        self.wait_for("both slots taken", lambda: server.slots_in_use == 2)
+        # Full: a scrape now is turned away. After the timeout drops the slow
+        # clients, one gets through.
+        self.wait_for("the timeout to free a slot",
+                      lambda: server.slots_in_use == 0)
+        self.assertEqual(self.scrape(port), m.render())
+
+    def test_the_slot_is_released_when_the_handler_raises(self):
+        class Raises:
+            def render(self):
+                raise RuntimeError("render failed")
+
+        import contextlib
+        import io
+        import urllib.error
+        import urllib.request
+        server, port = self.serve(cap=2, metrics=Raises())
+        for _ in range(6):                         # more than the cap
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    urllib.request.urlopen(
+                        "http://127.0.0.1:%d/metrics" % port,
+                        timeout=5).read()
+                except (urllib.error.URLError, OSError, ConnectionError):
+                    pass
+                self.wait_for("the slot back",
+                              lambda: server.slots_in_use == 0)
+        self.assertEqual(server.refused, 0,
+                         "a handler that raised kept its slot")
+
+    def test_the_slot_is_released_when_the_thread_cannot_start(self):
+        server, port = self.serve(cap=2)
+        import socketserver
+        real = socketserver.ThreadingMixIn.process_request
+
+        def fails(self, request, client_address):
+            raise RuntimeError("can't start new thread")
+        import contextlib
+        import io
+        socketserver.ThreadingMixIn.process_request = fails
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.connect(port)
+                self.wait_for("the connection to be dealt with",
+                              lambda: server.connections == 1)
+                self.wait_for("the slot back",
+                              lambda: server.slots_in_use == 0)
+        finally:
+            socketserver.ThreadingMixIn.process_request = real
+        self.assertEqual(server.slots_in_use, 0)
+
+    def test_the_default_cap_is_eight(self):
+        from metalnap.metrics import Metrics, serve
+        server = serve(Metrics(), 0, host="127.0.0.1")
+        try:
+            self.assertEqual(server.max_connections, 8)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class _FakeKube:
     """The three calls ConfigMapStatus makes, against one stored object."""
 

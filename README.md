@@ -586,7 +586,10 @@ it was last written once that is older than fifteen minutes.
 
 Metrics are served on `METRICS_PORT` (chart `metrics.port`) — the controller
 listened on nothing before, so it is **off by default**, there is no Service,
-and it adds no dependency:
+and it adds no dependency. It handles at most eight connections at once, and
+closes any beyond that as they arrive, so a client that opens a few hundred and
+says nothing costs eight threads and not a few hundred (a silent one is dropped
+after ten seconds, which frees its slot):
 
 | metric | meaning |
 |---|---|
