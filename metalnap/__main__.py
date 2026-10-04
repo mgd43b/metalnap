@@ -101,7 +101,17 @@ Optional:
                             Neither set (the default) is no ceiling at all.
     CEILING_RELEASE_HOLD_S  a looser reading must hold this long before shed
                             nodes are released (default 900): the ceiling
-                            tightens at once and loosens only after this.
+                            tightens at once and loosens only after this. It is
+                            also how long an outage of the signal keeps the
+                            deadlines of nodes already shed (the ceiling itself
+                            is released at once): past it they are forgotten.
+    CEILING_TIMEOUT_S       a deadline, in elapsed seconds, on the ceiling's
+                            Prometheus read (default 5; with a query, above 0
+                            and no more than INTERVAL_S). Checked after every
+                            read, no redirect followed, each network wait at
+                            most half of it; DNS and a server that trickles the
+                            response headers are not bounded by it. Running out
+                            is an unavailable reading, like any other error.
     CEILING_DRAIN_DEADLINE_S
                             a node carrying work is given this long to finish
                             before a shed shuts it down anyway, the ordinary soft

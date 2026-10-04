@@ -407,6 +407,7 @@ capacityCeiling:
   query: 'vector(0) and on() (max(ipmi_temperature_celsius{sensor="Inlet Temp"}) > 35)'
   releaseHoldS: 900      # a looser reading must hold this long before nodes are released
   drainDeadlineS: 600    # a node carrying work is given this long; 0 = never force
+  timeoutS: 5            # how long the ceiling's Prometheus read may take
 ```
 
 **Off unless you set `query` (PromQL on the Prometheus metalnap already reads)
@@ -422,17 +423,45 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
   difference is the whole safety of this feature: an empty result read as `0`
   would be an order to power the pool off the first day the signal is quiet.
 - Several series take the **minimum**, so an unaggregated per-UPS expression
-  just works. Fractions floor, and the result is clamped to the pool the ceiling
-  counts — not the nodes an operator holds, which are not its to limit.
+  just works. Fractions floor, and the result is judged against the pool the
+  ceiling counts — not the nodes an operator holds, which are not its to limit.
 - NaN, infinity, a negative, a value that is not a number, an error, a timeout:
   all are **cannot tell**, which is never zero. If any one series cannot be
   read, the whole reading cannot.
+- **The read has a deadline of its own, `CEILING_TIMEOUT_S`** (default 5; with a
+  query, above 0 and no more than `INTERVAL_S`). It is made on the tick before
+  anything else, so a Prometheus that hangs must not stretch the tick by the
+  demand signal's twenty seconds. It is **elapsed time**, not a socket timeout:
+  the answer is read against the clock after every read (each returns as soon as
+  any bytes arrive, so a server that sends one byte every few milliseconds cannot
+  hold the tick), no redirect is followed (a 3xx is an error), and the answer is
+  asked for uncompressed. Each wait on the network is at most half the deadline,
+  so once the response headers are in, the read is over within the deadline plus
+  at most one such wait. **Not bounded by it:** DNS resolution, and a server that
+  trickles the response *headers* themselves (each wait is bounded, the header
+  block is not). It is a bound, not a concurrency: the read stays sequential on
+  the tick, and no thread is added to a safety-critical path to hide a slow one.
+  Running out of it is an unavailable reading like any other error. (The demand
+  signal is read as it always was, with a socket timeout.)
 - **It fails open, in both directions.** An error never engages a ceiling, and
   it *releases one that is engaged, on that same tick*. A Prometheus outage in
   the middle of an event therefore lifts the ceiling. Nothing wakes at that
   moment — shed nodes stay asleep until demand wants them, through the usual
   `WAKE_SUSTAIN_S` — so the exposure is bounded by that and by how long the
-  outage lasts. This is **not a substitute for BMC thermal protection or UPS
+  outage lasts. What it does *not* do is forget the sheds already under way:
+  a node the ceiling was holding down keeps its deadline through an outage no
+  longer than `CEILING_RELEASE_HOLD_S`, counted from the outage's first tick,
+  so a signal that errors on alternate ticks cannot restart every busy node's
+  clock each time round and never reach it. During the outage nothing is
+  picked, un-shed or forced (the deadline is enforced only while the reading in
+  hand asks for it, and there is none), demand can still take a draining node
+  back as it can with no ceiling, and `status` says the signal is unavailable
+  and how many nodes are still held. A readable reading decides as it always
+  did: one that asks again resumes the *same* deadlines, and one that does not
+  forgets them. An outage longer than the hold forgets them too, so a stale
+  anchor never outlives it. (The outage clock is in memory: a restart starts it
+  again, so the anchors can outlive an outage by one more hold per restart; the
+  ceiling itself stays released throughout.) This is **not a substitute for BMC thermal protection or UPS
   shutdown**: it is only as available as its signal and the controller.
 - **Staleness is the expression's job.** An instant query is stamped with the
   time it was *evaluated*, so the age of a metric cannot be read off the
@@ -488,7 +517,8 @@ capacityCeiling:
 - **It loosens reluctantly.** The effective limit is the *minimum of the
   readings in the trailing `CEILING_RELEASE_HOLD_S`* (900), so a flapping signal
   (`0, none, 0, none`) holds nodes down and costs no wake-and-sleep cycles. An
-  *unavailable* reading is not a looser one — it empties the window. After the
+  *unavailable* reading is not a looser one — it empties the window (and
+  does not forget the sheds under way: see above). After the
   release nothing wakes by itself: demand does, through the usual wake window,
   one node per tick. (The hold is in memory, so a restart forgets it.) Nodes
   held down that the loosened reading no longer needs gone go back to being
@@ -508,7 +538,10 @@ capacityCeiling:
   person asked — and `metalnap maintenance start` says so. A person who
   uncordons a node mid-drain -- one the ceiling was already holding down, or an
   ordinary drain it had not yet picked -- is not fought: the node is *spared*,
-  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S`, and another node is shed in its place if the ceiling still
+  counted as powered but never picked to be shed, for `SLEEP_COOLDOWN_S` (a
+  node is known to have been draining by its phase, or, after a restart, by the
+  shed note or the ownership mark still on it, both while engaged and through
+  an outage's hold), and another node is shed in its place if the ceiling still
   needs one. (That is held in memory, so a restart forgets it.)
 - **Scheduled visits and a wedged node's power cycle are for a pool with room.**
   A steady budget — `static: 2` over four nodes — works normally; an emergency
@@ -565,17 +598,22 @@ it was last written once that is older than fifteen minutes.
 
 Metrics are served on `METRICS_PORT` (chart `metrics.port`) — the controller
 listened on nothing before, so it is **off by default**, there is no Service,
-and it adds no dependency:
+and it adds no dependency. It handles at most eight connections at once, and
+closes any beyond that as they arrive, so a client that opens a few hundred and
+says nothing costs eight threads and not a few hundred (a silent one is dropped
+after ten seconds, which frees its slot):
 
 | metric | meaning |
 |---|---|
-| `metalnap_capacity_ceiling` | the limit in force; absent when there is none |
-| `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool |
+| `metalnap_capacity_ceiling` | the effective limit — the reading with the release hold applied — **as read, not clamped to the pool**; absent while there is no reading or the signal is unavailable |
+| `metalnap_capacity_ceiling_pool_nodes` | the nodes the ceiling counts: every managed node except those an operator holds or has taken for maintenance |
+| `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool (the limit is below `..._pool_nodes`) |
 | `metalnap_capacity_ceiling_signal_ok` | 0 while the signal is unavailable and treated as no ceiling |
 | `metalnap_nodes_shed` | nodes currently held down by the ceiling |
 | `metalnap_shed_forced_total` | busy nodes shut down at the deadline with work still running, counted once per shed when the power-off is confirmed (a node that ignores the request is not counted) |
 
-"Shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
+"The ceiling binds" is `metalnap_capacity_ceiling < metalnap_capacity_ceiling_pool_nodes`
+(which is `..._engaged`); "shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
 `increase(metalnap_shed_forced_total[1h]) > 0`.
 
 ### The rule it touches
@@ -737,8 +775,9 @@ it is asked for on the node.
 `CEILING_QUERY` (PromQL; its value is the most nodes awake, no series is none)
 or `CEILING_STATIC` (a number; `0` is a ceiling) enables a [capacity
 ceiling](#capacity-ceiling) and is off by default. `CEILING_RELEASE_HOLD_S`
-(default `900`) and `CEILING_DRAIN_DEADLINE_S` (default `600`; `0` never forces
-a busy node) shape it. `STATUS_CONFIGMAP` names the object `metalnap status`
+(default `900`), `CEILING_DRAIN_DEADLINE_S` (default `600`; `0` never forces a
+busy node) and `CEILING_TIMEOUT_S` (default `5`, the read's own timeout) shape
+it. `STATUS_CONFIGMAP` names the object `metalnap status`
 reads it from, and `METRICS_PORT` (default `0`, off) serves the metrics.
 
 The pool is sized on **memory and CPU**, whichever needs more nodes

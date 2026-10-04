@@ -115,7 +115,11 @@ maintenance:
 #
 # OFF unless `query` or `static` is set, and it FAILS OPEN, in both directions:
 # an unreachable Prometheus never sheds a node, and one that goes away in the
-# middle of an event lifts the ceiling at once.
+# middle of an event lifts the ceiling at once. The nodes it was already
+# holding down keep their drain deadlines through an outage no longer than
+# `releaseHoldS` (nothing is forced while the signal is down), so a signal that
+# errors every other tick cannot restart them for ever; a longer outage, or a
+# reading that releases, forgets them.
 #
 # It touches one of the rules the README lists as unbreakable -- "never
 # interrupt running work" -- and relaxes it in exactly one place: a node still
@@ -162,13 +166,16 @@ capacityCeiling:
   static: null
   releaseHoldS: 900       # a looser reading must hold this long before shed nodes are released
   drainDeadlineS: 600     # a busy node is given this long, then shut down anyway; 0 = never force
+  timeoutS: 5             # deadline, in elapsed seconds, on the ceiling's Prometheus read: checked after every read, no redirect followed, DNS and trickled response headers not bounded (with a query: > 0, <= timers.intervalS); running out is an unavailable reading
 
 # Prometheus metrics, on a plain HTTP listener inside the controller. OFF by
 # default: before this the controller listened on nothing at all. Set a port to
-# serve /metrics there -- metalnap_capacity_ceiling, ..._engaged, ..._signal_ok,
-# metalnap_nodes_shed and metalnap_shed_forced_total. There is deliberately no
+# serve /metrics there -- metalnap_capacity_ceiling (the reading, not clamped to
+# the pool), ..._pool_nodes, ..._engaged, ..._signal_ok, metalnap_nodes_shed and
+# metalnap_shed_forced_total. There is deliberately no
 # Service: scrape the pod (a PodMonitor), or add a Service of your own. 1024 or
-# more -- the container runs unprivileged with every capability dropped.
+# more -- the container runs unprivileged with every capability dropped. At most
+# eight connections are handled at once; the rest are closed as they arrive.
 metrics:
   port: 0
 

@@ -124,6 +124,20 @@ class Config:
     #: it off anyway, with the ordinary soft shutdown. 0 never forces: a busy
     #: node then holds the ceiling open for as long as its work runs.
     ceiling_drain_deadline_s: int = _i("CEILING_DRAIN_DEADLINE_S", 600)
+    #: A DEADLINE, in seconds of elapsed time, on the ceiling's Prometheus read.
+    #: It has its own, much shorter than the demand signal's twenty seconds,
+    #: because it is read ON the tick, before anything else, and a shed is
+    #: waiting on it: running out of it is an unavailable reading like any other
+    #: error. Elapsed time, because a socket timeout bounds each wait and not the
+    #: read, and a server that trickles bytes would never trip it. The body is
+    #: read against the clock after every read; each socket wait is at most half
+    #: of it; no redirect is followed. So the read is over within this plus at
+    #: most one socket wait (half of it) once the headers are in. NOT bounded by
+    #: it: DNS resolution, and a server that trickles the response headers.
+    #: Checked only when a query is set: nothing else is read. A bound and not
+    #: a concurrency: the read stays on the tick, sequential, and no thread is
+    #: added to a safety-critical path to hide a slow one.
+    ceiling_timeout_s: int = _i("CEILING_TIMEOUT_S", 5)
 
     def validate(self):
         if self.mode not in ("off", "dry_run", "on"):
@@ -180,6 +194,15 @@ class Config:
         if self.ceiling_drain_deadline_s < 0:
             raise ValueError("CEILING_DRAIN_DEADLINE_S must be >= 0 "
                              "(0 never forces a busy node)")
+        # Only a query is read, so only a query has a read to bound: a
+        # deployment with a small INTERVAL_S and no ceiling must still start.
+        if self.ceiling_query and not (
+                0 < self.ceiling_timeout_s <= self.interval_s):
+            raise ValueError(
+                "CEILING_TIMEOUT_S (%d) must be > 0 and no more than "
+                "INTERVAL_S (%d): the read is made on the tick, and one that "
+                "can outlast the tick's own interval stretches every tick"
+                % (self.ceiling_timeout_s, self.interval_s))
 
     def _validate_maintenance(self):
         """Reject schedules that cannot work, rather than half-working.
