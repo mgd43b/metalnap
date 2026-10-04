@@ -31,15 +31,21 @@ class PrometheusCeiling:
     the underlying metric cannot be read off the response. End the expression
     with a freshness guard instead -- `... and on() (time() - timestamp(m) <
     120)` -- and a stale metric returns no series, which is no ceiling.
+
+    The read is made on the tick, before the demand signal's, so it has a short
+    deadline of its own (CEILING_TIMEOUT_S, five seconds of ELAPSED time,
+    not a socket timeout: see instant_query for exactly what it bounds). Running out of it
+    is an exception like any other: unavailable, which sheds nothing.
     """
 
-    def __init__(self, url, query, timeout=20):
+    def __init__(self, url, query, timeout=5):
         self.url = url.rstrip("/")
         self.query = query
         self.timeout = timeout
 
     def limit(self):
-        data = instant_query(self.url, self.query, self.timeout)
+        data = instant_query(self.url, self.query, self.timeout,
+                             deadline=self.timeout)
         kind, result = data["resultType"], data["result"]
         if kind == "scalar":                 # `query: "2"`: [ts, "2"]
             samples = [result]

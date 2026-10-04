@@ -63,10 +63,17 @@ The cluster model is faithful on the points a controller gets wrong:
     a shed's deadline and the current reading, no deadline re-stamped, no power
     cycle with the pool over it). A standing budget is one of the episodes -- a
     cap of one over two nodes for hundreds of ticks -- because visits and a
-    wedged node's power cycle have to keep working inside it. LIVENESS is that an engaged ceiling CONVERGES -- the nodes the
+    wedged node's power cycle have to keep working inside it. A FLAPPING signal
+    is another -- a reading, an error, a reading, for a hundred ticks -- and an
+    outage is judged as it is specified: the ceiling is released (no new shed,
+    nothing blocked, no deadline enforced) but a node already held down keeps
+    its anchor, and the clock on what the ceiling was asking runs on through the
+    outage, for as long as it is no longer than the release hold. LIVENESS is that an engaged ceiling CONVERGES -- the nodes the
     controller can act on end up at or under it within a drain deadline and a
-    shutdown or two -- because safety alone is satisfied by a controller that
-    does nothing.
+    shutdown or two, flapping included -- because safety alone is satisfied by
+    a controller that does nothing. (The demand check does not apply while a
+    signal flaps: fail-open in both directions serves demand only between an
+    error and the next reading.)
 
 Four things this harness got WRONG before it got them right, each of which made
 it report OK while testing nothing:
@@ -179,27 +186,29 @@ for requests, and play out exactly as they did before them.
 and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
 300 of 600), each mistake reintroduced afresh:
 
-    a shed's deadline held in memory                   29/30   292/300
-    a shed note outliving the ceiling                  29/30   298/300
-    an error averaged into the hold                    23/30   194/300
-    a visit begun with no slot left under a ceiling    17/30   173/300
-    a shed's deadline re-stamped when it is resumed    17/30   171/300
-    a node carrying work shed before an idle one        8/30   112/300
+    a shed's deadline held in memory                   28/30   284/300
+    a shed note outliving the ceiling                  28/30   275/300
+    an error averaged into the hold                     8/30   145/300
+    a visit begun with no slot left under a ceiling    18/30   172/300
+    an outage forgetting the sheds under way           17/30   182/300
+    the outage clock never reset by a reading           8/30   105/300
+    a shed's deadline re-stamped when it is resumed    16/30   185/300
+    a node carrying work shed before an idle one       11/30   143/300
     the deadline forced for a ceiling only the hold
-      still asks for                                    7/30    67/300
-    a wedged node power-cycled with the pool over       5/30    31/300
+      still asks for                                    7/30    51/300
+    a wedged node power-cycled with the pool over       4/30    32/300
     the wedged node left out of that count              4/30    27/300
-    the drain timeout ending a shed                     2/30    26/300
-    the hold taken as a maximum, not a minimum          0/30     7/300
-    a wake that has just arrived not shed               0/30     3/300
-    the attempt bound ending a shed                     0/30     1/300
+    the drain timeout ending a shed                     0/30     5/300
+    the hold taken as a maximum, not a minimum          3/30    15/300
+    a wake that has just arrived not shed               1/30     3/300
+    the attempt bound ending a shed                     1/30    12/300
     clamp before the fit guard                          0/30     0/300
     `unguarded` not clamped                             0/30     0/300
     visits held back whenever a ceiling limits, with
       headroom                                          0/30    10/300
     a wedged node never cycled under a ceiling, or
       refused at the limit and not only over it         0/30     0/300
-    wakes gated on the nodes in service, not powered    0/30     0/300
+    wakes gated on the nodes in service, not powered    1/30     3/300
     a drain turned into a shed that is not needed       0/30     0/300
     a shed the reading no longer needs not given back   0/30     0/300
     the end of the list not shed first                  0/30     0/300
@@ -221,11 +230,12 @@ and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
     a limit clamped to every node, not to the pool      0/30     0/300
     no series read as a ceiling of 0, in the controller 60/60   600/600
 
-Rates measured against an older harness say nothing about this one, so: the
-rows were measured before a standing-budget episode (a cap of one over two nodes
-for hundreds of ticks) joined the harness and visits and power cycles became a
-matter of headroom. Every row about a visit or a wedged node's cycle was
-re-measured with them; the rest were not, and the episodes they draw differ.
+Every row above was measured again on the harness as it stands, with the
+flapping and standing-budget episodes in it (the failing seeds of 60 are the
+numerators over 30, since only half the seeds run a ceiling, and of 600 over
+300). Rates measured against an older harness say nothing about this one, and
+several moved when the episodes they draw changed; the ones that moved most are
+the rows an outage or a flap bears on.
 
 The last row is every seed because the mistake is not confined to the seeds that
 run a ceiling: a controller with none reads "no series" too. The same mistake in
@@ -356,6 +366,12 @@ class Sim:
         self.busy_phase, self.big, self.capped = True, True, False
         self.phase_left, self.quiet_ticks, self.busy_ticks = 30, 0, 0
         self.human_held, self.need_window = set(), []
+        #: Nodes an operator uncordoned with plain kubectl while the controller
+        #: had them cordoned -- our mark left behind -- and when. The ceiling
+        #: does not fight a person: none of them may be cordoned again for a
+        #: shed within the sleep cooldown. (A restart in between is the case
+        #: that has no in-memory phase to say it was draining.)
+        self.put_back, self.put_back_pending = {}, {}
         self.log = []
         # invariant violations, collected rather than raised so the tick that
         # caused them finishes and the report shows full context
@@ -424,12 +440,20 @@ class Sim:
         #: error empties it; a restart does too, which is the documented
         #: direction (the hold is in memory, and a restart fails open).
         self.ceil_hist = []
+        #: When the signal first went unavailable, in this unbroken outage --
+        #: the model's own copy of the clock the controller keeps in memory,
+        #: and like it, started again by a restart.
+        self.ceil_down_since = None
         self.ceil_over_since, self.ceil_pool_key = None, None
         self.ceil_breaches = []
         self.forced_sheds = self.shed_episodes = self.sheds_begun = 0
         #: Visits begun, and wedged nodes cycled, WHILE a ceiling was limiting
         #: the pool -- the two things a steady budget has to keep doing.
         self.visits_under_ceiling = self.cycles_under_ceiling = 0
+
+    #: How often, per drained node per tick in a ceiling episode, an operator
+    #: puts it back into service with plain `kubectl uncordon`.
+    PUT_BACK_P = 0.02
 
     @staticmethod
     def default_cfg(seed):
@@ -528,9 +552,14 @@ class Sim:
             self.ceil_kind = None
             if r.random() < 0.012:
                 self.ceil_kind = r.choice(("steady", "steady", "flicker",
-                                           "noisy", "budget"))
+                                           "noisy", "budget", "flap"))
                 self.ceil_value = r.choice((0, 0, 1))
                 self.ceil_left = r.randint(8, 70)
+                if self.ceil_kind == "flap":
+                    # A signal that errors on about every other tick, for long
+                    # enough to cross a drain deadline several times: the shape
+                    # that restarted every busy node's deadline each time round.
+                    self.ceil_left = r.randint(60, 140)
                 if self.ceil_kind == "budget":
                     # A standing cap of one node over two, for a long time: not
                     # an emergency, so visits and the power cycle of a wedged
@@ -544,6 +573,9 @@ class Sim:
         elif self.ceil_kind == "flicker":
             self.ceil_flip = not self.ceil_flip
             self.ceil_reading = self.ceil_value if self.ceil_flip else None
+        elif self.ceil_kind == "flap":
+            self.ceil_reading = (self.ceil_value if r.random() < 0.55
+                                 else "error")
         else:
             x = r.random()
             self.ceil_reading = (self.ceil_value if x < 0.6
@@ -553,6 +585,12 @@ class Sim:
         # leave the model believing there was no ceiling, and pass.
         if self.ceil_reading == "error":
             self.ceil_hist = []
+            if self.ceil_down_since is None:
+                self.ceil_down_since = self.t
+        else:
+            self.ceil_down_since = None
+        if self.ceil_reading == "error":
+            pass
         elif self.ceil_reading is not None:
             self.ceil_hist.append((self.t, self.ceil_reading))
         hold = self.cfg.ceiling_release_hold_s
@@ -564,6 +602,20 @@ class Sim:
         if self.ceil_reading == "error":
             raise RuntimeError("prometheus unreachable")
         return self.ceil_reading
+
+    def in_outage_grace(self):
+        """The signal is down, and has been for no longer than the release hold:
+        the ceiling is released, but what it had put down is still held."""
+        return (self.ceil_reading == "error"
+                and self.t - self.ceil_down_since
+                <= self.cfg.ceiling_release_hold_s)
+
+    def spared(self, name):
+        """An operator put this node back into service while the ceiling was in
+        force, lately: it is not the ceiling's to shed, so a busy node may go
+        while it sits idle."""
+        return (self.t - self.put_back.get(name, -10 ** 9)
+                < self.cfg.sleep_cooldown_s)
 
     def exempt(self, n):
         """Held by an operator, by cordon or by request: not the ceiling's."""
@@ -632,6 +684,7 @@ class Sim:
             # idle nodes first.
             idle_awake = [m for m in self.pool()
                           if m.name != name and m.ready and not m.cordoned
+                          and not self.spared(m.name)
                           and not any(w.node == m.name and w.work
                                       for w in self.workers)]
             if not (self.model_binding() and n.shed_at is not None):
@@ -647,6 +700,17 @@ class Sim:
                 self.ceil_breaches.append(
                     (self.t, name, "put a node into service over the "
                      "ceiling (%d allowed)" % self.model_limit()))
+        if cordoned and self.ceiling_on and n.shed_at is not None \
+                and self.spared(name):
+            self.ceil_breaches.append(
+                (self.t, name, "cordoned a node for a shed that an operator "
+                 "had just put back into service"))
+        if not cordoned and self.ceiling_on and self.in_outage_grace():
+            # Demand took a node back while the ceiling was released: the
+            # signal being down is "no ceiling", and a node the pool needs is
+            # served. What it had been shed for is over, so the clock on it
+            # starts again if the signal comes back and asks for it again.
+            self.ceil_over_since = None
         n.cordoned = cordoned
         n.ours = self.t if cordoned else None
 
@@ -661,6 +725,17 @@ class Sim:
             self.ceil_breaches.append(
                 (self.t, name, "re-stamped the shed deadline of a node it "
                  "was already holding down"))
+        if (key == "shed" and value is None and node.shed_at is not None
+                and node.ready and node.cordoned and node.ours is not None
+                and not self.exempt(node)
+                and self.ceiling_on and self.in_outage_grace()):
+            # The ceiling is released while its signal is down, but a node it
+            # holds down, and still draining, keeps its deadline: dropped, the
+            # next reading starts a fresh one, and a signal that errors every
+            # other tick never lets one run out.
+            self.ceil_breaches.append(
+                (self.t, name, "dropped the shed deadline of a node it was "
+                 "still holding down, in an outage shorter than the hold"))
         if key == "shed" and value is not None and node.shed_at is None:
             self.sheds_begun += 1
         setattr(node, {"power-cycled": "power_cycled_at",
@@ -1025,6 +1100,18 @@ class Sim:
 
         self.step_maintenance_requests()
 
+        # An operator puts back into service a node the controller is draining
+        # -- plain `kubectl uncordon`, which leaves our mark behind.
+        if self.ceiling_on and self.ceil_kind is not None:
+            for n in self.nodes.values():
+                if (n.cordoned and n.ours is not None and n.ready
+                        and n.powered and n.shutdown_at is None
+                        and n.name not in self.human_held
+                        and n.maintenance is None
+                        and self.ceil_rnd.random() < self.PUT_BACK_P):
+                    n.cordoned = False
+                    self.put_back_pending[n.name] = self.t
+
         # PHASED demand. Rerolling every tick never held demand below capacity
         # for the consecutive ticks a sleep needs, so the sleep path never ran.
         if not self.busy_phase:
@@ -1295,7 +1382,8 @@ class Sim:
         if self.ceiling_on:
             lim = self.model_limit()
             for n in self.nodes.values():
-                if n.shed_at is not None and lim is None:
+                if (n.shed_at is not None and lim is None
+                        and not self.in_outage_grace()):
                     fail("%s still carries a shed note with no ceiling in "
                          "force" % n.name)
             # An engaged ceiling CONVERGES: once settled, no more than `limit`
@@ -1314,7 +1402,11 @@ class Sim:
             key = frozenset(n.name for n in pool)
             if key != self.ceil_pool_key:
                 self.ceil_over_since, self.ceil_pool_key = None, key
-            powered = len(self.powered_pool())
+            # A node an operator put back is the operator's for the sleep
+            # cooldown: the ceiling does not fight a person, so it is not held
+            # against the ceiling's bound until then.
+            powered = len([n for n in self.powered_pool()
+                           if not self.spared(n.name)])
             if lim is not None and lim < len(pool) and powered > lim:
                 if self.ceil_over_since is None:
                     self.ceil_over_since = self.t
@@ -1326,6 +1418,12 @@ class Sim:
                          "nodes still powered (budget %.0fs) -- it does not "
                          "converge" % (lim, self.t - self.ceil_over_since,
                                        powered, budget))
+            elif self.in_outage_grace():
+                # An outage releases the ceiling but is not a release: the
+                # clock on what it was asking for runs on through it, so a
+                # signal that errors on alternate ticks cannot postpone a
+                # deadline for ever. Past the hold it is one, and resets.
+                pass
             else:
                 self.ceil_over_since = None
 
@@ -1579,7 +1677,15 @@ class Sim:
         # A wedged node is powered and serves nothing, so it is not capacity.
         powered = sum(1 for n in pool
                       if n.powered and not n.hung and n.partitioned is None)
-        self.need_window.append(need > powered)
+        # While the signal flaps -- an error, a reading, an error -- a node is
+        # woken on the error (the ceiling is released) and shed on the reading
+        # (it tightens at once), and demand is served only between the two. That
+        # is what fail-open in both directions means, and what the hold exists
+        # to soften for a signal that is merely noisy; it is not what this
+        # check is for, which is that a ceiling that is NOT in the way does not
+        # leave demand unserved.
+        self.need_window.append(need > powered
+                                and self.ceil_kind != "flap")
         if len(self.need_window) > 40:
             self.need_window.pop(0)
         if (len(self.need_window) == 40 and sum(self.need_window) >= 16
@@ -1617,8 +1723,20 @@ class Sim:
                     self.muted_hung_since.clear()
                     self.stuck_wake_since.clear()
                     self.ceil_hist = []     # the hold was in memory
+                    self.ceil_down_since = None
+                    # What was spared was remembered in memory; what has not
+                    # been seen yet is on the node, and is seen after the restart.
+                    self.put_back.clear()
                 if self.ceiling_on:
                     self.step_ceiling()
+                    # An uncordon is spared if the ceiling is engaged -- or in
+                    # the grace of an outage -- when the controller sees it;
+                    # seen while the ceiling is not in force, the node is
+                    # simply in service, and a ceiling that engages afterwards
+                    # may shed it like any other.
+                    if self.model_binding() or self.in_outage_grace():
+                        self.put_back.update(self.put_back_pending)
+                    self.put_back_pending.clear()
                 self.blocked = None
                 self.observed = {k: v.maintenance
                                  for k, v in self.nodes.items()}

@@ -8,6 +8,7 @@ backstop is not good enough -- particularly anything guarding running work or
 an operator's cordon.
 """
 import dataclasses
+import http.server
 import json
 import os
 import sys
@@ -131,6 +132,10 @@ class Harness:
 
     def disown(self, n):
         self.acted["disown"].append(n)
+        # As on a cluster: the mark is gone once it has been cleared, so it is
+        # not seen again on the next tick.
+        self.states[n] = dataclasses.replace(self.states[n], ours=False,
+                                             ours_since=None)
 
     # PowerBackend lives on its own object: NodeSource.state() and
     # PowerBackend.state() share a name, so one class implementing both hands
@@ -3136,6 +3141,8 @@ class _Resp:
 
     def __init__(self, body, code=200):
         self.body, self.code = body, code
+        self.status_code, self.headers = code, {}
+        self.raw = _Raw(json.dumps(body).encode())
 
     def raise_for_status(self):
         if self.code >= 400:
@@ -3143,6 +3150,46 @@ class _Resp:
 
     def json(self):
         return self.body
+
+    def close(self):
+        pass
+
+
+class _Raw:
+    """What `response.raw` offers: read1() returns as soon as ANY bytes have
+    arrived, which is the whole point of reading with it."""
+
+    def __init__(self, data, step=None):
+        self.data, self.step = data, step
+
+    def read1(self, n=-1):
+        size = len(self.data) if not n or n < 0 else n
+        if self.step:
+            size = min(size, self.step)
+        out, self.data = self.data[:size], self.data[size:]
+        return out
+
+
+class _Trickle(_Resp):
+    """A server that never goes quiet for as long as one socket timeout, and
+    never finishes: a byte every fifty milliseconds, for ever. `requests`
+    applies its timeout to each socket operation, so this is never a timeout
+    to it."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.sent = 0
+        self.raw = self
+
+    def json(self):
+        import time
+        time.sleep(3)                    # what reading it all would take
+
+    def read1(self, n=-1):
+        import time
+        time.sleep(0.05)
+        self.sent += 1
+        return b" "
 
 
 def prom(result, result_type="vector", status="success"):
@@ -3226,13 +3273,82 @@ class TestPrometheusCeiling(unittest.TestCase):
 
     def test_the_demand_signal_and_the_ceiling_ask_prometheus_the_same_way(self):
         """One place asks, so a change to how Prometheus is reached -- auth,
-        TLS, a timeout -- cannot reach the demand signal and miss the ceiling:
-        which would fail open, and quietly stop working."""
+        TLS -- cannot reach the demand signal and miss the ceiling: which would
+        fail open, and quietly stop working. They differ only in how long they
+        will wait, which is the point of the ceiling's own."""
         from metalnap.signal.prometheus import PrometheusSignal
         with mock.patch("requests.get", return_value=prom(vec(1))) as get:
             PrometheusSignal("http://prom:9090/", "q", timeout=7).shortfall()
             PrometheusCeiling("http://prom:9090/", "q", timeout=7).limit()
-        self.assertEqual(get.call_args_list[0], get.call_args_list[1])
+        demand, ceiling = get.call_args_list
+        self.assertEqual(demand.args, ceiling.args)
+        self.assertEqual(demand.kwargs["params"], ceiling.kwargs["params"])
+
+    def test_the_demand_signal_is_read_as_it_always_was(self):
+        """Unchanged: one scalar timeout, no streaming, no deadline."""
+        from metalnap.signal.prometheus import PrometheusSignal
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusSignal("http://prom:9090/", "q", timeout=7).shortfall()
+        get.assert_called_once_with("http://prom:9090/api/v1/query",
+                                    params={"query": "q"}, timeout=7)
+
+    def test_a_server_that_trickles_bytes_cannot_outlast_the_deadline(self):
+        """`requests` applies a timeout to each socket operation, not to the
+        read as a whole, so a server that sends a byte now and then is never a
+        timeout to it and could hold the tick for as long as it likes. The read
+        has a deadline of its own, measured on the clock."""
+        import time
+        trickle = _Trickle()
+        with mock.patch("requests.get", return_value=trickle):
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                PrometheusCeiling("http://prom", "q", timeout=0.4).limit()
+            took = time.monotonic() - t0
+        self.assertLess(took, 2.0, "outlasted its deadline by %.1fs" % took)
+        self.assertGreater(trickle.sent, 2, "the fake never trickled")
+
+    def test_a_timeout_of_the_deadline_is_an_unavailable_reading(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(**ONLY_THE_CEILING)
+        c.ceiling = PrometheusCeiling("http://prom", "q", timeout=0.3)
+        with mock.patch("requests.get", return_value=_Trickle()):
+            self.assertEqual(c._read_ceiling(), (None, False))
+        self.assertIn("deadline", c._ceiling_err)
+
+    def test_the_socket_waits_are_each_half_the_deadline_so_connect_and_headers_fit(self):
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusCeiling("http://prom", "q", timeout=6).limit()
+        kw = get.call_args.kwargs
+        self.assertEqual((kw["timeout"], kw["stream"]), ((3.0, 3.0), True))
+        self.assertIs(kw["allow_redirects"], False)
+        self.assertEqual(kw["headers"], {"Accept-Encoding": "identity"})
+
+    def test_a_normal_answer_is_read_whole_in_chunks(self):
+        resp = prom(vec(3, 1))
+        resp.raw = _Raw(json.dumps(resp.body).encode(), step=7)
+        with mock.patch("requests.get", return_value=resp):
+            self.assertEqual(PrometheusCeiling("http://prom", "q").limit(), 1)
+
+    def test_the_timeout_reaches_the_request_and_defaults_short(self):
+        """The ceiling is read before demand, on the tick: five seconds, not
+        the demand signal's twenty."""
+        with mock.patch("requests.get",
+                        side_effect=lambda *a, **k: prom(vec(1))) as get:
+            PrometheusCeiling("http://prom", "q").limit()
+            PrometheusCeiling("http://prom", "q", timeout=3).limit()
+        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list],
+                         [(2.5, 2.5), (1.5, 1.5)])
+
+    def test_a_timeout_is_unavailable_like_any_other_error(self):
+        import requests
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(**ONLY_THE_CEILING)
+        c.ceiling = PrometheusCeiling("http://prom", "q", timeout=1)
+        with mock.patch("requests.get",
+                        side_effect=requests.exceptions.ReadTimeout("slow")):
+            self.assertEqual(c._read_ceiling(), (None, False))
+            run(h, c, 3)
+        self.assertEqual(h.acted["cordon"], [], "a timeout shed a node")
 
     def test_the_query_goes_to_the_query_api(self):
         with mock.patch("requests.get",
@@ -3240,7 +3356,139 @@ class TestPrometheusCeiling(unittest.TestCase):
             PrometheusCeiling("http://prom:9090/", "up == 0",
                               timeout=7).limit()
         get.assert_called_once_with("http://prom:9090/api/v1/query",
-                                    params={"query": "up == 0"}, timeout=7)
+                                    params={"query": "up == 0"},
+                                    timeout=(3.5, 3.5), stream=True,
+                                    allow_redirects=False,
+                                    headers={"Accept-Encoding": "identity"})
+
+
+class TestCeilingReadAgainstARealSlowServer(unittest.TestCase):
+    """The deadline is only worth what it does against a real socket. A fake
+    that yields a byte per iteration never showed that reading a body in
+    8 KiB chunks blocks until 8 KiB have arrived, so a server that sends a byte
+    every fifty milliseconds never gave control back; nor that `requests`
+    follows redirects, each hop with socket timeouts of its own."""
+
+    DEADLINE = 0.6
+    SLACK = 1.5               # the one wait in progress (half a deadline) + more
+
+    def server(self, handler):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        return "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def read(self, url):
+        """(outcome, seconds): the read, run where a hang is a failure and not
+        a hung suite."""
+        import time
+        box = {}
+
+        def go():
+            t0 = time.monotonic()
+            try:
+                box["value"] = PrometheusCeiling(url, "q",
+                                                 timeout=self.DEADLINE).limit()
+            except BaseException as e:                # noqa: BLE001
+                box["error"] = e
+            box["took"] = time.monotonic() - t0
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=12)
+        self.assertFalse(t.is_alive(), "the read was still going after 12s")
+        return box
+
+    def trickling(self, chunked):
+        import time
+        body = (b'{"status":"success","data":{"resultType":"vector",'
+                b'"result":[' + b" " * 4000 + b"]}}")
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                else:
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for i in range(len(body)):
+                        time.sleep(0.05)
+                        b = body[i:i + 1]
+                        self.wfile.write(
+                            b"1\r\n" + b + b"\r\n" if chunked else b)
+                        self.wfile.flush()
+                except OSError:
+                    pass
+        return H
+
+    def test_a_body_sent_a_byte_at_a_time_cannot_outlast_the_deadline(self):
+        box = self.read(self.server(self.trickling(chunked=False)))
+        self.assertIsInstance(box.get("error"), TimeoutError, box)
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_chunked_body_sent_a_byte_at_a_time_cannot_either(self):
+        box = self.read(self.server(self.trickling(chunked=True)))
+        self.assertIsInstance(box.get("error"), TimeoutError, box)
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_redirect_is_unavailable_and_is_not_followed(self):
+        import time
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                hits.append(self.path)
+                time.sleep(0.15)           # each hop costs, as a chain does
+                self.send_response(302)
+                self.send_header("Location", self.path + "x")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        box = self.read(self.server(H))
+        self.assertIn("redirect", str(box.get("error")), box)
+        self.assertEqual(len(hits), 1, "followed a redirect")
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_compressed_answer_is_refused_not_read_raw(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = b"\x1f\x8b not json"
+                self.send_response(200)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        box = self.read(self.server(H))
+        self.assertIn("encoding", str(box.get("error")), box)
+
+    def test_an_ordinary_answer_over_a_real_socket_is_read(self):
+        body = json.dumps({"status": "success", "data": {
+            "resultType": "vector", "result": vec(3, 1)}}).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        box = self.read(self.server(H))
+        self.assertEqual(box.get("value"), 1, box)
 
 
 class TestStaticCeiling(unittest.TestCase):
@@ -3303,6 +3551,40 @@ class TestCeilingConfig(unittest.TestCase):
     def test_zero_is_allowed_for_both_durations(self):
         Config(mode="on", ceiling_release_hold_s=0,
                ceiling_drain_deadline_s=0).validate()
+
+    def test_the_ceiling_read_has_a_short_timeout_of_its_own(self):
+        """It is read on the tick, before the demand signal: a Prometheus that
+        hangs must not stretch the tick by the demand signal's twenty seconds
+        before the shed that is waiting on it can begin."""
+        self.assertEqual(self.build().ceiling_timeout_s, 5)
+        self.assertEqual(self.build(CEILING_TIMEOUT_S="3").ceiling_timeout_s,
+                         3)
+
+    def test_the_timeout_must_be_positive_and_no_longer_than_the_interval(self):
+        for kw in (dict(ceiling_timeout_s=0), dict(ceiling_timeout_s=-1),
+                   dict(ceiling_timeout_s=61),
+                   dict(ceiling_timeout_s=31, interval_s=30)):
+            with self.subTest(kw=kw), self.assertRaises(ValueError) as e:
+                Config(mode="on", ceiling_query="up", **kw).validate()
+            self.assertIn("CEILING_TIMEOUT_S", str(e.exception))
+        Config(mode="on", ceiling_query="up",
+               ceiling_timeout_s=60).validate()                 # == interval
+        Config(mode="on", ceiling_query="up", ceiling_timeout_s=1,
+               interval_s=1).validate()
+
+    def test_no_query_means_the_timeout_is_not_checked(self):
+        """Nothing reads Prometheus for a ceiling, so a deployment with a small
+        INTERVAL_S and no ceiling (or a static one) must still start."""
+        Config(mode="on", interval_s=2).validate()
+        Config(mode="on", interval_s=2, ceiling_static=1).validate()
+        Config(mode="on", interval_s=2, ceiling_timeout_s=0).validate()
+        saved = dict(os.environ)
+        os.environ["INTERVAL_S"] = "2"
+        try:
+            Config().validate()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
     def test_a_deadline_of_zero_is_warned_about_at_start(self):
         warned = Config(mode="on", ceiling_drain_deadline_s=0).warnings()
@@ -3481,8 +3763,16 @@ class TestCeilingFailsOpen(unittest.TestCase):
         h._ceiling = RuntimeError("prometheus down")
         h.t += 60
         c.tick()
+        self.assertFalse(c._engaged, "the ceiling outlived its signal")
+        self.assertIsNone(c._limit)
+        # What it had put down is not forgotten by a blip: the anchors go when
+        # a reading says release, or the outage outlasts the hold.
+        self.assertEqual([n for n, v in shed_notes(h) if v is None], [])
+        h._ceiling = None
+        h.t += 60
+        c.tick()
         self.assertEqual(sorted(n for n, v in shed_notes(h) if v is None),
-                         ["a", "b"], "the ceiling outlived its signal")
+                         ["a", "b"], "a real release left the notes behind")
 
     def test_an_error_lets_demand_wake_a_node_straight_away(self):
         h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
@@ -3542,22 +3832,27 @@ class TestCeilingFailsOpen(unittest.TestCase):
         h.controller().tick()
         self.assertEqual(seen, [1], "the demand signal was read first")
 
-    def test_a_reading_is_clamped_to_the_pool_not_to_every_node(self):
+    def test_a_reading_is_judged_against_the_pool_not_every_node(self):
         """Nodes an operator holds are not the ceiling's to limit, so a reading
-        of 99 over three governed nodes and two held ones is a limit of three --
-        not four -- and one of two stays two."""
+        of 99 over three governed nodes and two held ones does not bind (it is
+        not "four of five"), and one of two does. What is REPORTED is the
+        reading itself, not the pool-clamped limit the decisions use."""
         def states():
             return {"a": node(), "b": node(), "c": node(),
                     "d": node(cordoned=True, ours=False),
                     "e": node(maintenance="firmware")}
-        for reading, limit, engaged in ((99, 3, False), (2, 2, True)):
+        for reading, limit, engaged in ((99, 99, False), (2, 2, True)):
             with self.subTest(reading=reading):
                 h = world(states(), ceiling=reading)
                 sink = _Sink()
-                h.controller(nodes=("a", "b", "c", "d", "e"), metrics=sink,
-                             **ONLY_THE_CEILING).tick()
+                c = h.controller(nodes=("a", "b", "c", "d", "e"), metrics=sink,
+                                 **ONLY_THE_CEILING)
+                c.tick()
                 self.assertEqual((sink.last["limit"], sink.last["engaged"],
                                   sink.last["pool"]), (limit, engaged, 3))
+                self.assertEqual(c._eff, min(reading, 3),
+                                 "the limit the decisions use is not clamped "
+                                 "to the pool the ceiling counts")
 
     def test_nothing_of_a_tick_survives_into_one_that_returns_early(self):
         """sleep(), maintain() and the power cycle read what the last tick
@@ -3579,13 +3874,373 @@ class TestCeilingFailsOpen(unittest.TestCase):
         self.assertEqual(h.ceiling_reads, 0)
         self.assertEqual(h.acted["cordon"], [])
 
-    def test_a_reading_is_clamped_to_the_nodes_there_are(self):
+    def test_a_reading_above_the_pool_binds_nothing_and_is_reported_as_it_is(self):
         h = world({"a": node(), "b": node()}, ceiling=99)
         sink = _Sink()
-        h.controller(metrics=sink, **ONLY_THE_CEILING).tick()
-        self.assertEqual((sink.last["limit"], sink.last["engaged"]),
-                         (2, False))
+        c = h.controller(metrics=sink, **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual((sink.last["limit"], sink.last["engaged"],
+                          sink.last["pool"]), (99, False, 2))
+        self.assertEqual(c._eff, 2, "the decisions stopped using the clamp")
         self.assertEqual(h.acted["cordon"], [])
+
+
+class TestCeilingOutageKeepsTheSheds(unittest.TestCase):
+    """An unavailable reading releases the CEILING -- nothing is picked,
+    nothing is blocked -- but not the sheds already under way: a node held down
+    keeps its anchor through an outage no longer than the release hold, so a
+    signal that errors on alternate ticks cannot restart every busy node's
+    deadline each time round and never reach it."""
+
+    DOWN = RuntimeError("prometheus down")
+
+    def busy_one(self, **kw):
+        h = world({"a": node(ready_since=T0 - 10)}, ceiling=0,
+                  busy={"a": ["job-1"]})
+        return h, h.controller(nodes=("a",), **kw)
+
+    def at(self, h, c, offset, reading):
+        h.t = T0 + offset
+        h._ceiling = reading
+        c.tick()
+
+    def test_a_flapping_signal_still_reaches_the_deadline(self):
+        """engaged, error, engaged, error ...: one anchor, one deadline."""
+        h, c = self.busy_one()
+        for i, offset in enumerate(range(0, 721, 60)):
+            self.at(h, c, offset, 0 if i % 2 == 0 else self.DOWN)
+        self.assertEqual([v for _n, v in shed_notes(h)], [T0],
+                         "the anchor was rewritten or dropped by a blip")
+        self.assertEqual(h.acted["off"], ["a"],
+                         "a flapping signal kept a busy node past its deadline")
+        self.assertEqual(len(h.at_level("error", "SHED FORCED")), 1)
+
+    def test_an_outage_is_not_a_deadline_it_is_not_enforced_while_down(self):
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        for offset in (60, 660, 720):
+            self.at(h, c, offset, self.DOWN)
+        self.assertEqual(h.acted["off"], [],
+                         "forced a node while the signal could not be read")
+        self.assertEqual(c.st["a"]["shed_at"], T0)
+        self.at(h, c, 780, 0)                    # readable and engaged again
+        self.assertEqual(h.acted["off"], ["a"],
+                         "the same anchor did not carry on to its deadline")
+
+    def test_the_ceiling_itself_is_released_during_the_outage(self):
+        """Literal fail-open for the ceiling: no new sheds, no wake blocked."""
+        h = world({"a": node(), "b": asleep()}, ceiling=RuntimeError("down"),
+                  shortfall=400.0)
+        c = h.controller(**ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertEqual(h.acted["on"], ["b"], "a wake was blocked")
+        self.assertFalse(c._engaged)
+        self.assertIsNone(c._limit)
+
+    def test_an_outage_longer_than_the_hold_forgets_the_anchors(self):
+        h, c = self.busy_one(ceiling_release_hold_s=300)
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)             # the outage's first tick
+        self.at(h, c, 360, self.DOWN)            # exactly the hold: kept
+        self.assertNotIn(("a", None), shed_notes(h))
+        self.assertEqual(c.st["a"]["shed_at"], T0)
+        self.at(h, c, 420, self.DOWN)            # longer than it: forgotten
+        self.assertIn(("a", None), shed_notes(h))
+        self.assertNotIn("shed_at", c.st["a"])
+        self.at(h, c, 480, self.DOWN)
+        self.assertEqual(len(h.at_level("warn", "longer than the release "
+                                                "hold")), 1,
+                         "said again on every tick of a long outage")
+
+    def test_each_outage_is_timed_from_its_own_first_tick(self):
+        """Two outages, each shorter than the hold, with a reading between
+        them: the second is not the first one still running."""
+        h, c = self.busy_one(ceiling_release_hold_s=300)
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)
+        self.at(h, c, 120, 0)                    # readable: the outage is over
+        self.at(h, c, 180, self.DOWN)
+        self.at(h, c, 420, self.DOWN)            # 240s into this one
+        self.assertNotIn(("a", None), shed_notes(h),
+                         "the first outage's clock was still running")
+
+    def test_a_real_release_after_an_error_forgets_the_anchors(self):
+        for reading in (None, 5):               # no series; above the pool
+            with self.subTest(reading=reading):
+                h, c = self.busy_one()
+                self.at(h, c, 0, 0)
+                self.at(h, c, 60, self.DOWN)
+                self.assertNotIn(("a", None), shed_notes(h))
+                self.at(h, c, 120, reading)
+                self.assertIn(("a", None), shed_notes(h))
+                self.assertNotIn("shed_at", c.st["a"])
+
+    def test_a_forced_shed_is_still_counted_after_a_blip(self):
+        """The soft-off was asked for past the deadline; the signal blips
+        before the power-off is confirmed; it still counts, once."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        self.at(h, c, 600, 0)                    # forced: shutdown requested
+        self.assertEqual(h.acted["off"], ["a"])
+        self.assertEqual(c.st["a"]["phase"], "powering_off")
+        self.at(h, c, 660, self.DOWN)            # the blip; confirmed here
+        self.at(h, c, 720, 0)
+        self.assertEqual(c.forced_total, 1)
+
+    def test_an_operator_uncordon_during_an_outage_is_still_spared(self):
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        self.at(h, c, 60, self.DOWN)
+        h.states[shed] = dataclasses.replace(h.states[shed], cordoned=False)
+        for offset in (120, 180):
+            self.at(h, c, offset, self.DOWN)
+        self.at(h, c, 240, 1)
+        self.assertEqual(h.acted["cordon"].count((shed, True)), 1,
+                         "re-cordoned a node an operator put back")
+
+    def restarted_then_uncordoned(self):
+        """a and b busy, a ceiling of one: b is shed, with an anchor on the
+        node. The process restarts (no phase, no memory), and the operator
+        uncordons b: Ready, uncordoned, still carrying its note and our mark."""
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        c.st = {}                                  # the process restarted
+        h.states[shed] = dataclasses.replace(h.states[shed], cordoned=False)
+        h.acted["cordon"].clear()
+        h.acted["note"].clear()
+        return h, c, shed
+
+    def test_an_uncordon_after_a_restart_is_spared_during_an_outage(self):
+        """No in-memory phase to say it was draining: the note on the node and
+        our mark left behind are what say so."""
+        h, c, shed = self.restarted_then_uncordoned()
+        for offset in (60, 120):
+            self.at(h, c, offset, self.DOWN)
+        self.at(h, c, 180, 1)                      # the binding reading
+        for offset in (240, 300):
+            self.at(h, c, offset, 1)
+        self.assertNotIn((shed, True), h.acted["cordon"],
+                         "re-cordoned a node an operator put back after a "
+                         "restart")
+        self.assertTrue(h.logged("leaves it alone"))
+
+    def test_an_uncordon_after_a_restart_is_spared_while_engaged_too(self):
+        h, c, shed = self.restarted_then_uncordoned()
+        for offset in (60, 120, 180, 240):
+            self.at(h, c, offset, 1)
+        self.assertNotIn((shed, True), h.acted["cordon"],
+                         "re-cordoned a node an operator put back after a "
+                         "restart")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == shed and v is not None], [],
+                         "stamped the uncordoned node as a shed again")
+
+    def test_an_ordinary_drain_uncordoned_after_a_restart_is_spared_too(self):
+        """No anchor, no phase: only our ownership mark, left behind by the
+        uncordon and cleared the moment it is seen, says it was ours."""
+        h = world({"a": node(), "b": node(ours=True, ours_since=T0 - 100)},
+                  ceiling=1, busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        for offset in (0, 60, 120, 180):
+            self.at(h, c, offset, 1)
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had just put back")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == "b" and v is not None], [])
+
+    def test_a_shed_note_on_an_uncordoned_ready_node_is_spared(self):
+        """Not cordoned, no mark, no phase: the note on the node is all that
+        says the ceiling had it, and a person has since put it back."""
+        h = world({"a": node(), "b": node(shed_at=T0 - 100)}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        for offset in (0, 60, 120):
+            self.at(h, c, offset, 1)
+        self.assertNotIn(("b", True), h.acted["cordon"],
+                         "re-cordoned a node an operator had put back")
+        self.assertEqual([v for n, v in shed_notes(h)
+                          if n == "b" and v is not None], [])
+
+    def test_a_node_the_controller_itself_took_back_is_not_an_operators_uncordon(self):
+        """Demand takes a draining shed node back during an outage. That is
+        the controller's own release: its anchor goes with the cordon, and the
+        next reading does not mistake it for a person having put it back."""
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        h._shortfall = 400.0
+        self.at(h, c, 60, self.DOWN)
+        self.assertIn((shed, False), h.acted["cordon"], "setup: not rescued")
+        self.assertIn((shed, None), shed_notes(h),
+                      "the anchor outlived the controller's own uncordon")
+        self.at(h, c, 120, 1)
+        self.assertFalse(h.logged("leaves it alone"),
+                         "took its own rescue for an operator's uncordon")
+
+    def test_an_anchor_on_a_node_that_is_no_longer_held_down_goes(self):
+        """The anchor is kept for a node that is still cordoned and ours.
+        One put back in service is not held down, outage or not."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        h.states["a"] = dataclasses.replace(h.states["a"], cordoned=False)
+        self.at(h, c, 60, self.DOWN)
+        self.assertIn(("a", None), shed_notes(h))
+
+    def test_a_restart_during_an_outage_keeps_the_deadline_going(self):
+        """The anchor is on the node. The outage clock is not, so a restart
+        starts it again -- the ceiling itself stays released throughout."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        c.st = {}                                 # the process restarted
+        c2 = h.controller(nodes=("a",))
+        c2.st = {}
+        self.at(h, c2, 60, self.DOWN)
+        self.assertNotIn(("a", None), shed_notes(h))
+        self.at(h, c2, 120, 0)
+        self.assertEqual([v for _n, v in shed_notes(h)], [T0])
+        self.at(h, c2, 600, 0)
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_the_report_says_the_signal_is_down_and_what_is_still_held(self):
+        h, c = self.busy_one()
+        sink = _Sink()
+        c.metrics = sink
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)
+        r = sink.last
+        self.assertEqual((r["signal_ok"], r["engaged"], r["limit"]),
+                         (False, False, None))
+        self.assertEqual(r["shed"], ["a"], "a node held down was not counted")
+        self.assertEqual([d["until"] for d in r["draining"]], [None],
+                         "promised a deadline that is not enforced")
+        self.at(h, c, 120, self.DOWN)
+        self.assertEqual(len(h.at_level("warn", "unavailable")), 1,
+                         "one log line per change, not per tick")
+        self.assertTrue(h.logged("keeping the nodes it already holds down"))
+
+    def test_an_anchored_node_in_an_outage_does_not_confuse_the_stranded_repair(self):
+        """A node held down, Ready, in no operation (a restart lost it) is the
+        stranded repair's: returned to service if demand wants it, slept again
+        on its own anchor if not -- never abandoned by the drain timeout."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 5000,
+                             shed_at=T0 - 100)}, ceiling=RuntimeError("down"),
+                  busy={"a": ["j"]})
+        c = h.controller(nodes=("a",), **ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "the drain timeout gave a shed node back")
+
+
+class TestCeilingClassification(unittest.TestCase):
+    """One classification of the pool, per tick, that every count the ceiling
+    makes is read from: the wake gate, the visit gate, the power-cycle refusal,
+    the deadline's "does the reading still ask" and the shed's own arithmetic.
+    They differ in exactly one place, on purpose, and these pin it."""
+
+    def view(self, states, phases, anchored=(), **kw):
+        h = world(states, ceiling=None, **kw)
+        c = h.controller(nodes=tuple(states), **ONLY_THE_CEILING)
+        c.tick()                       # (no ceiling: it forgets every anchor)
+        for n, ph in phases.items():
+            c.st.setdefault(n, {})["phase"] = ph
+        for n in anchored:
+            c.st.setdefault(n, {})["shed_at"] = T0
+        return h, c, c._classify()
+
+    def test_every_kind_of_node_lands_in_exactly_one_place(self):
+        states = {
+            "held": node(cordoned=True, ours=True),                 # draining
+            "drain": node(cordoned=True, ours=True),                # ordinary
+            "up": node(),
+            "boot": asleep(),
+            "visit": asleep(),
+            "going": node(cordoned=True, ours=True),
+            "dark": asleep(),
+            "asleep": asleep(),
+            "stranded": node(cordoned=True, ours=True),
+        }
+        phases = {"held": "sleeping", "drain": "sleeping", "boot": "waking",
+                  "visit": "maintaining", "going": "powering_off"}
+        _h, _c, v = self.view(states, phases,
+                              anchored=("held", "dark", "stranded"))
+        self.assertEqual((v.held_down, v.drains, v.up),
+                         (["held", "stranded"], ["drain"], ["up"]))
+        self.assertEqual((v.booting, v.going_down, v.dark),
+                         (["boot", "visit"], ["going"], ["dark"]))
+        placed = [n for k in ("held_down", "drains", "up", "booting",
+                              "going_down", "dark") for n in getattr(v, k)]
+        self.assertEqual(len(placed), len(set(placed)), "a node in two places")
+
+    def test_a_booting_node_is_powered_but_never_picked(self):
+        """The one difference between the two counts: a node still booting
+        draws power the wake gate and the deadline have to count, and cannot be
+        asked to shut down, so the shed's arithmetic leaves it out."""
+        _h, c, v = self.view({"a": node(), "b": asleep()}, {"b": "waking"})
+        self.assertEqual(v.selectable, ["a"])
+        self.assertEqual((v.powered(cutting=True), v.powered(cutting=False)),
+                         (2, 2))
+        self.assertEqual((c._powered(True), c._powered(False)), (2, 2))
+
+    def test_a_node_going_down_counts_only_while_the_budget_is_the_question(self):
+        _h, c, v = self.view({"a": node(), "b": node(cordoned=True,
+                                                     ours=True)},
+                             {"b": "powering_off"})
+        self.assertEqual((v.powered(True), v.powered(False)), (2, 1))
+        self.assertEqual((c._powered(True), c._powered(False)), (2, 1))
+        self.assertEqual(v.selectable, ["a"], "a node being cut was pickable")
+
+    def test_a_dark_anchored_node_is_not_powered(self):
+        _h, c, v = self.view({"a": node(), "b": asleep()}, {},
+                             anchored=("b",))
+        self.assertEqual(v.dark, ["b"])
+        self.assertEqual(c._powered(True), 1)
+
+    def test_the_counts_follow_the_phases_as_they_stand_not_as_the_tick_began(self):
+        h, c, v = self.view({"a": node(), "b": node()}, {})
+        self.assertEqual(c._powered(True), 2)
+        c.st["b"]["phase"] = "powering_off"
+        h.states["b"] = dataclasses.replace(h.states["b"], ready=False)
+        c._states["b"] = h.states["b"]
+        self.assertEqual(c._powered(True), 1,
+                         "a node that went down this tick was still counted")
+
+    def test_every_count_reads_the_one_classification(self):
+        """Patch the classification and every count moves with it: none of
+        them keeps a notion of "powered" of its own."""
+        from metalnap.controller import _PoolView
+        h, c, _v = self.view({"a": node(), "b": node(), "c": node()}, {})
+        fake = _PoolView(up=["a"], booting=["b"], going_down=["c"])
+        with mock.patch.object(Controller, "_classify", return_value=fake):
+            self.assertEqual(c._powered(True), 3)
+            self.assertEqual(c._powered(False), 2)
+            c._cur = 1
+            self.assertTrue(c._shed_overdue(T0 - 10 ** 6),
+                            "the deadline counted what the view does not")
+            c._cur = 2
+            self.assertFalse(c._shed_overdue(T0 - 10 ** 6),
+                             "the deadline counted the node being cut")
+
+    def test_a_booting_node_does_not_raise_the_number_that_must_go(self):
+        """Ceiling 2 over a in service, b in service and c still waking: the
+        shed's arithmetic sees two nodes it could ask to go, so none must --
+        while the wake gate, counting c, is full."""
+        h = world({"a": node(), "b": node(), "c": asleep()}, ceiling=2,
+                  shortfall=400.0, busy={"a": ["j"], "b": ["k"]})
+        c = h.controller(nodes=("a", "b", "c"), **ONLY_THE_CEILING)
+        c.st["c"] = {"phase": "waking", "phase_since": T0}
+        h.chassis["c"] = "on"
+        c.tick()
+        self.assertEqual(shed_notes(h), [], "shed a node for one still booting")
+        self.assertEqual(c._powered(True), 3)
+        self.assertEqual(h.acted["on"], [], "woke a node past the ceiling")
 
 
 class TestCeilingBlocksWakes(unittest.TestCase):
@@ -4840,6 +5495,39 @@ class TestCeilingReport(unittest.TestCase):
         self.assertEqual(sorted(sink.last["shed"]), ["a", "b"],
                          "nodes asleep under the ceiling are still shed")
 
+    def test_the_limit_reported_is_the_reading_with_the_hold_applied(self):
+        """Not clamped to the pool: a dashboard that wants to know whether the
+        ceiling binds compares it with the pool, which is exported beside it."""
+        h = world({"a": node(), "b": node(), "c": node()}, ceiling=7)
+        sink = _Sink()
+        c = h.controller(nodes=("a", "b", "c"), metrics=sink,
+                         **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual((sink.last["limit"], sink.last["pool"],
+                          sink.last["engaged"]), (7, 3, False))
+        h._ceiling = 9                       # looser: the hold's minimum is 7
+        h.t += 60
+        c.tick()
+        self.assertEqual(sink.last["limit"], 7)
+        self.assertEqual(sink.last["signal"], 9,
+                         "the reading in hand is reported as it was read")
+
+    def test_the_limit_is_absent_with_no_reading_and_when_unavailable(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        sink = _Sink()
+        c = h.controller(metrics=sink, **ONLY_THE_CEILING)
+        c.tick()
+        self.assertIsNone(sink.last["limit"])
+        h._ceiling = 5
+        h.t += 60
+        c.tick()
+        self.assertEqual(sink.last["limit"], 5)
+        h._ceiling = RuntimeError("down")
+        h.t += 60
+        c.tick()
+        self.assertIsNone(sink.last["limit"],
+                          "an unavailable signal still reported a limit")
+
     def test_unavailable_is_reported_as_no_ceiling(self):
         h = world({"a": node(), "b": node()}, ceiling=RuntimeError("down"))
         sink = _Sink()
@@ -4909,6 +5597,29 @@ class TestMetrics(unittest.TestCase):
         self.assertIn("metalnap_capacity_ceiling_signal_ok 1", got)
         self.assertIn("metalnap_nodes_shed 0", got)
         self.assertIn("metalnap_shed_forced_total 0", got)
+
+    def test_the_limit_is_exported_unclamped_beside_the_pool(self):
+        """`binding` is limit < pool_nodes, which is why both are exported --
+        and why the limit must be the reading, not the pool-clamped value,
+        which could never exceed the pool."""
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        m.publish(self.report(limit=99, pool=3))
+        got = self.lines(m)
+        self.assertIn("metalnap_capacity_ceiling 99", got)
+        self.assertIn("metalnap_capacity_ceiling_pool_nodes 3", got)
+        text = m.render()
+        self.assertIn("# TYPE metalnap_capacity_ceiling_pool_nodes gauge", text)
+
+    def test_the_help_text_says_what_is_exported(self):
+        from metalnap.metrics import Metrics
+        helps = {ln.split()[2]: ln for ln in Metrics().render().splitlines()
+                 if ln.startswith("# HELP")}
+        limit = helps["metalnap_capacity_ceiling"]
+        self.assertIn("not clamped to the pool", limit)
+        self.assertIn("absent", limit)
+        pool = helps["metalnap_capacity_ceiling_pool_nodes"]
+        self.assertIn("held by an operator", pool)
 
     def test_the_limit_is_absent_when_there_is_none(self):
         from metalnap.metrics import Metrics
@@ -4997,6 +5708,136 @@ class TestMetricsDropsAConnectionThatSaysNothing(unittest.TestCase):
                     ("127.0.0.1", server.server_address[1]), timeout=5) as c:
                 self.assertEqual(c.recv(10), b"",
                                  "held a silent connection open")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestMetricsListenerIsBounded(unittest.TestCase):
+    """One thread per connection, unbounded, in the process that makes every
+    call to the cluster and the BMCs: a few hundred silent connections would
+    cost a few hundred threads. A small cap on concurrent handlers, and the
+    rest closed at once."""
+
+    def serve(self, cap, timeout=10, metrics=None):
+        from metalnap.metrics import Metrics, serve
+        server = serve(metrics or Metrics(), 0, host="127.0.0.1",
+                       timeout=timeout, max_connections=cap)
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        return server, server.server_address[1]
+
+    def connect(self, port):
+        import socket
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(c.close)
+        return c
+
+    def wait_for(self, what, ok, seconds=5.0):
+        import time
+        end = time.time() + seconds
+        while time.time() < end:
+            if ok():
+                return
+            time.sleep(0.005)
+        self.fail("timed out waiting for " + what)
+
+    def scrape(self, port):
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:%d/metrics" % port,
+                                    timeout=5) as r:
+            return r.read().decode()
+
+    def test_more_silent_connections_than_the_cap_never_start_more_threads(self):
+        server, port = self.serve(cap=3)
+        before = threading.active_count()
+        for _ in range(12):
+            self.connect(port)
+        self.wait_for("the surplus to be turned away",
+                      lambda: server.refused == 9)
+        self.assertEqual(threading.active_count() - before, 3,
+                         "a handler thread was started past the cap")
+
+    def test_a_refused_connection_is_closed_at_once(self):
+        server, port = self.serve(cap=1)
+        self.connect(port)                         # holds the one slot
+        self.wait_for("the slot to be taken",
+                      lambda: server.slots_in_use == 1)
+        extra = self.connect(port)
+        self.assertEqual(extra.recv(10), b"",
+                         "a connection past the cap was held open")
+
+    def test_a_real_scrape_works_while_slow_clients_hold_slots(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        server, port = self.serve(cap=4, metrics=m)
+        for _ in range(3):
+            self.connect(port)                     # silent, holding 3 of 4
+        self.wait_for("the slots to be taken",
+                      lambda: server.slots_in_use == 3)
+        self.assertEqual(self.scrape(port), m.render())
+
+    def test_a_slot_frees_when_a_slow_client_is_dropped_by_the_timeout(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        server, port = self.serve(cap=2, timeout=0.3, metrics=m)
+        self.connect(port)
+        self.connect(port)
+        self.wait_for("both slots taken", lambda: server.slots_in_use == 2)
+        # Full: a scrape now is turned away. After the timeout drops the slow
+        # clients, one gets through.
+        self.wait_for("the timeout to free a slot",
+                      lambda: server.slots_in_use == 0)
+        self.assertEqual(self.scrape(port), m.render())
+
+    def test_the_slot_is_released_when_the_handler_raises(self):
+        class Raises:
+            def render(self):
+                raise RuntimeError("render failed")
+
+        import contextlib
+        import io
+        import urllib.error
+        import urllib.request
+        server, port = self.serve(cap=2, metrics=Raises())
+        for _ in range(6):                         # more than the cap
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    urllib.request.urlopen(
+                        "http://127.0.0.1:%d/metrics" % port,
+                        timeout=5).read()
+                except (urllib.error.URLError, OSError, ConnectionError):
+                    pass
+                self.wait_for("the slot back",
+                              lambda: server.slots_in_use == 0)
+        self.assertEqual(server.refused, 0,
+                         "a handler that raised kept its slot")
+
+    def test_the_slot_is_released_when_the_thread_cannot_start(self):
+        server, port = self.serve(cap=2)
+        import socketserver
+        real = socketserver.ThreadingMixIn.process_request
+
+        def fails(self, request, client_address):
+            raise RuntimeError("can't start new thread")
+        import contextlib
+        import io
+        socketserver.ThreadingMixIn.process_request = fails
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.connect(port)
+                self.wait_for("the connection to be dealt with",
+                              lambda: server.connections == 1)
+                self.wait_for("the slot back",
+                              lambda: server.slots_in_use == 0)
+        finally:
+            socketserver.ThreadingMixIn.process_request = real
+        self.assertEqual(server.slots_in_use, 0)
+
+    def test_the_default_cap_is_eight(self):
+        from metalnap.metrics import Metrics, serve
+        server = serve(Metrics(), 0, host="127.0.0.1")
+        try:
+            self.assertEqual(server.max_connections, 8)
         finally:
             server.shutdown()
             server.server_close()
@@ -5316,6 +6157,17 @@ class TestCeilingWiring(unittest.TestCase):
         self.assertIsInstance(c.ceiling, PrometheusCeiling)
         self.assertEqual((c.ceiling.url, c.ceiling.query),
                          ("http://prom", "vector(0)"))
+
+    def test_the_timeout_reaches_the_ceiling_the_environment_builds(self):
+        self.assertEqual(self.build(CEILING_QUERY="vector(0)")
+                         .ceiling.timeout, 5)
+        self.assertEqual(self.build(CEILING_QUERY="vector(0)",
+                                    CEILING_TIMEOUT_S="2").ceiling.timeout, 2)
+
+    def test_a_timeout_longer_than_the_interval_stops_the_start(self):
+        with self.assertRaises(ValueError):
+            self.build(CEILING_QUERY="vector(0)", INTERVAL_S="10",
+                       CEILING_TIMEOUT_S="11")
 
     def test_a_static_zero_is_a_ceiling(self):
         c = self.build(CEILING_STATIC="0")

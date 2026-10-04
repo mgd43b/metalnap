@@ -12,5 +12,6 @@ def from_config(cfg, prom_url):
     if cfg.ceiling_static is not None:
         return StaticCeiling(cfg.ceiling_static)
     if cfg.ceiling_query:
-        return PrometheusCeiling(prom_url, cfg.ceiling_query)
+        return PrometheusCeiling(prom_url, cfg.ceiling_query,
+                                 timeout=cfg.ceiling_timeout_s)
     return None

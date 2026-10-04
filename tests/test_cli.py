@@ -609,12 +609,28 @@ class TestCeilingHeader(unittest.TestCase):
         self.assertEqual(header(out), ["ceiling:    3 nodes, not limiting "
                                        "(the pool is 3)"])
 
+    def test_a_limit_above_the_pool_is_shown_as_it_is_with_the_pool(self):
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=7, signal=7, shed=[], draining=[]))
+        self.assertEqual(header(out), ["ceiling:    7 nodes, not limiting "
+                                       "(the pool is 3)"])
+
     def test_an_unavailable_signal_is_said_and_is_not_a_ceiling(self):
         _c, out = self.status(ceiling_report(
             engaged=False, limit=None, signal=None, signal_ok=False,
             since=None, shed=[], draining=[]))
         self.assertEqual(header(out), ["ceiling:    signal UNAVAILABLE -- "
                                        "treated as no ceiling"])
+
+    def test_an_outage_says_how_many_nodes_are_still_held_down(self):
+        """The ceiling is released while the signal is down, but the nodes it
+        had put down are still down, with their deadlines kept."""
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=None, signal=None, signal_ok=False,
+            since=None, shed=["a", "b"], draining=[]))
+        self.assertEqual(header(out), ["ceiling:    signal UNAVAILABLE -- "
+                                       "treated as no ceiling; 2 nodes it "
+                                       "shed are still held down"])
 
     def test_a_status_nobody_has_written_lately_is_flagged(self):
         """A controller that died while a ceiling was engaged leaves ENGAGED
