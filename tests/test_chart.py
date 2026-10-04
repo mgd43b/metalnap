@@ -87,6 +87,14 @@ class TestChart(unittest.TestCase):
         self.assertIn('CEILING_TIMEOUT_S: "5"', self.ok())
         self.assertIn('CEILING_TIMEOUT_S: "2"',
                       self.ok("capacityCeiling: {timeoutS: 2}\n"))
+        # Nothing is read without a query, so 0 is not refused there (the
+        # schema must agree with the controller and the render guard) and is
+        # refused with one.
+        self.ok("capacityCeiling: {timeoutS: 0}\n")
+        self.ok("capacityCeiling: {static: 1, timeoutS: 0}\n")
+        code, _out, _err = self.render("capacityCeiling: {query: up, "
+                                       "timeoutS: 0}\n")
+        self.assertNotEqual(code, 0, "a query with no time to read it")
         # No query, no read: a small interval with the default timeout, and a
         # static ceiling, still render.
         self.ok("timers: {intervalS: 10}\ncapacityCeiling: {timeoutS: 11}\n")

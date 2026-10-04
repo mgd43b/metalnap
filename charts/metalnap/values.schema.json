@@ -221,8 +221,8 @@
         },
         "timeoutS": {
           "type": "integer",
-          "minimum": 1,
-          "description": "A deadline, in elapsed seconds, on the ceiling's Prometheus read (checked after every read; no redirect is followed; DNS and a server that trickles the response headers are not bounded by it). With a query, at most timers.intervalS (checked at render). Running out of it is an unavailable reading, which sheds nothing."
+          "minimum": 0,
+          "description": "A deadline, in elapsed seconds, on the ceiling's Prometheus read (checked after every read; no redirect is followed; DNS and a server that trickles the response headers are not bounded by it). With a query, above 0 and at most timers.intervalS (both checked at render, so 0 is accepted here and refused there). Running out of it is an unavailable reading, which sheds nothing."
         }
       },
       "allOf": [
