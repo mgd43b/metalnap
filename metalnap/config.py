@@ -128,14 +128,15 @@ class Config:
     #: It has its own, much shorter than the demand signal's twenty seconds,
     #: because it is read ON the tick, before anything else, and a shed is
     #: waiting on it: running out of it is an unavailable reading like any other
-    #: error, so there is nothing to gain from waiting longer. Elapsed time,
-    #: because a socket timeout bounds each wait and not the read, and a server
-    #: that trickles bytes would never trip it; each wait on the network is at
-    #: most half of it, and one chunk in progress when it passes can finish, so
-    #: the bound is this plus at most half again. Checked only when a query is
-    #: set: nothing else is read. It is a bound and not a concurrency: the read
-    #: stays on the tick, sequential, and no thread is added to a safety-critical
-    #: path to hide a slow one.
+    #: error. Elapsed time, because a socket timeout bounds each wait and not the
+    #: read, and a server that trickles bytes would never trip it. The body is
+    #: read against the clock after every read; each socket wait is at most half
+    #: of it; no redirect is followed. So the read is over within this plus at
+    #: most one socket wait (half of it) once the headers are in. NOT bounded by
+    #: it: DNS resolution, and a server that trickles the response headers.
+    #: Checked only when a query is set: nothing else is read. A bound and not
+    #: a concurrency: the read stays on the tick, sequential, and no thread is
+    #: added to a safety-critical path to hide a slow one.
     ceiling_timeout_s: int = _i("CEILING_TIMEOUT_S", 5)
 
     def validate(self):

@@ -8,6 +8,7 @@ backstop is not good enough -- particularly anything guarding running work or
 an operator's cordon.
 """
 import dataclasses
+import http.server
 import json
 import os
 import sys
@@ -3140,6 +3141,8 @@ class _Resp:
 
     def __init__(self, body, code=200):
         self.body, self.code = body, code
+        self.status_code, self.headers = code, {}
+        self.raw = _Raw(json.dumps(body).encode())
 
     def raise_for_status(self):
         if self.code >= 400:
@@ -3148,12 +3151,23 @@ class _Resp:
     def json(self):
         return self.body
 
-    # The ceiling reads the body against a deadline, a chunk at a time.
-    def iter_content(self, chunk_size=1):
-        yield json.dumps(self.body).encode()
-
     def close(self):
         pass
+
+
+class _Raw:
+    """What `response.raw` offers: read1() returns as soon as ANY bytes have
+    arrived, which is the whole point of reading with it."""
+
+    def __init__(self, data, step=None):
+        self.data, self.step = data, step
+
+    def read1(self, n=-1):
+        size = len(self.data) if not n or n < 0 else n
+        if self.step:
+            size = min(size, self.step)
+        out, self.data = self.data[:size], self.data[size:]
+        return out
 
 
 class _Trickle(_Resp):
@@ -3165,17 +3179,17 @@ class _Trickle(_Resp):
     def __init__(self):
         super().__init__(None)
         self.sent = 0
+        self.raw = self
 
     def json(self):
         import time
         time.sleep(3)                    # what reading it all would take
 
-    def iter_content(self, chunk_size=1):
+    def read1(self, n=-1):
         import time
-        while True:
-            time.sleep(0.05)
-            self.sent += 1
-            yield b" "
+        time.sleep(0.05)
+        self.sent += 1
+        return b" "
 
 
 def prom(result, result_type="vector", status="success"):
@@ -3306,21 +3320,20 @@ class TestPrometheusCeiling(unittest.TestCase):
             PrometheusCeiling("http://prom", "q", timeout=6).limit()
         kw = get.call_args.kwargs
         self.assertEqual((kw["timeout"], kw["stream"]), ((3.0, 3.0), True))
+        self.assertIs(kw["allow_redirects"], False)
+        self.assertEqual(kw["headers"], {"Accept-Encoding": "identity"})
 
     def test_a_normal_answer_is_read_whole_in_chunks(self):
-        class Chunks(_Resp):
-            def iter_content(self, chunk_size=1):
-                raw = json.dumps(self.body).encode()
-                for i in range(0, len(raw), 7):
-                    yield raw[i:i + 7]
-        resp = Chunks(prom(vec(3, 1)).body)
+        resp = prom(vec(3, 1))
+        resp.raw = _Raw(json.dumps(resp.body).encode(), step=7)
         with mock.patch("requests.get", return_value=resp):
             self.assertEqual(PrometheusCeiling("http://prom", "q").limit(), 1)
 
     def test_the_timeout_reaches_the_request_and_defaults_short(self):
         """The ceiling is read before demand, on the tick: five seconds, not
         the demand signal's twenty."""
-        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+        with mock.patch("requests.get",
+                        side_effect=lambda *a, **k: prom(vec(1))) as get:
             PrometheusCeiling("http://prom", "q").limit()
             PrometheusCeiling("http://prom", "q", timeout=3).limit()
         self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list],
@@ -3344,7 +3357,138 @@ class TestPrometheusCeiling(unittest.TestCase):
                               timeout=7).limit()
         get.assert_called_once_with("http://prom:9090/api/v1/query",
                                     params={"query": "up == 0"},
-                                    timeout=(3.5, 3.5), stream=True)
+                                    timeout=(3.5, 3.5), stream=True,
+                                    allow_redirects=False,
+                                    headers={"Accept-Encoding": "identity"})
+
+
+class TestCeilingReadAgainstARealSlowServer(unittest.TestCase):
+    """The deadline is only worth what it does against a real socket. A fake
+    that yields a byte per iteration never showed that reading a body in
+    8 KiB chunks blocks until 8 KiB have arrived, so a server that sends a byte
+    every fifty milliseconds never gave control back; nor that `requests`
+    follows redirects, each hop with socket timeouts of its own."""
+
+    DEADLINE = 0.6
+    SLACK = 1.5               # the one wait in progress (half a deadline) + more
+
+    def server(self, handler):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        return "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def read(self, url):
+        """(outcome, seconds): the read, run where a hang is a failure and not
+        a hung suite."""
+        import time
+        box = {}
+
+        def go():
+            t0 = time.monotonic()
+            try:
+                box["value"] = PrometheusCeiling(url, "q",
+                                                 timeout=self.DEADLINE).limit()
+            except BaseException as e:                # noqa: BLE001
+                box["error"] = e
+            box["took"] = time.monotonic() - t0
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=12)
+        self.assertFalse(t.is_alive(), "the read was still going after 12s")
+        return box
+
+    def trickling(self, chunked):
+        import time
+        body = (b'{"status":"success","data":{"resultType":"vector",'
+                b'"result":[' + b" " * 4000 + b"]}}")
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                else:
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for i in range(len(body)):
+                        time.sleep(0.05)
+                        b = body[i:i + 1]
+                        self.wfile.write(
+                            b"1\r\n" + b + b"\r\n" if chunked else b)
+                        self.wfile.flush()
+                except OSError:
+                    pass
+        return H
+
+    def test_a_body_sent_a_byte_at_a_time_cannot_outlast_the_deadline(self):
+        box = self.read(self.server(self.trickling(chunked=False)))
+        self.assertIsInstance(box.get("error"), TimeoutError, box)
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_chunked_body_sent_a_byte_at_a_time_cannot_either(self):
+        box = self.read(self.server(self.trickling(chunked=True)))
+        self.assertIsInstance(box.get("error"), TimeoutError, box)
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_redirect_is_unavailable_and_is_not_followed(self):
+        import time
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                hits.append(self.path)
+                time.sleep(0.15)           # each hop costs, as a chain does
+                self.send_response(302)
+                self.send_header("Location", self.path + "x")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        box = self.read(self.server(H))
+        self.assertIn("redirect", str(box.get("error")), box)
+        self.assertEqual(len(hits), 1, "followed a redirect")
+        self.assertLess(box["took"], self.DEADLINE + self.SLACK)
+
+    def test_a_compressed_answer_is_refused_not_read_raw(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = b"\x1f\x8b not json"
+                self.send_response(200)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        box = self.read(self.server(H))
+        self.assertIn("encoding", str(box.get("error")), box)
+
+    def test_an_ordinary_answer_over_a_real_socket_is_read(self):
+        body = json.dumps({"status": "success", "data": {
+            "resultType": "vector", "result": vec(3, 1)}}).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        box = self.read(self.server(H))
+        self.assertEqual(box.get("value"), 1, box)
 
 
 class TestStaticCeiling(unittest.TestCase):

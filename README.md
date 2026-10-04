@@ -431,15 +431,18 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
 - **The read has a deadline of its own, `CEILING_TIMEOUT_S`** (default 5; with a
   query, above 0 and no more than `INTERVAL_S`). It is made on the tick before
   anything else, so a Prometheus that hangs must not stretch the tick by the
-  demand signal's twenty seconds. It is **elapsed time for the whole read**, not
-  a socket timeout: the answer is streamed and read against the clock, so a
-  server that sends a byte now and then cannot hold the tick. Connecting and
-  waiting for the first byte each wait at most half of it, and a chunk already
-  being read when it passes can finish, so the read is over within the deadline
-  plus at most half again. It is a bound, not a concurrency: the read stays
-  sequential on the tick, and no thread is added to a safety-critical path to
-  hide a slow one. Running out of it is an unavailable reading like any other
-  error. (The demand signal is read as it always was, with a socket timeout.)
+  demand signal's twenty seconds. It is **elapsed time**, not a socket timeout:
+  the answer is read against the clock after every read (each returns as soon as
+  any bytes arrive, so a server that sends one byte every few milliseconds cannot
+  hold the tick), no redirect is followed (a 3xx is an error), and the answer is
+  asked for uncompressed. Each wait on the network is at most half the deadline,
+  so once the response headers are in, the read is over within the deadline plus
+  at most one such wait. **Not bounded by it:** DNS resolution, and a server that
+  trickles the response *headers* themselves (each wait is bounded, the header
+  block is not). It is a bound, not a concurrency: the read stays sequential on
+  the tick, and no thread is added to a safety-critical path to hide a slow one.
+  Running out of it is an unavailable reading like any other error. (The demand
+  signal is read as it always was, with a socket timeout.)
 - **It fails open, in both directions.** An error never engages a ceiling, and
   it *releases one that is engaged, on that same tick*. A Prometheus outage in
   the middle of an event therefore lifts the ceiling. Nothing wakes at that

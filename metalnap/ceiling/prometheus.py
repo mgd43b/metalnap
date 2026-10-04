@@ -33,8 +33,8 @@ class PrometheusCeiling:
     120)` -- and a stale metric returns no series, which is no ceiling.
 
     The read is made on the tick, before the demand signal's, so it has a short
-    deadline of its own (CEILING_TIMEOUT_S, five seconds of ELAPSED time for
-    the whole read, not a socket timeout: see instant_query). Running out of it
+    deadline of its own (CEILING_TIMEOUT_S, five seconds of ELAPSED time,
+    not a socket timeout: see instant_query for exactly what it bounds). Running out of it
     is an exception like any other: unavailable, which sheds nothing.
     """
 

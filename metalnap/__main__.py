@@ -107,10 +107,11 @@ Optional:
                             is released at once): past it they are forgotten.
     CEILING_TIMEOUT_S       a deadline, in elapsed seconds, on the ceiling's
                             Prometheus read (default 5; with a query, above 0
-                            and no more than INTERVAL_S). It is read on the
-                            tick, so it is short, and it is the whole read, not
-                            one socket wait; running out of it is an unavailable
-                            reading, like any other error.
+                            and no more than INTERVAL_S). Checked after every
+                            read, no redirect followed, each network wait at
+                            most half of it; DNS and a server that trickles the
+                            response headers are not bounded by it. Running out
+                            is an unavailable reading, like any other error.
     CEILING_DRAIN_DEADLINE_S
                             a node carrying work is given this long to finish
                             before a shed shuts it down anyway, the ordinary soft
