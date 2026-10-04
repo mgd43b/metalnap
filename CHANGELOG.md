@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.1](https://github.com/mgd43b/metalnap/compare/v0.6.0...v0.6.1) (2026-10-04)
+
+
+### Fixes
+
+* a signal outage keeps the sheds already under way ([3b9d47d](https://github.com/mgd43b/metalnap/commit/3b9d47d33f4cec476dbe71bdc75811d8b8d731a2))
+* an operator's uncordon is spared after a restart too ([0d3398e](https://github.com/mgd43b/metalnap/commit/0d3398eecb9f62dd1a90a22c25e147f492d6c095))
+* cap concurrent connections on the metrics listener ([a55d5e3](https://github.com/mgd43b/metalnap/commit/a55d5e338ff134029056423139cfb2b6119acc3e))
+* capacity ceiling review findings -- outage anchors, reported limit, read timeout, listener cap, refactor ([8d4ad01](https://github.com/mgd43b/metalnap/commit/8d4ad019299c281bf426c37b9f6ee10035ee8159))
+* make the ceiling read's deadline hold against a real slow server ([c79ca75](https://github.com/mgd43b/metalnap/commit/c79ca75645e146098f298273f075ba0b76a45d2e))
+* metalnap_capacity_ceiling reports the reading, not the pool-clamped limit ([9ef9c45](https://github.com/mgd43b/metalnap/commit/9ef9c455570804d8b651f7a216b46a706880bde7))
+* the ceiling read has a real elapsed-time deadline ([d2e5148](https://github.com/mgd43b/metalnap/commit/d2e5148f31bd0d82932de05c415535adaf59f357))
+* the ceiling read has a short timeout of its own ([425c849](https://github.com/mgd43b/metalnap/commit/425c849885b0df9b9229ac1ee9ffd40fb77d3eb8))
+* the ceiling timeout bound applies only when a query is configured ([d490960](https://github.com/mgd43b/metalnap/commit/d49096035c8c265a058fc8608256d696164f4dee))
+* the chart schema accepts a ceiling timeout of 0 when no query is set ([9fb09e0](https://github.com/mgd43b/metalnap/commit/9fb09e07616150bb3c6dfe6c233360bfcca5752c))
+
+
+### Refactoring
+
+* classify the ceiling's pool once and split _ceiling_section ([5538d39](https://github.com/mgd43b/metalnap/commit/5538d39bea7d6d7f1cec03789148293c3593d639))
+
 ## [0.6.0](https://github.com/mgd43b/metalnap/compare/v0.5.2...v0.6.0) (2026-10-03)
 
 
