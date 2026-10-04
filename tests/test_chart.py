@@ -83,6 +83,27 @@ class TestChart(unittest.TestCase):
         self.assertIn('CEILING_RELEASE_HOLD_S: "900"', out)
         self.assertIn('CEILING_DRAIN_DEADLINE_S: "600"', out)
 
+    def test_the_read_timeout_is_rendered_and_bounded_by_the_interval(self):
+        self.assertIn('CEILING_TIMEOUT_S: "5"', self.ok())
+        self.assertIn('CEILING_TIMEOUT_S: "2"',
+                      self.ok("capacityCeiling: {timeoutS: 2}\n"))
+        for values in ("capacityCeiling: {timeoutS: 0}\n",
+                       "capacityCeiling: {timeoutS: -1}\n",
+                       "capacityCeiling: {timeoutS: 61}\n",
+                       "timers: {intervalS: 10}\ncapacityCeiling: "
+                       "{timeoutS: 11}\n"):
+            with self.subTest(values=values):
+                code, _out, _err = self.render(values)
+                self.assertNotEqual(code, 0, "rendered a timeout the "
+                                             "controller refuses to start on")
+                if CAN_SKIP_SCHEMA:
+                    # The template says so itself, for the one the schema
+                    # cannot know (the interval is another value).
+                    code, _out, err = self.render(values,
+                                                  "--skip-schema-validation")
+                    self.assertNotEqual(code, 0)
+                    self.assertIn("timeoutS", err)
+
     # -- a query -------------------------------------------------------------
     def test_a_query_reaches_the_controller_verbatim(self):
         q = 'vector(0) and on() (max(temp{sensor="Inlet Temp"}) > 35)'

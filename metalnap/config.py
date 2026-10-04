@@ -124,6 +124,14 @@ class Config:
     #: it off anyway, with the ordinary soft shutdown. 0 never forces: a busy
     #: node then holds the ceiling open for as long as its work runs.
     ceiling_drain_deadline_s: int = _i("CEILING_DRAIN_DEADLINE_S", 600)
+    #: How long the ceiling's Prometheus read may take. It has its own, much
+    #: shorter than the demand signal's twenty seconds, because it is read ON
+    #: the tick, before anything else, and a shed is waiting on it: a timeout is
+    #: an unavailable reading like any other error, so there is nothing to gain
+    #: from waiting longer. It is a bound and not a concurrency: the read stays
+    #: on the tick, sequential, and no thread is added to a safety-critical
+    #: path to hide a slow one.
+    ceiling_timeout_s: int = _i("CEILING_TIMEOUT_S", 5)
 
     def validate(self):
         if self.mode not in ("off", "dry_run", "on"):
@@ -180,6 +188,12 @@ class Config:
         if self.ceiling_drain_deadline_s < 0:
             raise ValueError("CEILING_DRAIN_DEADLINE_S must be >= 0 "
                              "(0 never forces a busy node)")
+        if not 0 < self.ceiling_timeout_s <= self.interval_s:
+            raise ValueError(
+                "CEILING_TIMEOUT_S (%d) must be > 0 and no more than "
+                "INTERVAL_S (%d): the read is made on the tick, and one that "
+                "can outlast the tick's own interval stretches every tick"
+                % (self.ceiling_timeout_s, self.interval_s))
 
     def _validate_maintenance(self):
         """Reject schedules that cannot work, rather than half-working.

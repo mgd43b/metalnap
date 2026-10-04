@@ -218,6 +218,11 @@
           "type": "integer",
           "minimum": 0,
           "description": "A node carrying work is given this long to finish, then shut down anyway (soft, announced). 0 never forces."
+        },
+        "timeoutS": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long the ceiling's Prometheus read may take, in seconds. At most timers.intervalS (checked at render). A timeout is an unavailable reading, which sheds nothing."
         }
       },
       "allOf": [

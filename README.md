@@ -407,6 +407,7 @@ capacityCeiling:
   query: 'vector(0) and on() (max(ipmi_temperature_celsius{sensor="Inlet Temp"}) > 35)'
   releaseHoldS: 900      # a looser reading must hold this long before nodes are released
   drainDeadlineS: 600    # a node carrying work is given this long; 0 = never force
+  timeoutS: 5            # how long the ceiling's Prometheus read may take
 ```
 
 **Off unless you set `query` (PromQL on the Prometheus metalnap already reads)
@@ -422,11 +423,17 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
   difference is the whole safety of this feature: an empty result read as `0`
   would be an order to power the pool off the first day the signal is quiet.
 - Several series take the **minimum**, so an unaggregated per-UPS expression
-  just works. Fractions floor, and the result is clamped to the pool the ceiling
-  counts — not the nodes an operator holds, which are not its to limit.
+  just works. Fractions floor, and the result is judged against the pool the
+  ceiling counts — not the nodes an operator holds, which are not its to limit.
 - NaN, infinity, a negative, a value that is not a number, an error, a timeout:
   all are **cannot tell**, which is never zero. If any one series cannot be
   read, the whole reading cannot.
+- **The read has a timeout of its own, `CEILING_TIMEOUT_S`** (default 5, above 0
+  and no more than `INTERVAL_S`). It is made on the tick before anything else,
+  so a Prometheus that hangs must not stretch the tick by the demand signal's
+  twenty seconds. It is a bound, not a concurrency: the read stays sequential
+  on the tick, and no thread is added to a safety-critical path to hide a slow
+  one. A timeout is an unavailable reading like any other error.
 - **It fails open, in both directions.** An error never engages a ceiling, and
   it *releases one that is engaged, on that same tick*. A Prometheus outage in
   the middle of an event therefore lifts the ceiling. Nothing wakes at that
@@ -753,8 +760,9 @@ it is asked for on the node.
 `CEILING_QUERY` (PromQL; its value is the most nodes awake, no series is none)
 or `CEILING_STATIC` (a number; `0` is a ceiling) enables a [capacity
 ceiling](#capacity-ceiling) and is off by default. `CEILING_RELEASE_HOLD_S`
-(default `900`) and `CEILING_DRAIN_DEADLINE_S` (default `600`; `0` never forces
-a busy node) shape it. `STATUS_CONFIGMAP` names the object `metalnap status`
+(default `900`), `CEILING_DRAIN_DEADLINE_S` (default `600`; `0` never forces a
+busy node) and `CEILING_TIMEOUT_S` (default `5`, the read's own timeout) shape
+it. `STATUS_CONFIGMAP` names the object `metalnap status`
 reads it from, and `METRICS_PORT` (default `0`, off) serves the metrics.
 
 The pool is sized on **memory and CPU**, whichever needs more nodes

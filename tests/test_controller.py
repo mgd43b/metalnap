@@ -3234,6 +3234,26 @@ class TestPrometheusCeiling(unittest.TestCase):
             PrometheusCeiling("http://prom:9090/", "q", timeout=7).limit()
         self.assertEqual(get.call_args_list[0], get.call_args_list[1])
 
+    def test_the_timeout_reaches_the_request_and_defaults_short(self):
+        """The ceiling is read before demand, on the tick: five seconds, not
+        the demand signal's twenty."""
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusCeiling("http://prom", "q").limit()
+            PrometheusCeiling("http://prom", "q", timeout=3).limit()
+        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list],
+                         [5, 3])
+
+    def test_a_timeout_is_unavailable_like_any_other_error(self):
+        import requests
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(**ONLY_THE_CEILING)
+        c.ceiling = PrometheusCeiling("http://prom", "q", timeout=1)
+        with mock.patch("requests.get",
+                        side_effect=requests.exceptions.ReadTimeout("slow")):
+            self.assertEqual(c._read_ceiling(), (None, False))
+            run(h, c, 3)
+        self.assertEqual(h.acted["cordon"], [], "a timeout shed a node")
+
     def test_the_query_goes_to_the_query_api(self):
         with mock.patch("requests.get",
                         return_value=prom([])) as get:
@@ -3303,6 +3323,24 @@ class TestCeilingConfig(unittest.TestCase):
     def test_zero_is_allowed_for_both_durations(self):
         Config(mode="on", ceiling_release_hold_s=0,
                ceiling_drain_deadline_s=0).validate()
+
+    def test_the_ceiling_read_has_a_short_timeout_of_its_own(self):
+        """It is read on the tick, before the demand signal: a Prometheus that
+        hangs must not stretch the tick by the demand signal's twenty seconds
+        before the shed that is waiting on it can begin."""
+        self.assertEqual(self.build().ceiling_timeout_s, 5)
+        self.assertEqual(self.build(CEILING_TIMEOUT_S="3").ceiling_timeout_s,
+                         3)
+
+    def test_the_timeout_must_be_positive_and_no_longer_than_the_interval(self):
+        for kw in (dict(ceiling_timeout_s=0), dict(ceiling_timeout_s=-1),
+                   dict(ceiling_timeout_s=61),
+                   dict(ceiling_timeout_s=31, interval_s=30)):
+            with self.subTest(kw=kw), self.assertRaises(ValueError) as e:
+                Config(mode="on", **kw).validate()
+            self.assertIn("CEILING_TIMEOUT_S", str(e.exception))
+        Config(mode="on", ceiling_timeout_s=60).validate()      # == interval
+        Config(mode="on", ceiling_timeout_s=1, interval_s=1).validate()
 
     def test_a_deadline_of_zero_is_warned_about_at_start(self):
         warned = Config(mode="on", ceiling_drain_deadline_s=0).warnings()
@@ -5553,6 +5591,17 @@ class TestCeilingWiring(unittest.TestCase):
         self.assertIsInstance(c.ceiling, PrometheusCeiling)
         self.assertEqual((c.ceiling.url, c.ceiling.query),
                          ("http://prom", "vector(0)"))
+
+    def test_the_timeout_reaches_the_ceiling_the_environment_builds(self):
+        self.assertEqual(self.build(CEILING_QUERY="vector(0)")
+                         .ceiling.timeout, 5)
+        self.assertEqual(self.build(CEILING_QUERY="vector(0)",
+                                    CEILING_TIMEOUT_S="2").ceiling.timeout, 2)
+
+    def test_a_timeout_longer_than_the_interval_stops_the_start(self):
+        with self.assertRaises(ValueError):
+            self.build(CEILING_QUERY="vector(0)", INTERVAL_S="10",
+                       CEILING_TIMEOUT_S="11")
 
     def test_a_static_zero_is_a_ceiling(self):
         c = self.build(CEILING_STATIC="0")

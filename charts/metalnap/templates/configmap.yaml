@@ -59,6 +59,9 @@
 {{- if lt (int .drainDeadlineS) 0 }}
 {{- fail (printf "capacityCeiling.drainDeadlineS (%v) must be 0 or more; 0 never forces a busy node" .drainDeadlineS) }}
 {{- end }}
+{{- if or (le (int .timeoutS) 0) (gt (int .timeoutS) (int $.Values.timers.intervalS)) }}
+{{- fail (printf "capacityCeiling.timeoutS (%v) must be above 0 and no more than timers.intervalS (%v): the read is made on the tick, and one that can outlast the interval stretches every tick" .timeoutS $.Values.timers.intervalS) }}
+{{- end }}
 {{- end }}
 apiVersion: v1
 kind: ConfigMap
@@ -129,6 +132,7 @@ data:
   {{- end }}
   CEILING_RELEASE_HOLD_S: {{ int64 .releaseHoldS | quote }}
   CEILING_DRAIN_DEADLINE_S: {{ int64 .drainDeadlineS | quote }}
+  CEILING_TIMEOUT_S: {{ int64 .timeoutS | quote }}
   {{- end }}
   {{- if include "metalnap.ceilingEnabled" . }}
   {{- /* Where the controller publishes what `metalnap status` shows. */}}
