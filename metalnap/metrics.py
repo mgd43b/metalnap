@@ -36,10 +36,18 @@ class Metrics:
         limit = r.get("limit")
         samples = (
             ("metalnap_capacity_ceiling", "gauge",
-             "The most managed nodes allowed awake; absent while no ceiling "
-             "is in force.", limit),
+             "The most managed nodes allowed awake: the effective limit, the "
+             "release hold applied, as read and not clamped to the pool; "
+             "absent while there is no reading or the signal is unavailable.",
+             limit),
+            ("metalnap_capacity_ceiling_pool_nodes", "gauge",
+             "The managed nodes the ceiling counts: every one except those "
+             "held by an operator or taken for maintenance. The ceiling binds "
+             "when metalnap_capacity_ceiling is below this.",
+             r.get("pool")),
             ("metalnap_capacity_ceiling_engaged", "gauge",
-             "1 while a capacity ceiling is in force and limiting the pool.",
+             "1 while a capacity ceiling is in force and limiting the pool "
+             "(the limit is below metalnap_capacity_ceiling_pool_nodes).",
              int(bool(r.get("engaged")))),
             ("metalnap_capacity_ceiling_signal_ok", "gauge",
              "0 while the ceiling signal is unavailable and is being treated "

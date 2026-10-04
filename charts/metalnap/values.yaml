@@ -169,8 +169,9 @@ capacityCeiling:
 
 # Prometheus metrics, on a plain HTTP listener inside the controller. OFF by
 # default: before this the controller listened on nothing at all. Set a port to
-# serve /metrics there -- metalnap_capacity_ceiling, ..._engaged, ..._signal_ok,
-# metalnap_nodes_shed and metalnap_shed_forced_total. There is deliberately no
+# serve /metrics there -- metalnap_capacity_ceiling (the reading, not clamped to
+# the pool), ..._pool_nodes, ..._engaged, ..._signal_ok, metalnap_nodes_shed and
+# metalnap_shed_forced_total. There is deliberately no
 # Service: scrape the pod (a PodMonitor), or add a Service of your own. 1024 or
 # more -- the container runs unprivileged with every capability dropped.
 metrics:

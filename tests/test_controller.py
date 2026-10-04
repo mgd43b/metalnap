@@ -3550,15 +3550,16 @@ class TestCeilingFailsOpen(unittest.TestCase):
         h.controller().tick()
         self.assertEqual(seen, [1], "the demand signal was read first")
 
-    def test_a_reading_is_clamped_to_the_pool_not_to_every_node(self):
+    def test_a_reading_is_judged_against_the_pool_not_every_node(self):
         """Nodes an operator holds are not the ceiling's to limit, so a reading
-        of 99 over three governed nodes and two held ones is a limit of three --
-        not four -- and one of two stays two."""
+        of 99 over three governed nodes and two held ones does not bind (it is
+        not "four of five"), and one of two does. What is REPORTED is the
+        reading itself, not the pool-clamped limit the decisions use."""
         def states():
             return {"a": node(), "b": node(), "c": node(),
                     "d": node(cordoned=True, ours=False),
                     "e": node(maintenance="firmware")}
-        for reading, limit, engaged in ((99, 3, False), (2, 2, True)):
+        for reading, limit, engaged in ((99, 99, False), (2, 2, True)):
             with self.subTest(reading=reading):
                 h = world(states(), ceiling=reading)
                 sink = _Sink()
@@ -3587,12 +3588,14 @@ class TestCeilingFailsOpen(unittest.TestCase):
         self.assertEqual(h.ceiling_reads, 0)
         self.assertEqual(h.acted["cordon"], [])
 
-    def test_a_reading_is_clamped_to_the_nodes_there_are(self):
+    def test_a_reading_above_the_pool_binds_nothing_and_is_reported_as_it_is(self):
         h = world({"a": node(), "b": node()}, ceiling=99)
         sink = _Sink()
-        h.controller(metrics=sink, **ONLY_THE_CEILING).tick()
-        self.assertEqual((sink.last["limit"], sink.last["engaged"]),
-                         (2, False))
+        c = h.controller(metrics=sink, **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual((sink.last["limit"], sink.last["engaged"],
+                          sink.last["pool"]), (99, False, 2))
+        self.assertEqual(c._eff, 2, "the decisions stopped using the clamp")
         self.assertEqual(h.acted["cordon"], [])
 
 
@@ -5018,6 +5021,39 @@ class TestCeilingReport(unittest.TestCase):
         self.assertEqual(sorted(sink.last["shed"]), ["a", "b"],
                          "nodes asleep under the ceiling are still shed")
 
+    def test_the_limit_reported_is_the_reading_with_the_hold_applied(self):
+        """Not clamped to the pool: a dashboard that wants to know whether the
+        ceiling binds compares it with the pool, which is exported beside it."""
+        h = world({"a": node(), "b": node(), "c": node()}, ceiling=7)
+        sink = _Sink()
+        c = h.controller(nodes=("a", "b", "c"), metrics=sink,
+                         **ONLY_THE_CEILING)
+        c.tick()
+        self.assertEqual((sink.last["limit"], sink.last["pool"],
+                          sink.last["engaged"]), (7, 3, False))
+        h._ceiling = 9                       # looser: the hold's minimum is 7
+        h.t += 60
+        c.tick()
+        self.assertEqual(sink.last["limit"], 7)
+        self.assertEqual(sink.last["signal"], 9,
+                         "the reading in hand is reported as it was read")
+
+    def test_the_limit_is_absent_with_no_reading_and_when_unavailable(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        sink = _Sink()
+        c = h.controller(metrics=sink, **ONLY_THE_CEILING)
+        c.tick()
+        self.assertIsNone(sink.last["limit"])
+        h._ceiling = 5
+        h.t += 60
+        c.tick()
+        self.assertEqual(sink.last["limit"], 5)
+        h._ceiling = RuntimeError("down")
+        h.t += 60
+        c.tick()
+        self.assertIsNone(sink.last["limit"],
+                          "an unavailable signal still reported a limit")
+
     def test_unavailable_is_reported_as_no_ceiling(self):
         h = world({"a": node(), "b": node()}, ceiling=RuntimeError("down"))
         sink = _Sink()
@@ -5087,6 +5123,29 @@ class TestMetrics(unittest.TestCase):
         self.assertIn("metalnap_capacity_ceiling_signal_ok 1", got)
         self.assertIn("metalnap_nodes_shed 0", got)
         self.assertIn("metalnap_shed_forced_total 0", got)
+
+    def test_the_limit_is_exported_unclamped_beside_the_pool(self):
+        """`binding` is limit < pool_nodes, which is why both are exported --
+        and why the limit must be the reading, not the pool-clamped value,
+        which could never exceed the pool."""
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        m.publish(self.report(limit=99, pool=3))
+        got = self.lines(m)
+        self.assertIn("metalnap_capacity_ceiling 99", got)
+        self.assertIn("metalnap_capacity_ceiling_pool_nodes 3", got)
+        text = m.render()
+        self.assertIn("# TYPE metalnap_capacity_ceiling_pool_nodes gauge", text)
+
+    def test_the_help_text_says_what_is_exported(self):
+        from metalnap.metrics import Metrics
+        helps = {ln.split()[2]: ln for ln in Metrics().render().splitlines()
+                 if ln.startswith("# HELP")}
+        limit = helps["metalnap_capacity_ceiling"]
+        self.assertIn("not clamped to the pool", limit)
+        self.assertIn("absent", limit)
+        pool = helps["metalnap_capacity_ceiling_pool_nodes"]
+        self.assertIn("held by an operator", pool)
 
     def test_the_limit_is_absent_when_there_is_none(self):
         from metalnap.metrics import Metrics

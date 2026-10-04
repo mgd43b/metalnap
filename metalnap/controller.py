@@ -100,6 +100,9 @@ class Controller:
         self._limit = None      # the effective limit while it binds, else None
         self._eff = None        # the effective limit, bound or not
         self._cur = None        # the current reading, None if there is none
+        #: The same two as the signal gave them, not clamped to the pool: what
+        #: the status object and the metrics say.
+        self._eff_reported = self._reading = None
         self._engaged = False   # a limit is in force and below the pool
         self._grace = False     # the signal is down, but not for long enough
                                 # to forget the sheds already under way
@@ -1570,6 +1573,7 @@ class Controller:
         now = self.now()
         self._states, self._pool = states, wakeable
         self._limit = self._eff = self._cur = None
+        self._eff_reported = self._reading = None
         self._engaged = self._grace = False
 
         reading, ok = self._read_ceiling()
@@ -1613,6 +1617,10 @@ class Controller:
         # operator holds are not its to limit, so a reading of 99 over three
         # governed nodes and two held ones is a limit of three, not four.
         eff = min((v for _t, v in window), default=None)
+        # What is REPORTED is the reading itself, the hold applied, and not the
+        # clamp the decisions use: clamped, it could never exceed the pool, and
+        # a dashboard could not tell a ceiling of 99 from one of 3.
+        self._eff_reported, self._reading = eff, reading
         if eff is not None:
             eff = min(eff, len(wakeable))
         self._eff = eff
@@ -1891,7 +1899,8 @@ class Controller:
         key = (eff, engaged, ok)
         last = st.get("_ceiling_last")
         if key != last and not (last is None and key == (None, False, True)):
-            fields = dict(limit=eff, signal=self._cur, engaged=engaged,
+            fields = dict(limit=self._eff_reported, signal=self._reading,
+                          engaged=engaged,
                           exempt=powered_exempt, shed=shed)
             if not ok:
                 self.log("warn", "capacity ceiling signal unavailable; "
@@ -1919,8 +1928,8 @@ class Controller:
         from .types import NullCeiling
         self._rep = {
             "configured": not isinstance(self.ceiling, NullCeiling),
-            "mode": cfg.mode, "engaged": engaged, "limit": eff,
-            "signal": self._cur, "signal_ok": ok,
+            "mode": cfg.mode, "engaged": engaged, "limit": self._eff_reported,
+            "signal": self._reading, "signal_ok": ok,
             "since": st.get("_ceiling_since"), "pool": len(self._pool),
             "shed": shed, "draining": draining, "exempt": powered_exempt,
             "forced": self.forced_total,

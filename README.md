@@ -583,13 +583,15 @@ and it adds no dependency:
 
 | metric | meaning |
 |---|---|
-| `metalnap_capacity_ceiling` | the limit in force; absent when there is none |
-| `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool |
+| `metalnap_capacity_ceiling` | the effective limit — the reading with the release hold applied — **as read, not clamped to the pool**; absent while there is no reading or the signal is unavailable |
+| `metalnap_capacity_ceiling_pool_nodes` | the nodes the ceiling counts: every managed node except those an operator holds or has taken for maintenance |
+| `metalnap_capacity_ceiling_engaged` | 1 while a ceiling is in force and limiting the pool (the limit is below `..._pool_nodes`) |
 | `metalnap_capacity_ceiling_signal_ok` | 0 while the signal is unavailable and treated as no ceiling |
 | `metalnap_nodes_shed` | nodes currently held down by the ceiling |
 | `metalnap_shed_forced_total` | busy nodes shut down at the deadline with work still running, counted once per shed when the power-off is confirmed (a node that ignores the request is not counted) |
 
-"Shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
+"The ceiling binds" is `metalnap_capacity_ceiling < metalnap_capacity_ceiling_pool_nodes`
+(which is `..._engaged`); "shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
 `increase(metalnap_shed_forced_total[1h]) > 0`.
 
 ### The rule it touches
