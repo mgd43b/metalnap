@@ -3601,10 +3601,14 @@ class TestCeilingFailsOpen(unittest.TestCase):
             with self.subTest(reading=reading):
                 h = world(states(), ceiling=reading)
                 sink = _Sink()
-                h.controller(nodes=("a", "b", "c", "d", "e"), metrics=sink,
-                             **ONLY_THE_CEILING).tick()
+                c = h.controller(nodes=("a", "b", "c", "d", "e"), metrics=sink,
+                                 **ONLY_THE_CEILING)
+                c.tick()
                 self.assertEqual((sink.last["limit"], sink.last["engaged"],
                                   sink.last["pool"]), (limit, engaged, 3))
+                self.assertEqual(c._eff, min(reading, 3),
+                                 "the limit the decisions use is not clamped "
+                                 "to the pool the ceiling counts")
 
     def test_nothing_of_a_tick_survives_into_one_that_returns_early(self):
         """sleep(), maintain() and the power cycle read what the last tick
@@ -3805,6 +3809,110 @@ class TestCeilingOutageKeepsTheSheds(unittest.TestCase):
         run(h, c, 3)
         self.assertNotIn(("a", False), h.acted["cordon"],
                          "the drain timeout gave a shed node back")
+
+
+class TestCeilingClassification(unittest.TestCase):
+    """One classification of the pool, per tick, that every count the ceiling
+    makes is read from: the wake gate, the visit gate, the power-cycle refusal,
+    the deadline's "does the reading still ask" and the shed's own arithmetic.
+    They differ in exactly one place, on purpose, and these pin it."""
+
+    def view(self, states, phases, anchored=(), **kw):
+        h = world(states, ceiling=None, **kw)
+        c = h.controller(nodes=tuple(states), **ONLY_THE_CEILING)
+        c.tick()                       # (no ceiling: it forgets every anchor)
+        for n, ph in phases.items():
+            c.st.setdefault(n, {})["phase"] = ph
+        for n in anchored:
+            c.st.setdefault(n, {})["shed_at"] = T0
+        return h, c, c._classify()
+
+    def test_every_kind_of_node_lands_in_exactly_one_place(self):
+        states = {
+            "held": node(cordoned=True, ours=True),                 # draining
+            "drain": node(cordoned=True, ours=True),                # ordinary
+            "up": node(),
+            "boot": asleep(),
+            "visit": asleep(),
+            "going": node(cordoned=True, ours=True),
+            "dark": asleep(),
+            "asleep": asleep(),
+            "stranded": node(cordoned=True, ours=True),
+        }
+        phases = {"held": "sleeping", "drain": "sleeping", "boot": "waking",
+                  "visit": "maintaining", "going": "powering_off"}
+        _h, _c, v = self.view(states, phases,
+                              anchored=("held", "dark", "stranded"))
+        self.assertEqual((v.held_down, v.drains, v.up),
+                         (["held", "stranded"], ["drain"], ["up"]))
+        self.assertEqual((v.booting, v.going_down, v.dark),
+                         (["boot", "visit"], ["going"], ["dark"]))
+        placed = [n for k in ("held_down", "drains", "up", "booting",
+                              "going_down", "dark") for n in getattr(v, k)]
+        self.assertEqual(len(placed), len(set(placed)), "a node in two places")
+
+    def test_a_booting_node_is_powered_but_never_picked(self):
+        """The one difference between the two counts: a node still booting
+        draws power the wake gate and the deadline have to count, and cannot be
+        asked to shut down, so the shed's arithmetic leaves it out."""
+        _h, c, v = self.view({"a": node(), "b": asleep()}, {"b": "waking"})
+        self.assertEqual(v.selectable, ["a"])
+        self.assertEqual((v.powered(cutting=True), v.powered(cutting=False)),
+                         (2, 2))
+        self.assertEqual((c._powered(True), c._powered(False)), (2, 2))
+
+    def test_a_node_going_down_counts_only_while_the_budget_is_the_question(self):
+        _h, c, v = self.view({"a": node(), "b": node(cordoned=True,
+                                                     ours=True)},
+                             {"b": "powering_off"})
+        self.assertEqual((v.powered(True), v.powered(False)), (2, 1))
+        self.assertEqual((c._powered(True), c._powered(False)), (2, 1))
+        self.assertEqual(v.selectable, ["a"], "a node being cut was pickable")
+
+    def test_a_dark_anchored_node_is_not_powered(self):
+        _h, c, v = self.view({"a": node(), "b": asleep()}, {},
+                             anchored=("b",))
+        self.assertEqual(v.dark, ["b"])
+        self.assertEqual(c._powered(True), 1)
+
+    def test_the_counts_follow_the_phases_as_they_stand_not_as_the_tick_began(self):
+        h, c, v = self.view({"a": node(), "b": node()}, {})
+        self.assertEqual(c._powered(True), 2)
+        c.st["b"]["phase"] = "powering_off"
+        h.states["b"] = dataclasses.replace(h.states["b"], ready=False)
+        c._states["b"] = h.states["b"]
+        self.assertEqual(c._powered(True), 1,
+                         "a node that went down this tick was still counted")
+
+    def test_every_count_reads_the_one_classification(self):
+        """Patch the classification and every count moves with it: none of
+        them keeps a notion of "powered" of its own."""
+        from metalnap.controller import _PoolView
+        h, c, _v = self.view({"a": node(), "b": node(), "c": node()}, {})
+        fake = _PoolView(up=["a"], booting=["b"], going_down=["c"])
+        with mock.patch.object(Controller, "_classify", return_value=fake):
+            self.assertEqual(c._powered(True), 3)
+            self.assertEqual(c._powered(False), 2)
+            c._cur = 1
+            self.assertTrue(c._shed_overdue(T0 - 10 ** 6),
+                            "the deadline counted what the view does not")
+            c._cur = 2
+            self.assertFalse(c._shed_overdue(T0 - 10 ** 6),
+                             "the deadline counted the node being cut")
+
+    def test_a_booting_node_does_not_raise_the_number_that_must_go(self):
+        """Ceiling 2 over a in service, b in service and c still waking: the
+        shed's arithmetic sees two nodes it could ask to go, so none must --
+        while the wake gate, counting c, is full."""
+        h = world({"a": node(), "b": node(), "c": asleep()}, ceiling=2,
+                  shortfall=400.0, busy={"a": ["j"], "b": ["k"]})
+        c = h.controller(nodes=("a", "b", "c"), **ONLY_THE_CEILING)
+        c.st["c"] = {"phase": "waking", "phase_since": T0}
+        h.chassis["c"] = "on"
+        c.tick()
+        self.assertEqual(shed_notes(h), [], "shed a node for one still booting")
+        self.assertEqual(c._powered(True), 3)
+        self.assertEqual(h.acted["on"], [], "woke a node past the ceiling")
 
 
 class TestCeilingBlocksWakes(unittest.TestCase):

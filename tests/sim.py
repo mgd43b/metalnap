@@ -186,29 +186,29 @@ for requests, and play out exactly as they did before them.
 and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
 300 of 600), each mistake reintroduced afresh:
 
-    a shed's deadline held in memory                   29/30   292/300
-    a shed note outliving the ceiling                  29/30   298/300
-    an error averaged into the hold                    23/30   194/300
-    a visit begun with no slot left under a ceiling    17/30   173/300
+    a shed's deadline held in memory                   28/30   284/300
+    a shed note outliving the ceiling                  28/30   275/300
+    an error averaged into the hold                     8/30   145/300
+    a visit begun with no slot left under a ceiling    18/30   172/300
     an outage forgetting the sheds under way           17/30   182/300
     the outage clock never reset by a reading           8/30   105/300
-    a shed's deadline re-stamped when it is resumed    17/30   171/300
-    a node carrying work shed before an idle one        8/30   112/300
+    a shed's deadline re-stamped when it is resumed    16/30   185/300
+    a node carrying work shed before an idle one       11/30   143/300
     the deadline forced for a ceiling only the hold
-      still asks for                                    7/30    67/300
-    a wedged node power-cycled with the pool over       5/30    31/300
+      still asks for                                    7/30    51/300
+    a wedged node power-cycled with the pool over       4/30    32/300
     the wedged node left out of that count              4/30    27/300
-    the drain timeout ending a shed                     2/30    26/300
-    the hold taken as a maximum, not a minimum          0/30     7/300
-    a wake that has just arrived not shed               0/30     3/300
-    the attempt bound ending a shed                     0/30     1/300
+    the drain timeout ending a shed                     0/30     5/300
+    the hold taken as a maximum, not a minimum          3/30    15/300
+    a wake that has just arrived not shed               1/30     3/300
+    the attempt bound ending a shed                     1/30    12/300
     clamp before the fit guard                          0/30     0/300
     `unguarded` not clamped                             0/30     0/300
     visits held back whenever a ceiling limits, with
       headroom                                          0/30    10/300
     a wedged node never cycled under a ceiling, or
       refused at the limit and not only over it         0/30     0/300
-    wakes gated on the nodes in service, not powered    0/30     0/300
+    wakes gated on the nodes in service, not powered    1/30     3/300
     a drain turned into a shed that is not needed       0/30     0/300
     a shed the reading no longer needs not given back   0/30     0/300
     the end of the list not shed first                  0/30     0/300
@@ -230,12 +230,12 @@ and for the capacity ceiling, on the 30 of those 60 seeds that run it (and the
     a limit clamped to every node, not to the pool      0/30     0/300
     no series read as a ceiling of 0, in the controller 60/60   600/600
 
-Rates measured against an older harness say nothing about this one, so: the
-rows other than the two about an outage were measured before a flapping episode
-joined it, and before a standing-budget episode (a cap of one over two nodes
-for hundreds of ticks) joined the harness and visits and power cycles became a
-matter of headroom. Every row about a visit or a wedged node's cycle was
-re-measured with them; the rest were not, and the episodes they draw differ.
+Every row above was measured again on the harness as it stands, with the
+flapping and standing-budget episodes in it (the failing seeds of 60 are the
+numerators over 30, since only half the seeds run a ceiling, and of 600 over
+300). Rates measured against an older harness say nothing about this one, and
+several moved when the episodes they draw changed; the ones that moved most are
+the rows an outage or a flap bears on.
 
 The last row is every seed because the mistake is not confined to the seeds that
 run a ceiling: a controller with none reads "no series" too. The same mistake in

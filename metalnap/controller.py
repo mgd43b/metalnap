@@ -53,6 +53,50 @@ import time
 from typing import Dict, List
 
 
+@dataclasses.dataclass
+class _PoolView:
+    """The nodes a capacity ceiling counts, sorted by what each is at this
+    moment. Built by Controller._classify() and nowhere else.
+
+    held_down  held down by the ceiling (it carries a shed anchor) and still up:
+               draining, or Ready in no operation after a restart
+    drains     an ordinary drain under way, which a ceiling that needs the node
+               gone turns into a shed
+    up         in service, or Ready in no operation of the kind that is going
+               down -- stranded, visiting, warming, a wake that has just arrived
+    booting    powered, NotReady, in a wake or a visit: drawing power, and not
+               yet anything that can be asked to shut down
+    going_down its power is being cut and it still reads Ready
+    dark       holding an anchor, asleep, in no operation: not drawing power
+
+    Two counts come out of it, and they differ in exactly one place, on
+    purpose. What a shed may PICK from is `selectable` -- a node still booting
+    cannot be asked to shut down, so it is not among them, and is shed the tick
+    it is Ready. What is POWERED -- for the wake gate, the visit gate, the
+    power-cycle refusal and the deadline's "does the reading still ask" -- is
+    those and the nodes booting, which draw power the budget has to count.
+    """
+    held_down: list = dataclasses.field(default_factory=list)
+    drains: list = dataclasses.field(default_factory=list)
+    up: list = dataclasses.field(default_factory=list)
+    booting: list = dataclasses.field(default_factory=list)
+    going_down: list = dataclasses.field(default_factory=list)
+    dark: list = dataclasses.field(default_factory=list)
+
+    @property
+    def selectable(self):
+        return self.held_down + self.drains + self.up
+
+    def powered(self, cutting):
+        """Nodes still drawing power. `cutting` is whether a node whose
+        shutdown has been requested counts while it still reads Ready: it does
+        when the question is the budget -- a wake is not made beside a node that
+        is still on -- and not when it is whether the ceiling still wants
+        somebody gone, which a node on its way out has already answered."""
+        return (len(self.selectable) + len(self.booting)
+                + (len(self.going_down) if cutting else 0))
+
+
 class Controller:
     def __init__(self, nodes, node_source, power, signal, drain, config,
                  notifier=None, warmup=None, log=None, clock=time.time,
@@ -1505,31 +1549,48 @@ class Controller:
         self._try_note(name, "shed", None)
         return dataclasses.replace(state, shed_at=None)
 
-    def _powered(self, cutting):
-        """Nodes the ceiling counts that are still drawing power, as far as
-        can be told without asking a BMC: Ready, or on their way up -- waking,
-        or up for a visit.
+    def _phase(self, name):
+        return (self.st.get(name) or {}).get("phase")
 
-        `cutting` is whether a node whose shutdown has been requested counts
-        while it still reads Ready. It does when the question is the budget --
-        a wake is not made beside a node that is still on -- and not when it is
-        whether the ceiling still wants somebody gone, which a node on its way
-        out has already answered. Worked out from the phases as they stand,
-        not as the tick began, so a node that went down a moment ago in this
-        same tick is not counted.
+    def _classify(self):
+        """Every node the ceiling counts, sorted once into what it is NOW.
+
+        The one place that says what "powered" means and which nodes a shed may
+        pick: the wake gate, the visit gate, the power-cycle refusal, the
+        deadline's "does the reading still ask for it" and the shed's own
+        arithmetic all read this, so they cannot drift into three notions of
+        one thing. Worked out from the phases as they stand -- not as the tick
+        began -- so a node that went down a moment ago in this same tick is
+        not counted; call it again after anything that moves a phase.
         """
-        n = 0
-        for name in self._pool:
-            phase = (self.st.get(name) or {}).get("phase")
-            if phase == "powering_off":
-                n += bool(cutting and self._states[name].ready)
-            elif (self._states[name].ready
-                    or phase in ("waking", "sleeping", "maintaining")):
+        v = _PoolView()
+        for n in self._pool:
+            ph = self._phase(n)
+            ready = self._states[n].ready
+            held = self._shed_anchor(n, self._states[n]) is not None
+            if ph == "powering_off":
+                # Its power is already being cut: never picked, and counted
+                # only while it still reads Ready and the question is the budget.
+                if ready:
+                    v.going_down.append(n)
+            elif ph == "sleeping":
                 # A drain counts Ready or not: a node that went NotReady
                 # mid-drain -- cut off from the cluster, its work carrying
                 # on -- is as powered as it was a moment ago.
-                n += 1
-        return n
+                (v.held_down if held else v.drains).append(n)
+            elif ready:
+                (v.held_down if held else v.up).append(n)
+            elif ph in ("waking", "maintaining"):
+                v.booting.append(n)
+            elif held and not ph:
+                v.dark.append(n)
+        return v
+
+    def _powered(self, cutting):
+        """Nodes the ceiling counts that are still drawing power, as far as
+        can be told without asking a BMC: Ready, or on their way up -- waking,
+        or up for a visit. See `_PoolView.powered` for `cutting`."""
+        return self._classify().powered(cutting)
 
     def _read_ceiling(self):
         """(reading, ok): what the signal says now, or that it cannot say.
@@ -1568,15 +1629,33 @@ class Controller:
         What it concludes is left on self for the steps below it: `_limit`,
         the limit while it binds, is what clamps demand; `_engaged` is what
         holds visits and power cycles back.
+
+        In four steps: read the signal and apply the hold; settle the anchors
+        the nodes carry; and, while a limit binds, choose what must go and
+        carry that out; and report what was concluded.
         """
-        cfg, st = self.cfg, self.st
-        now = self.now()
+        now = self.now()                  # one reading of the clock for the lot
         self._states, self._pool = states, wakeable
         self._limit = self._eff = self._cur = None
         self._eff_reported = self._reading = None
         self._engaged = self._grace = False
 
         reading, ok = self._read_ceiling()
+        eff, engaged, grace = self._apply_hold(reading, ok, now)
+        exempt = [n for n in present if n in held or n in maint]
+        self._settle_anchors(present, exempt, engaged, grace, ok, now)
+        begun = set()
+        if not engaged:
+            self.st["_shed_dry_last"] = None
+        else:
+            self._shed_pass(eff, awake, begun, now)
+        self._ceiling_report(present, states, exempt, ok)
+        return begun
+
+    def _apply_hold(self, reading, ok, now):
+        """(effective limit, engaged, in the grace of an outage): the reading
+        folded into the trailing hold, and what that makes the limit."""
+        cfg, st = self.cfg, self.st
         # The effective limit is the minimum of the readings in the trailing
         # hold: tightening is immediate, loosening waits a whole window of
         # looser readings, and `0, none, 0, none` costs no wake and no sleep.
@@ -1622,21 +1701,23 @@ class Controller:
         # a dashboard could not tell a ceiling of 99 from one of 3.
         self._eff_reported, self._reading = eff, reading
         if eff is not None:
-            eff = min(eff, len(wakeable))
+            eff = min(eff, len(self._pool))
         self._eff = eff
-        self._cur = None if reading is None else min(reading, len(wakeable))
+        self._cur = None if reading is None else min(reading, len(self._pool))
         # It binds only if it is below what it counts. A ceiling at or above
         # the pool changes nothing, and is treated as none, so that a standing
         # budget that is not binding does not hold visits or cycles back.
-        engaged = eff is not None and eff < len(wakeable)
+        engaged = eff is not None and eff < len(self._pool)
         self._engaged = engaged
         self._limit = eff if engaged else None
-        exempt = [n for n in present if n in held or n in maint]
+        return eff, engaged, grace
 
-        # The note on a node is true only while the ceiling holds it down. Any
-        # other time -- released, brought back by a wake or a rescue, taken by
-        # an operator -- it goes, and a node that is shed again gets a fresh
-        # anchor. One note per concern is the whole reason for a note.
+    def _settle_anchors(self, present, exempt, engaged, grace, ok, now):
+        """The note on a node is true only while the ceiling holds it down. Any
+        other time -- released, brought back by a wake or a rescue, taken by
+        an operator -- it goes, and a node that is shed again gets a fresh
+        anchor. One note per concern is the whole reason for a note."""
+        cfg, st, states = self.cfg, self.st, self._states
         dropped = []
         for n in present:
             state = states[n]
@@ -1684,128 +1765,114 @@ class Controller:
         if ok:
             st["_ceiling_gave_up"] = False
 
-        begun = set()
-        picks = []
-        if not engaged:
-            st["_shed_dry_last"] = None
+    def _shed_pass(self, L, awake, begun, now):
+        """A limit binds: work out how many nodes must go and which, and do
+        it. `L` is the effective limit, clamped to the pool."""
+        cfg, st = self.cfg, self.st
+        view = self._classify()
+        # Every node still drawing power that is not already on its way out
+        # counts -- the view's `selectable` -- and the ceiling allows L of
+        # them. A node still booting is not among them: it cannot be asked to
+        # shut down, and is shed the tick it is Ready. (It IS counted by
+        # `_powered`, for the wake gate and the deadline: that is the one
+        # difference between the two counts, and it is on purpose.)
+        required = len(view.selectable) - L
+        # Anyone an operator put back in service, whichever list it landed
+        # in this tick: it is counted, and it is not picked.
+        spared = {n for n in self._pool if (st.get(n) or {}).get(
+            "ceiling_spared_until", 0) > now}
+        picks, unshed = self._choose(view, required, spared)
+        if cfg.mode != "on":
+            # A shadow says what it WOULD do, once per change, and does
+            # nothing: no cordon, no note, no silence.
+            if picks and st.get("_shed_dry_last") != (tuple(picks), L):
+                self.log("info", "dry_run: would shed %s (ceiling %d, "
+                                 "awake %d)" % (", ".join(picks), L,
+                                                len(awake)),
+                         nodes=picks)
+            st["_shed_dry_last"] = (tuple(picks), L) if picks else None
         else:
-            L = eff
+            self._carry_out(view, picks, unshed, L, awake, begun, now)
 
-            def phase(n):
-                return (st.get(n) or {}).get("phase")
+    def _shed_order(self, nodes):
+        """The order they go in: nodes carrying no work first, then nodes
+        carrying work -- the mirror of the wake order, with a node that has a
+        job on it the last to go. Within each, the ones that cost nothing to
+        lose before the ones that do: a drain already on its way out, then a
+        node powered for nobody (stranded, visiting, just arrived), then one in
+        service; and each in reverse list order, so `nodes:` still decides among
+        equals. Picked the other way round, a node already leaving is left to
+        finish while one in service is shed beside it, and the pool ends one
+        under the ceiling."""
+        states = self._states
+        free = [n for n in reversed(self._pool) if n in nodes]
+        working = set(self._in_use(free))
 
-            # How many nodes must go, and which. Every node still drawing
-            # power that is not already on its way out counts, and the ceiling
-            # allows L of them:
-            #   held   already held down by it -- a note on the node -- and
-            #          still up: draining, or Ready and in no operation after
-            #          a restart;
-            #   drains an ordinary drain under way, which a ceiling that needs
-            #          the node gone turns into a shed;
-            #   up     in service, or Ready in no operation of the kind that is
-            #          going down -- stranded, visiting, warming, a wake that
-            #          has just arrived. A node still booting is none of these:
-            #          it cannot be asked to shut down, and is shed the tick it
-            #          is Ready.
-            held_down, drains, up = [], [], []
-            for n in wakeable:
-                ph = phase(n)
-                if ph == "powering_off":
-                    continue            # its power is already being cut
-                mine = self._shed_anchor(n, states[n]) is not None
-                if ph == "sleeping":
-                    (held_down if mine else drains).append(n)
-                elif states[n].ready:
-                    (held_down if mine else up).append(n)
-            required = len(held_down) + len(drains) + len(up) - L
-            # Anyone an operator put back in service, whichever list it landed
-            # in this tick: it is counted, and it is not picked.
-            spared = {n for n in wakeable if (st.get(n) or {}).get(
-                "ceiling_spared_until", 0) > now}
+        def cost(n):
+            if self._phase(n) == "sleeping":
+                return 0
+            return 1 if states[n].cordoned else 2
+        return sorted(free, key=lambda n: (n in working, cost(n)))
 
-            def order(nodes):
-                """The order they go in: nodes carrying no work first, then
-                nodes carrying work -- the mirror of the wake order, with a node
-                that has a job on it the last to go. Within each, the ones that
-                cost nothing to lose before the ones that do: a drain already
-                on its way out, then a node powered for nobody (stranded,
-                visiting, just arrived), then one in service; and each in
-                reverse list order, so `nodes:` still decides among equals.
-                Picked the other way round, a node already leaving is left to
-                finish while one in service is shed beside it, and the pool
-                ends one under the ceiling."""
-                free = [n for n in reversed(wakeable) if n in nodes]
-                working = set(self._in_use(free))
+    def _choose(self, view, required, spared):
+        """(picks, unshed): who is shed beyond the ones already going, or who
+        stops being shed because fewer must go than are."""
+        picks, unshed = [], []
+        held_down = view.held_down
+        if required > len(held_down):
+            # More must go than are going: the rest are picked.
+            picks = self._shed_order(
+                [n for n in view.drains + view.up if n not in spared])[
+                :required - len(held_down)]
+        elif required < len(held_down) and self.cfg.mode == "on":
+            # Fewer must go than are held down -- the reading loosened, or
+            # a node went down some other way. The surplus goes back to
+            # being what it was: not shed, with a drain timeout and a
+            # rescue like any other, and no deadline that would end its
+            # work for a ceiling that no longer asks it. The ones that
+            # carry work are given back first.
+            keep = self._shed_order(held_down)[:max(required, 0)]
+            unshed = [n for n in held_down if n not in keep]
+        return picks, unshed
 
-                def cost(n):
-                    if phase(n) == "sleeping":
-                        return 0
-                    return 1 if states[n].cordoned else 2
-                return sorted(free, key=lambda n: (n in working, cost(n)))
-
-            unshed = []
-            if required > len(held_down):
-                # More must go than are going: the rest are picked.
-                picks = order([n for n in drains + up if n not in spared])[
-                    :required - len(held_down)]
-            elif required < len(held_down) and cfg.mode == "on":
-                # Fewer must go than are held down -- the reading loosened, or
-                # a node went down some other way. The surplus goes back to
-                # being what it was: not shed, with a drain timeout and a
-                # rescue like any other, and no deadline that would end its
-                # work for a ceiling that no longer asks it. The ones that
-                # carry work are given back first.
-                keep = order(held_down)[:max(required, 0)]
-                unshed = [n for n in held_down if n not in keep]
-            if cfg.mode != "on":
-                # A shadow says what it WOULD do, once per change, and does
-                # nothing: no cordon, no note, no silence.
-                if picks and st.get("_shed_dry_last") != (tuple(picks), L):
-                    self.log("info", "dry_run: would shed %s (ceiling %d, "
-                                     "awake %d)" % (", ".join(picks), L,
-                                                    len(awake)),
-                             nodes=picks)
-                st["_shed_dry_last"] = (tuple(picks), L) if picks else None
+    def _carry_out(self, view, picks, unshed, L, awake, begun, now):
+        """Do what `_choose` decided, for a controller that is live."""
+        states = self._states
+        for n in unshed:
+            states[n] = self._forget_shed(n, states[n])
+            self.log("info", "no longer shed: the ceiling does not ask "
+                             "for this node to go", node=n, ceiling=L)
+        for n in picks:
+            if self._phase(n) == "sleeping":
+                # A drain that was running when the ceiling engaged
+                # BECOMES a shed: still cordoned, its deadline anchored
+                # now and not at a cordon that may be a day old, and no
+                # drain timeout to give the node back.
+                self._node(n)["shed_at"] = now
+                self._try_note(n, "shed", now)
+                states[n] = dataclasses.replace(states[n], shed_at=now)
+                self.log("warn", "a drain under way is now a shed; its "
+                                 "deadline starts here", node=n,
+                         ceiling=L)
             else:
-                for n in unshed:
-                    states[n] = self._forget_shed(n, states[n])
-                    self.log("info", "no longer shed: the ceiling does not ask "
-                                     "for this node to go", node=n, ceiling=L)
-                for n in picks:
-                    if phase(n) == "sleeping":
-                        # A drain that was running when the ceiling engaged
-                        # BECOMES a shed: still cordoned, its deadline anchored
-                        # now and not at a cordon that may be a day old, and no
-                        # drain timeout to give the node back.
-                        self._node(n)["shed_at"] = now
-                        self._try_note(n, "shed", now)
-                        states[n] = dataclasses.replace(states[n], shed_at=now)
-                        self.log("warn", "a drain under way is now a shed; its "
-                                         "deadline starts here", node=n,
-                                 ceiling=L)
-                    else:
-                        self._start_shed(n, states, awake, begun)
-                # A node held down but with no operation -- a restart lost it --
-                # is started again, on the anchor it already carries.
-                for n in held_down:
-                    if (n not in unshed and phase(n) != "sleeping"
-                            and n not in begun):
-                        self._start_shed(n, states, awake, begun)
-                # And the nodes already down. A ceiling that has loosened to two
-                # of three holds ONE node down, whatever it had put down at
-                # zero: the others are merely asleep, and wake in the order the
-                # list gives. Their notes go -- the earliest in the list, which
-                # are the first demand would wake -- so that `status` and the
-                # metric say how many the ceiling is actually holding.
-                kept = len(held_down) - len(unshed) + len(picks)
-                dark = [n for n in wakeable
-                        if self._shed_anchor(n, states[n]) is not None
-                        and not states[n].ready and not phase(n)]
-                surplus = len(dark) - max(len(wakeable) - L - kept, 0)
-                for n in dark[:max(surplus, 0)]:
-                    states[n] = self._forget_shed(n, states[n])
-        self._ceiling_report(present, states, exempt, ok)
-        return begun
+                self._start_shed(n, states, awake, begun)
+        # A node held down but with no operation -- a restart lost it --
+        # is started again, on the anchor it already carries.
+        for n in view.held_down:
+            if (n not in unshed and self._phase(n) != "sleeping"
+                    and n not in begun):
+                self._start_shed(n, states, awake, begun)
+        # And the nodes already down. A ceiling that has loosened to two
+        # of three holds ONE node down, whatever it had put down at
+        # zero: the others are merely asleep, and wake in the order the
+        # list gives. Their notes go -- the earliest in the list, which
+        # are the first demand would wake -- so that `status` and the
+        # metric say how many the ceiling is actually holding.
+        kept = len(view.held_down) - len(unshed) + len(picks)
+        dark = self._classify().dark       # as they are now: starts moved some
+        surplus = len(dark) - max(len(self._pool) - L - kept, 0)
+        for n in dark[:max(surplus, 0)]:
+            states[n] = self._forget_shed(n, states[n])
 
     def _start_shed(self, n, states, awake, begun):
         """Begin holding one node down: on record first, then through the
