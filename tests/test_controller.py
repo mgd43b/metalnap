@@ -3144,6 +3144,35 @@ class _Resp:
     def json(self):
         return self.body
 
+    # The ceiling reads the body against a deadline, a chunk at a time.
+    def iter_content(self, chunk_size=1):
+        yield json.dumps(self.body).encode()
+
+    def close(self):
+        pass
+
+
+class _Trickle(_Resp):
+    """A server that never goes quiet for as long as one socket timeout, and
+    never finishes: a byte every fifty milliseconds, for ever. `requests`
+    applies its timeout to each socket operation, so this is never a timeout
+    to it."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.sent = 0
+
+    def json(self):
+        import time
+        time.sleep(3)                    # what reading it all would take
+
+    def iter_content(self, chunk_size=1):
+        import time
+        while True:
+            time.sleep(0.05)
+            self.sent += 1
+            yield b" "
+
 
 def prom(result, result_type="vector", status="success"):
     return _Resp({"status": status,
@@ -3226,13 +3255,63 @@ class TestPrometheusCeiling(unittest.TestCase):
 
     def test_the_demand_signal_and_the_ceiling_ask_prometheus_the_same_way(self):
         """One place asks, so a change to how Prometheus is reached -- auth,
-        TLS, a timeout -- cannot reach the demand signal and miss the ceiling:
-        which would fail open, and quietly stop working."""
+        TLS -- cannot reach the demand signal and miss the ceiling: which would
+        fail open, and quietly stop working. They differ only in how long they
+        will wait, which is the point of the ceiling's own."""
         from metalnap.signal.prometheus import PrometheusSignal
         with mock.patch("requests.get", return_value=prom(vec(1))) as get:
             PrometheusSignal("http://prom:9090/", "q", timeout=7).shortfall()
             PrometheusCeiling("http://prom:9090/", "q", timeout=7).limit()
-        self.assertEqual(get.call_args_list[0], get.call_args_list[1])
+        demand, ceiling = get.call_args_list
+        self.assertEqual(demand.args, ceiling.args)
+        self.assertEqual(demand.kwargs["params"], ceiling.kwargs["params"])
+
+    def test_the_demand_signal_is_read_as_it_always_was(self):
+        """Unchanged: one scalar timeout, no streaming, no deadline."""
+        from metalnap.signal.prometheus import PrometheusSignal
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusSignal("http://prom:9090/", "q", timeout=7).shortfall()
+        get.assert_called_once_with("http://prom:9090/api/v1/query",
+                                    params={"query": "q"}, timeout=7)
+
+    def test_a_server_that_trickles_bytes_cannot_outlast_the_deadline(self):
+        """`requests` applies a timeout to each socket operation, not to the
+        read as a whole, so a server that sends a byte now and then is never a
+        timeout to it and could hold the tick for as long as it likes. The read
+        has a deadline of its own, measured on the clock."""
+        import time
+        trickle = _Trickle()
+        with mock.patch("requests.get", return_value=trickle):
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                PrometheusCeiling("http://prom", "q", timeout=0.4).limit()
+            took = time.monotonic() - t0
+        self.assertLess(took, 2.0, "outlasted its deadline by %.1fs" % took)
+        self.assertGreater(trickle.sent, 2, "the fake never trickled")
+
+    def test_a_timeout_of_the_deadline_is_an_unavailable_reading(self):
+        h = world({"a": node(), "b": node()}, ceiling=None)
+        c = h.controller(**ONLY_THE_CEILING)
+        c.ceiling = PrometheusCeiling("http://prom", "q", timeout=0.3)
+        with mock.patch("requests.get", return_value=_Trickle()):
+            self.assertEqual(c._read_ceiling(), (None, False))
+        self.assertIn("deadline", c._ceiling_err)
+
+    def test_the_socket_waits_are_each_half_the_deadline_so_connect_and_headers_fit(self):
+        with mock.patch("requests.get", return_value=prom(vec(1))) as get:
+            PrometheusCeiling("http://prom", "q", timeout=6).limit()
+        kw = get.call_args.kwargs
+        self.assertEqual((kw["timeout"], kw["stream"]), ((3.0, 3.0), True))
+
+    def test_a_normal_answer_is_read_whole_in_chunks(self):
+        class Chunks(_Resp):
+            def iter_content(self, chunk_size=1):
+                raw = json.dumps(self.body).encode()
+                for i in range(0, len(raw), 7):
+                    yield raw[i:i + 7]
+        resp = Chunks(prom(vec(3, 1)).body)
+        with mock.patch("requests.get", return_value=resp):
+            self.assertEqual(PrometheusCeiling("http://prom", "q").limit(), 1)
 
     def test_the_timeout_reaches_the_request_and_defaults_short(self):
         """The ceiling is read before demand, on the tick: five seconds, not
@@ -3241,7 +3320,7 @@ class TestPrometheusCeiling(unittest.TestCase):
             PrometheusCeiling("http://prom", "q").limit()
             PrometheusCeiling("http://prom", "q", timeout=3).limit()
         self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list],
-                         [5, 3])
+                         [(2.5, 2.5), (1.5, 1.5)])
 
     def test_a_timeout_is_unavailable_like_any_other_error(self):
         import requests
@@ -3260,7 +3339,8 @@ class TestPrometheusCeiling(unittest.TestCase):
             PrometheusCeiling("http://prom:9090/", "up == 0",
                               timeout=7).limit()
         get.assert_called_once_with("http://prom:9090/api/v1/query",
-                                    params={"query": "up == 0"}, timeout=7)
+                                    params={"query": "up == 0"},
+                                    timeout=(3.5, 3.5), stream=True)
 
 
 class TestStaticCeiling(unittest.TestCase):

@@ -166,7 +166,7 @@ capacityCeiling:
   static: null
   releaseHoldS: 900       # a looser reading must hold this long before shed nodes are released
   drainDeadlineS: 600     # a busy node is given this long, then shut down anyway; 0 = never force
-  timeoutS: 5             # how long the ceiling's Prometheus read may take (> 0, <= timers.intervalS); a timeout is an unavailable reading
+  timeoutS: 5             # deadline, in elapsed seconds, on the whole Prometheus read of the ceiling (with a query: > 0, <= timers.intervalS); running out is an unavailable reading
 
 # Prometheus metrics, on a plain HTTP listener inside the controller. OFF by
 # default: before this the controller listened on nothing at all. Set a port to

@@ -124,12 +124,17 @@ class Config:
     #: it off anyway, with the ordinary soft shutdown. 0 never forces: a busy
     #: node then holds the ceiling open for as long as its work runs.
     ceiling_drain_deadline_s: int = _i("CEILING_DRAIN_DEADLINE_S", 600)
-    #: How long the ceiling's Prometheus read may take. It has its own, much
-    #: shorter than the demand signal's twenty seconds, because it is read ON
-    #: the tick, before anything else, and a shed is waiting on it: a timeout is
-    #: an unavailable reading like any other error, so there is nothing to gain
-    #: from waiting longer. It is a bound and not a concurrency: the read stays
-    #: on the tick, sequential, and no thread is added to a safety-critical
+    #: A DEADLINE, in seconds of elapsed time, on the ceiling's Prometheus read.
+    #: It has its own, much shorter than the demand signal's twenty seconds,
+    #: because it is read ON the tick, before anything else, and a shed is
+    #: waiting on it: running out of it is an unavailable reading like any other
+    #: error, so there is nothing to gain from waiting longer. Elapsed time,
+    #: because a socket timeout bounds each wait and not the read, and a server
+    #: that trickles bytes would never trip it; each wait on the network is at
+    #: most half of it, and one chunk in progress when it passes can finish, so
+    #: the bound is this plus at most half again. Checked only when a query is
+    #: set: nothing else is read. It is a bound and not a concurrency: the read
+    #: stays on the tick, sequential, and no thread is added to a safety-critical
     #: path to hide a slow one.
     ceiling_timeout_s: int = _i("CEILING_TIMEOUT_S", 5)
 

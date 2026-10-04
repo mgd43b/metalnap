@@ -222,7 +222,7 @@
         "timeoutS": {
           "type": "integer",
           "minimum": 1,
-          "description": "How long the ceiling's Prometheus read may take, in seconds. At most timers.intervalS (checked at render). A timeout is an unavailable reading, which sheds nothing."
+          "description": "A deadline, in elapsed seconds, on the whole Prometheus read of the ceiling (not a socket timeout). With a query, at most timers.intervalS (checked at render). Running out of it is an unavailable reading, which sheds nothing."
         }
       },
       "allOf": [

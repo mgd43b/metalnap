@@ -33,8 +33,9 @@ class PrometheusCeiling:
     120)` -- and a stale metric returns no series, which is no ceiling.
 
     The read is made on the tick, before the demand signal's, so it has a short
-    timeout of its own (CEILING_TIMEOUT_S, five seconds). A timeout is an
-    exception like any other: unavailable, which sheds nothing.
+    deadline of its own (CEILING_TIMEOUT_S, five seconds of ELAPSED time for
+    the whole read, not a socket timeout: see instant_query). Running out of it
+    is an exception like any other: unavailable, which sheds nothing.
     """
 
     def __init__(self, url, query, timeout=5):
@@ -43,7 +44,8 @@ class PrometheusCeiling:
         self.timeout = timeout
 
     def limit(self):
-        data = instant_query(self.url, self.query, self.timeout)
+        data = instant_query(self.url, self.query, self.timeout,
+                             deadline=self.timeout)
         kind, result = data["resultType"], data["result"]
         if kind == "scalar":                 # `query: "2"`: [ts, "2"]
             samples = [result]

@@ -105,10 +105,12 @@ Optional:
                             also how long an outage of the signal keeps the
                             deadlines of nodes already shed (the ceiling itself
                             is released at once): past it they are forgotten.
-    CEILING_TIMEOUT_S       how long the ceiling's Prometheus read may take
-                            (default 5; above 0 and no more than INTERVAL_S).
-                            It is read on the tick, so it is short; a timeout is
-                            an unavailable reading, like any other error.
+    CEILING_TIMEOUT_S       a deadline, in elapsed seconds, on the ceiling's
+                            Prometheus read (default 5; with a query, above 0
+                            and no more than INTERVAL_S). It is read on the
+                            tick, so it is short, and it is the whole read, not
+                            one socket wait; running out of it is an unavailable
+                            reading, like any other error.
     CEILING_DRAIN_DEADLINE_S
                             a node carrying work is given this long to finish
                             before a shed shuts it down anyway, the ordinary soft

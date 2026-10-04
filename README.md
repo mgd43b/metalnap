@@ -428,12 +428,18 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
 - NaN, infinity, a negative, a value that is not a number, an error, a timeout:
   all are **cannot tell**, which is never zero. If any one series cannot be
   read, the whole reading cannot.
-- **The read has a timeout of its own, `CEILING_TIMEOUT_S`** (default 5, above 0
-  and no more than `INTERVAL_S`). It is made on the tick before anything else,
-  so a Prometheus that hangs must not stretch the tick by the demand signal's
-  twenty seconds. It is a bound, not a concurrency: the read stays sequential
-  on the tick, and no thread is added to a safety-critical path to hide a slow
-  one. A timeout is an unavailable reading like any other error.
+- **The read has a deadline of its own, `CEILING_TIMEOUT_S`** (default 5; with a
+  query, above 0 and no more than `INTERVAL_S`). It is made on the tick before
+  anything else, so a Prometheus that hangs must not stretch the tick by the
+  demand signal's twenty seconds. It is **elapsed time for the whole read**, not
+  a socket timeout: the answer is streamed and read against the clock, so a
+  server that sends a byte now and then cannot hold the tick. Connecting and
+  waiting for the first byte each wait at most half of it, and a chunk already
+  being read when it passes can finish, so the read is over within the deadline
+  plus at most half again. It is a bound, not a concurrency: the read stays
+  sequential on the tick, and no thread is added to a safety-critical path to
+  hide a slow one. Running out of it is an unavailable reading like any other
+  error. (The demand signal is read as it always was, with a socket timeout.)
 - **It fails open, in both directions.** An error never engages a ceiling, and
   it *releases one that is engaged, on that same tick*. A Prometheus outage in
   the middle of an event therefore lifts the ceiling. Nothing wakes at that
