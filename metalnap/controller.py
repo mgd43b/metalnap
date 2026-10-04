@@ -101,6 +101,8 @@ class Controller:
         self._eff = None        # the effective limit, bound or not
         self._cur = None        # the current reading, None if there is none
         self._engaged = False   # a limit is in force and below the pool
+        self._grace = False     # the signal is down, but not for long enough
+                                # to forget the sheds already under way
         self._ceiling_err = None
         self._states, self._pool = {}, []
         self._busy_seen = {}    # busy() answers already read this tick
@@ -659,7 +661,9 @@ class Controller:
                     self.log("info", "waiting on running work; the shed "
                                      "deadline has passed, but the current "
                                      "reading no longer asks for this node to "
-                                     "go", node=name, busy=len(busy),
+                                     "go" + (" (the signal cannot be read)"
+                                             if self._cur is None else ""),
+                             node=name, busy=len(busy),
                              units=busy[:5], reading=self._cur)
                 else:
                     self.log("info", "waiting on running work; the shed "
@@ -1566,7 +1570,7 @@ class Controller:
         now = self.now()
         self._states, self._pool = states, wakeable
         self._limit = self._eff = self._cur = None
-        self._engaged = False
+        self._engaged = self._grace = False
 
         reading, ok = self._read_ceiling()
         # The effective limit is the minimum of the readings in the trailing
@@ -1576,7 +1580,28 @@ class Controller:
         # it empties the window instead of being averaged into it: fail open,
         # literally, and at once. (The window lives in memory. A restart
         # forgets the hold, which is the same direction.)
+        #
+        # What an outage does NOT do is forget the sheds already under way. The
+        # ceiling is released -- nothing is picked, nothing blocked, the hold
+        # gone -- but a node already held down keeps its anchor, so that a
+        # signal that errors on alternate ticks cannot restart every busy
+        # node's deadline each time round and never reach it. The anchors are
+        # kept while the outage is no longer than the release hold, measured
+        # from its first tick (in memory: a restart starts the clock again, so
+        # the anchors can outlive the outage by one more hold per restart, and
+        # the ceiling itself stays released throughout). Past that, they go as
+        # a release would send them, so a stale anchor never outlives a long
+        # outage. A readable reading is a real one and decides as it always
+        # did: engaged resumes the same anchors, anything else forgets them.
         window = st.setdefault("_ceiling_window", [])
+        if ok:
+            st["_ceiling_down_since"] = None
+            grace = False
+        else:
+            if st.get("_ceiling_down_since") is None:
+                st["_ceiling_down_since"] = now
+            grace = now - st["_ceiling_down_since"] <= cfg.ceiling_release_hold_s
+        self._grace = grace
         if not ok:
             window.clear()
         else:
@@ -1604,9 +1629,11 @@ class Controller:
         # other time -- released, brought back by a wake or a rescue, taken by
         # an operator -- it goes, and a node that is shed again gets a fresh
         # anchor. One note per concern is the whole reason for a note.
+        dropped = []
         for n in present:
             state = states[n]
-            if (engaged and n not in exempt and not state.cordoned
+            if ((engaged or grace) and n not in exempt
+                    and not state.cordoned
                     and (st.get(n) or {}).get("phase") == "sleeping"):
                 # A person uncordoned a node that was draining -- one the
                 # ceiling was holding down (it carries a shed note) or an
@@ -1625,7 +1652,8 @@ class Controller:
                     now + cfg.sleep_cooldown_s)
             if self._shed_anchor(n, state) is None:
                 continue
-            if engaged and state.cordoned and state.ours and n not in exempt:
+            if ((engaged or grace) and state.cordoned and state.ours
+                    and n not in exempt):
                 if state.shed_at is None:
                     # Held down on this process's own say-so: the write that
                     # should have put it on the node failed. Retried until the
@@ -1636,7 +1664,17 @@ class Controller:
                     if self._try_note(n, "shed", mine):
                         states[n] = dataclasses.replace(state, shed_at=mine)
                 continue
+            if not ok and not grace:
+                dropped.append(n)
             states[n] = self._forget_shed(n, state)
+        if dropped and not st.get("_ceiling_gave_up"):
+            st["_ceiling_gave_up"] = True
+            self.log("warn", "capacity ceiling signal has been unavailable "
+                             "longer than the release hold; forgetting the "
+                             "shed deadlines of the nodes it held down",
+                     nodes=dropped, hold_s=cfg.ceiling_release_hold_s)
+        if ok:
+            st["_ceiling_gave_up"] = False
 
         begun = set()
         picks = []
@@ -1826,7 +1864,7 @@ class Controller:
         eff, engaged = self._eff, self._engaged
         # Held down by the ceiling, and not an operator's: asleep or draining.
         shed, draining = [], []
-        if cfg.mode == "on" and engaged:
+        if cfg.mode == "on" and (engaged or self._grace):
             for n in present:
                 state = states[n]
                 anchor = self._shed_anchor(n, state)
@@ -1835,8 +1873,10 @@ class Controller:
                 shed.append(n)
                 phase = (st.get(n) or {}).get("phase")
                 if state.ready or phase == "sleeping":
+                    # While the signal is down nothing is enforced, so no
+                    # time is promised.
                     draining.append({"node": n, "until": (
-                        anchor + deadline if deadline else None)})
+                        anchor + deadline if deadline and engaged else None)})
         if engaged:
             if st.get("_ceiling_since") is None:
                 # From the notes on the nodes where there are any, so a
@@ -1855,7 +1895,11 @@ class Controller:
                           exempt=powered_exempt, shed=shed)
             if not ok:
                 self.log("warn", "capacity ceiling signal unavailable; "
-                                 "treating it as no ceiling",
+                                 "treating it as no ceiling" + (
+                                     ", and keeping the nodes it already "
+                                     "holds down for up to %ds"
+                                     % cfg.ceiling_release_hold_s
+                                     if shed else ""),
                          err=self._ceiling_err, **fields)
             elif engaged and not (last and last[1]):
                 self.log("warn", "capacity ceiling ENGAGED", **fields)

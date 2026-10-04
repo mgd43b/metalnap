@@ -3481,8 +3481,16 @@ class TestCeilingFailsOpen(unittest.TestCase):
         h._ceiling = RuntimeError("prometheus down")
         h.t += 60
         c.tick()
+        self.assertFalse(c._engaged, "the ceiling outlived its signal")
+        self.assertIsNone(c._limit)
+        # What it had put down is not forgotten by a blip: the anchors go when
+        # a reading says release, or the outage outlasts the hold.
+        self.assertEqual([n for n, v in shed_notes(h) if v is None], [])
+        h._ceiling = None
+        h.t += 60
+        c.tick()
         self.assertEqual(sorted(n for n, v in shed_notes(h) if v is None),
-                         ["a", "b"], "the ceiling outlived its signal")
+                         ["a", "b"], "a real release left the notes behind")
 
     def test_an_error_lets_demand_wake_a_node_straight_away(self):
         h = world({"a": asleep(), "b": asleep()}, shortfall=400.0, ceiling=0)
@@ -3586,6 +3594,176 @@ class TestCeilingFailsOpen(unittest.TestCase):
         self.assertEqual((sink.last["limit"], sink.last["engaged"]),
                          (2, False))
         self.assertEqual(h.acted["cordon"], [])
+
+
+class TestCeilingOutageKeepsTheSheds(unittest.TestCase):
+    """An unavailable reading releases the CEILING -- nothing is picked,
+    nothing is blocked -- but not the sheds already under way: a node held down
+    keeps its anchor through an outage no longer than the release hold, so a
+    signal that errors on alternate ticks cannot restart every busy node's
+    deadline each time round and never reach it."""
+
+    DOWN = RuntimeError("prometheus down")
+
+    def busy_one(self, **kw):
+        h = world({"a": node(ready_since=T0 - 10)}, ceiling=0,
+                  busy={"a": ["job-1"]})
+        return h, h.controller(nodes=("a",), **kw)
+
+    def at(self, h, c, offset, reading):
+        h.t = T0 + offset
+        h._ceiling = reading
+        c.tick()
+
+    def test_a_flapping_signal_still_reaches_the_deadline(self):
+        """engaged, error, engaged, error ...: one anchor, one deadline."""
+        h, c = self.busy_one()
+        for i, offset in enumerate(range(0, 721, 60)):
+            self.at(h, c, offset, 0 if i % 2 == 0 else self.DOWN)
+        self.assertEqual([v for _n, v in shed_notes(h)], [T0],
+                         "the anchor was rewritten or dropped by a blip")
+        self.assertEqual(h.acted["off"], ["a"],
+                         "a flapping signal kept a busy node past its deadline")
+        self.assertEqual(len(h.at_level("error", "SHED FORCED")), 1)
+
+    def test_an_outage_is_not_a_deadline_it_is_not_enforced_while_down(self):
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        for offset in (60, 660, 720):
+            self.at(h, c, offset, self.DOWN)
+        self.assertEqual(h.acted["off"], [],
+                         "forced a node while the signal could not be read")
+        self.assertEqual(c.st["a"]["shed_at"], T0)
+        self.at(h, c, 780, 0)                    # readable and engaged again
+        self.assertEqual(h.acted["off"], ["a"],
+                         "the same anchor did not carry on to its deadline")
+
+    def test_the_ceiling_itself_is_released_during_the_outage(self):
+        """Literal fail-open for the ceiling: no new sheds, no wake blocked."""
+        h = world({"a": node(), "b": asleep()}, ceiling=RuntimeError("down"),
+                  shortfall=400.0)
+        c = h.controller(**ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertEqual(h.acted["on"], ["b"], "a wake was blocked")
+        self.assertFalse(c._engaged)
+        self.assertIsNone(c._limit)
+
+    def test_an_outage_longer_than_the_hold_forgets_the_anchors(self):
+        h, c = self.busy_one(ceiling_release_hold_s=300)
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)             # the outage's first tick
+        self.at(h, c, 360, self.DOWN)            # exactly the hold: kept
+        self.assertNotIn(("a", None), shed_notes(h))
+        self.assertEqual(c.st["a"]["shed_at"], T0)
+        self.at(h, c, 420, self.DOWN)            # longer than it: forgotten
+        self.assertIn(("a", None), shed_notes(h))
+        self.assertNotIn("shed_at", c.st["a"])
+        self.at(h, c, 480, self.DOWN)
+        self.assertEqual(len(h.at_level("warn", "longer than the release "
+                                                "hold")), 1,
+                         "said again on every tick of a long outage")
+
+    def test_each_outage_is_timed_from_its_own_first_tick(self):
+        """Two outages, each shorter than the hold, with a reading between
+        them: the second is not the first one still running."""
+        h, c = self.busy_one(ceiling_release_hold_s=300)
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)
+        self.at(h, c, 120, 0)                    # readable: the outage is over
+        self.at(h, c, 180, self.DOWN)
+        self.at(h, c, 420, self.DOWN)            # 240s into this one
+        self.assertNotIn(("a", None), shed_notes(h),
+                         "the first outage's clock was still running")
+
+    def test_a_real_release_after_an_error_forgets_the_anchors(self):
+        for reading in (None, 5):               # no series; above the pool
+            with self.subTest(reading=reading):
+                h, c = self.busy_one()
+                self.at(h, c, 0, 0)
+                self.at(h, c, 60, self.DOWN)
+                self.assertNotIn(("a", None), shed_notes(h))
+                self.at(h, c, 120, reading)
+                self.assertIn(("a", None), shed_notes(h))
+                self.assertNotIn("shed_at", c.st["a"])
+
+    def test_a_forced_shed_is_still_counted_after_a_blip(self):
+        """The soft-off was asked for past the deadline; the signal blips
+        before the power-off is confirmed; it still counts, once."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        self.at(h, c, 600, 0)                    # forced: shutdown requested
+        self.assertEqual(h.acted["off"], ["a"])
+        self.assertEqual(c.st["a"]["phase"], "powering_off")
+        self.at(h, c, 660, self.DOWN)            # the blip; confirmed here
+        self.at(h, c, 720, 0)
+        self.assertEqual(c.forced_total, 1)
+
+    def test_an_operator_uncordon_during_an_outage_is_still_spared(self):
+        h = world({"a": node(), "b": node()}, ceiling=1,
+                  busy={"a": ["j1"], "b": ["j2"]})
+        c = h.controller(**ONLY_THE_CEILING)
+        self.at(h, c, 0, 1)
+        shed = [n for n, _v in shed_notes(h)][0]
+        self.at(h, c, 60, self.DOWN)
+        h.states[shed] = dataclasses.replace(h.states[shed], cordoned=False)
+        for offset in (120, 180):
+            self.at(h, c, offset, self.DOWN)
+        self.at(h, c, 240, 1)
+        self.assertEqual(h.acted["cordon"].count((shed, True)), 1,
+                         "re-cordoned a node an operator put back")
+
+    def test_an_anchor_on_a_node_that_is_no_longer_held_down_goes(self):
+        """The anchor is kept for a node that is still cordoned and ours.
+        One put back in service is not held down, outage or not."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        h.states["a"] = dataclasses.replace(h.states["a"], cordoned=False)
+        self.at(h, c, 60, self.DOWN)
+        self.assertIn(("a", None), shed_notes(h))
+
+    def test_a_restart_during_an_outage_keeps_the_deadline_going(self):
+        """The anchor is on the node. The outage clock is not, so a restart
+        starts it again -- the ceiling itself stays released throughout."""
+        h, c = self.busy_one()
+        self.at(h, c, 0, 0)
+        c.st = {}                                 # the process restarted
+        c2 = h.controller(nodes=("a",))
+        c2.st = {}
+        self.at(h, c2, 60, self.DOWN)
+        self.assertNotIn(("a", None), shed_notes(h))
+        self.at(h, c2, 120, 0)
+        self.assertEqual([v for _n, v in shed_notes(h)], [T0])
+        self.at(h, c2, 600, 0)
+        self.assertEqual(h.acted["off"], ["a"])
+
+    def test_the_report_says_the_signal_is_down_and_what_is_still_held(self):
+        h, c = self.busy_one()
+        sink = _Sink()
+        c.metrics = sink
+        self.at(h, c, 0, 0)
+        self.at(h, c, 60, self.DOWN)
+        r = sink.last
+        self.assertEqual((r["signal_ok"], r["engaged"], r["limit"]),
+                         (False, False, None))
+        self.assertEqual(r["shed"], ["a"], "a node held down was not counted")
+        self.assertEqual([d["until"] for d in r["draining"]], [None],
+                         "promised a deadline that is not enforced")
+        self.at(h, c, 120, self.DOWN)
+        self.assertEqual(len(h.at_level("warn", "unavailable")), 1,
+                         "one log line per change, not per tick")
+        self.assertTrue(h.logged("keeping the nodes it already holds down"))
+
+    def test_an_anchored_node_in_an_outage_does_not_confuse_the_stranded_repair(self):
+        """A node held down, Ready, in no operation (a restart lost it) is the
+        stranded repair's: returned to service if demand wants it, slept again
+        on its own anchor if not -- never abandoned by the drain timeout."""
+        h = world({"a": node(cordoned=True, ours=True, ours_since=T0 - 5000,
+                             shed_at=T0 - 100)}, ceiling=RuntimeError("down"),
+                  busy={"a": ["j"]})
+        c = h.controller(nodes=("a",), **ONLY_THE_CEILING)
+        run(h, c, 3)
+        self.assertNotIn(("a", False), h.acted["cordon"],
+                         "the drain timeout gave a shed node back")
 
 
 class TestCeilingBlocksWakes(unittest.TestCase):

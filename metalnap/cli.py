@@ -296,6 +296,12 @@ def ceiling_line(t, now=None):
     draining = report.get("draining") or []
     if not report.get("signal_ok", True):
         line = "signal UNAVAILABLE -- treated as no ceiling"
+        if shed:
+            # Released, but what it had put down is still down, and its
+            # deadlines are kept until the signal is back or the outage
+            # outlasts the release hold.
+            line += "; %s it shed %s still held down" % (
+                _nodes(len(shed)), "is" if len(shed) == 1 else "are")
     elif report.get("engaged"):
         signal = report.get("signal")
         parts = ["%d shed" % len(shed)]

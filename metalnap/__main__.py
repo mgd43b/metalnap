@@ -101,7 +101,10 @@ Optional:
                             Neither set (the default) is no ceiling at all.
     CEILING_RELEASE_HOLD_S  a looser reading must hold this long before shed
                             nodes are released (default 900): the ceiling
-                            tightens at once and loosens only after this.
+                            tightens at once and loosens only after this. It is
+                            also how long an outage of the signal keeps the
+                            deadlines of nodes already shed (the ceiling itself
+                            is released at once): past it they are forgotten.
     CEILING_DRAIN_DEADLINE_S
                             a node carrying work is given this long to finish
                             before a shed shuts it down anyway, the ordinary soft

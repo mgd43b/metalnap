@@ -432,7 +432,20 @@ or `static` (a fixed number, to try the shed path with no signal).** Not both.
   the middle of an event therefore lifts the ceiling. Nothing wakes at that
   moment — shed nodes stay asleep until demand wants them, through the usual
   `WAKE_SUSTAIN_S` — so the exposure is bounded by that and by how long the
-  outage lasts. This is **not a substitute for BMC thermal protection or UPS
+  outage lasts. What it does *not* do is forget the sheds already under way:
+  a node the ceiling was holding down keeps its deadline through an outage no
+  longer than `CEILING_RELEASE_HOLD_S`, counted from the outage's first tick,
+  so a signal that errors on alternate ticks cannot restart every busy node's
+  clock each time round and never reach it. During the outage nothing is
+  picked, un-shed or forced (the deadline is enforced only while the reading in
+  hand asks for it, and there is none), demand can still take a draining node
+  back as it can with no ceiling, and `status` says the signal is unavailable
+  and how many nodes are still held. A readable reading decides as it always
+  did: one that asks again resumes the *same* deadlines, and one that does not
+  forgets them. An outage longer than the hold forgets them too, so a stale
+  anchor never outlives it. (The outage clock is in memory: a restart starts it
+  again, so the anchors can outlive an outage by one more hold per restart; the
+  ceiling itself stays released throughout.) This is **not a substitute for BMC thermal protection or UPS
   shutdown**: it is only as available as its signal and the controller.
 - **Staleness is the expression's job.** An instant query is stamped with the
   time it was *evaluated*, so the age of a metric cannot be read off the
@@ -488,7 +501,8 @@ capacityCeiling:
 - **It loosens reluctantly.** The effective limit is the *minimum of the
   readings in the trailing `CEILING_RELEASE_HOLD_S`* (900), so a flapping signal
   (`0, none, 0, none`) holds nodes down and costs no wake-and-sleep cycles. An
-  *unavailable* reading is not a looser one — it empties the window. After the
+  *unavailable* reading is not a looser one — it empties the window (and
+  does not forget the sheds under way: see above). After the
   release nothing wakes by itself: demand does, through the usual wake window,
   one node per tick. (The hold is in memory, so a restart forgets it.) Nodes
   held down that the loosened reading no longer needs gone go back to being

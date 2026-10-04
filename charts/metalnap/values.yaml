@@ -115,7 +115,11 @@ maintenance:
 #
 # OFF unless `query` or `static` is set, and it FAILS OPEN, in both directions:
 # an unreachable Prometheus never sheds a node, and one that goes away in the
-# middle of an event lifts the ceiling at once.
+# middle of an event lifts the ceiling at once. The nodes it was already
+# holding down keep their drain deadlines through an outage no longer than
+# `releaseHoldS` (nothing is forced while the signal is down), so a signal that
+# errors every other tick cannot restart them for ever; a longer outage, or a
+# reading that releases, forgets them.
 #
 # It touches one of the rules the README lists as unbreakable -- "never
 # interrupt running work" -- and relaxes it in exactly one place: a node still

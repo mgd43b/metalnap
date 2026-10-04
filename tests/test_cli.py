@@ -616,6 +616,16 @@ class TestCeilingHeader(unittest.TestCase):
         self.assertEqual(header(out), ["ceiling:    signal UNAVAILABLE -- "
                                        "treated as no ceiling"])
 
+    def test_an_outage_says_how_many_nodes_are_still_held_down(self):
+        """The ceiling is released while the signal is down, but the nodes it
+        had put down are still down, with their deadlines kept."""
+        _c, out = self.status(ceiling_report(
+            engaged=False, limit=None, signal=None, signal_ok=False,
+            since=None, shed=["a", "b"], draining=[]))
+        self.assertEqual(header(out), ["ceiling:    signal UNAVAILABLE -- "
+                                       "treated as no ceiling; 2 nodes it "
+                                       "shed are still held down"])
+
     def test_a_status_nobody_has_written_lately_is_flagged(self):
         """A controller that died while a ceiling was engaged leaves ENGAGED
         in the object for ever."""
