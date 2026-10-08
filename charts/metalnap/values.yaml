@@ -214,6 +214,14 @@ timers:
 queries:
   shortfall: ""           # memory, GiB, as PromQL; empty = read off the pods
   cpuShortfall: ""        # CPU, cores, as PromQL; empty = read off the pods; "-" sizes on memory alone
+  # Work queues pinned at their own ceiling, each a floor of one awake node: a
+  # capped queue admits nothing further, so its demand never reaches the
+  # shortfall. The ARC default counts a scale set whose desired runners have
+  # reached its maxRunners, and never one capped at maxRunners: 0 -- paused,
+  # able to run nothing, and otherwise holding a node awake for the whole
+  # pause. Set each maxRunners ABOVE the width of one run: a cap equal to it
+  # reads as saturated on every ordinary run, with nothing queued behind it,
+  # and holds a node awake for it.
   saturation: ""          # empty = the ARC default; "-" disables the term
 
 rbac:

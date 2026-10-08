@@ -158,6 +158,20 @@ when extra capacity is most needed. This bit us in production: a runner pool
 pinned at its cap with jobs waiting, and the controller reporting zero unmet
 demand and preparing to sleep the last awake node.
 
+Each saturated queue is a floor of one awake node, so what counts as saturated
+matters. The ARC default (`ARC_SATURATION_QUERY`) counts a scale set whose
+desired runners have reached its `maxRunners`, and never one capped at
+`maxRunners: 0`. That cap is how CI is paused with the set and its listener
+still registered, so jobs queue rather than fail; a set that can run nothing is
+never saturated, and counting it would keep a node awake per paused set for as
+long as the pause lasted.
+
+**Set each `maxRunners` above the width of one run.** A scale set whose cap
+equals the most jobs a single run starts — a four-job matrix on
+`maxRunners: 4` — reads as saturated on every ordinary run, with nothing queued
+behind it, and holds a node awake for it. Above that width, only work actually
+waiting on the cap reads as saturated.
+
 ## When a node will not come back
 
 A wake waits `WAKE_TIMEOUT_S` for the node to become Ready. What happens then
