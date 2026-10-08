@@ -176,6 +176,10 @@ class DemandSignal(Protocol):
         further -- so genuine demand becomes invisible exactly when capacity is
         most needed. Each saturated unit counts as one node's worth of demand.
 
+        A queue whose ceiling is zero can run nothing and is never saturated,
+        however it reads: counted, it holds a node awake for as long as the
+        ceiling stays at zero.
+
         Return 0 if the concept does not apply to your signal.
         """
 

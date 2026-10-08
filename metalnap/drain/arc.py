@@ -77,15 +77,28 @@ class ArcDrain:
 
 #: Queue depth beyond a scale set's own ceiling is invisible to any
 #: pending-pod query: ARC creates pods up to maxRunners and no further, so a
-#: capped pool produces nothing unschedulable while jobs pile up on GitHub.
+#: capped pool produces nothing unschedulable while jobs pile up on GitHub. So
+#: a scale set counts once its desired runners have reached its maxRunners.
+#:
+#: Except at a cap of 0. `maxRunners: 0` is how CI is paused while the set and
+#: its listener stay registered, so jobs queue rather than fail -- and such a
+#: set reads desired 0 >= max 0 for as long as the pause lasts. A set that can
+#: run nothing is never saturated: saturation is a floor on how many nodes stay
+#: awake, so counting it would keep a node awake per paused set, for as long
+#: as it stays paused. `> 0` keeps only sets with a positive cap.
+#:
 #: `max by(name)` on both sides is load-bearing -- re-applying a scale set
 #: rolls its listener, and for the lookback window two series share a name;
 #: without the aggregation the comparison fails outright, precisely when a cap
 #: has just been changed.
+#:
+#: A cap equal to the width of one run (a four-job matrix on maxRunners: 4)
+#: reads as saturated on every ordinary run, with nothing queued behind it,
+#: and holds a node awake for it. Set caps above one run's width.
 ARC_SATURATION_QUERY = (
     "count("
     "  max by(name) (gha_desired_runners)"
     "  >= on(name)"
-    "  max by(name) (gha_max_runners)"
+    "  (max by(name) (gha_max_runners) > 0)"
     ") or vector(0)"
 )
