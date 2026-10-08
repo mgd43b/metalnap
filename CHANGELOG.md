@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/mgd43b/metalnap/compare/v0.6.1...v0.6.2) (2026-10-08)
+
+
+### Fixes
+
+* a scale set paused at maxRunners: 0 no longer reads as saturated ([9a1d6ed](https://github.com/mgd43b/metalnap/commit/9a1d6eda270e993d02669a70e3b88945101479b9))
+* a scale set paused at maxRunners: 0 no longer reads as saturated ([7147b20](https://github.com/mgd43b/metalnap/commit/7147b20f2ee8c5f50e8ceae7e17763b5d700096e))
+
 ## [0.6.1](https://github.com/mgd43b/metalnap/compare/v0.6.0...v0.6.1) (2026-10-04)
 
 
