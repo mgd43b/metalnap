@@ -25,7 +25,7 @@
 # Pinned by digest, and Dependabot bumps it. A floating tag means the base can
 # change under a rebuild with nothing in git to say so -- and this image runs
 # with cluster credentials and BMC passwords.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 # `apk upgrade` FIRST, and it is not redundant. `apk add` installs the packages
 # named below; it does NOT touch what the base image already ships. libcrypto3
