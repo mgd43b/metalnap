@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/mgd43b/metalnap/compare/v0.6.3...v0.7.0) (2026-11-04)
+
+
+### Features
+
+* an opt-in headroom wake that fires before anything is Pending ([9a03250](https://github.com/mgd43b/metalnap/commit/9a032501a58f97ca9487575a9d484bf95e1a6bb0))
+* an opt-in headroom wake that fires before anything is Pending ([9c6cf36](https://github.com/mgd43b/metalnap/commit/9c6cf36fa9c9152e0b77c503d73c103d575ee7e0))
+
+
+### Fixes
+
+* headroom drops a non-finite reading and counts only the sized resources ([c73565c](https://github.com/mgd43b/metalnap/commit/c73565cca45763a893a774c4de8efd8dbe323fde))
+
 ## [0.6.3](https://github.com/mgd43b/metalnap/compare/v0.6.2...v0.6.3) (2026-11-02)
 
 
