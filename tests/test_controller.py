@@ -6680,6 +6680,22 @@ class TestHeadroomFailsTowardNoChange(unittest.TestCase):
                 self.assertEqual(h.acted["on"], [])
                 self.assertTrue(h.at_level("warn", "headroom reading failed"))
 
+    def test_a_request_that_is_not_a_finite_amount_is_a_failed_read(self):
+        for bad in (float("inf"), float("nan"), -1.0):
+            with self.subTest(bad=bad):
+                h = self.full_pool({"a": {"cpu": bad, "memory": 1.0}})
+                run(h, h.controller(headroom_requested_pct=80.0), 2)
+                self.assertEqual(h.acted["on"], [])
+                self.assertTrue(h.at_level("warn", "headroom reading failed"))
+
+    def test_only_the_resources_the_pool_is_sized_on_count(self):
+        h = headroom_world({"a": sized(), "b": sized()},
+                           shortfall={"memory": 0.0},
+                           requested=asked(a=(10, 10), b=(10, 10)))
+        h.controller(headroom_requested_pct=80.0).tick()
+        self.assertEqual(headroom_seen(h)["headroom_pct"],
+                         {"memory": 10.0}, "CPU, not sized on, was counted")
+
     def test_nodes_that_report_no_allocatable_are_a_failed_read(self):
         h = headroom_world({"a": sized(capacity={"cpu": 0.0, "memory": 0.0}),
                             "b": sized_asleep()}, requested=asked(a=(9, 9)))

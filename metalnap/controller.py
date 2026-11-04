@@ -1419,7 +1419,7 @@ class Controller:
         return cap, max((math.ceil(v / cap[r]) for r, v in shortfall.items()
                          if v > 0 and r in cap), default=0)
 
-    def _headroom(self, awake, states, in_use):
+    def _headroom(self, awake, states, in_use, resources=None):
         """How full the awake pool is, and the floor on `want` that says.
 
         {"fill": {resource: ratio}, "peak": the higher of them, "without": the
@@ -1494,12 +1494,21 @@ class Controller:
                 caps[n] = ({r: float(v) for r, v in c.items()}
                            if isinstance(c, dict) else {"memory": float(c)})
             fill, without = {}, {}
-            for r in sorted(set().union(*caps.values())):
+            have = set().union(*caps.values())
+            # Only what the pool is sized on: a resource the demand signal
+            # does not size on is not one an operator chose to wake for.
+            for r in sorted(have if resources is None else have & resources):
                 total = sum(c.get(r, 0.0) for c in caps.values())
                 if not total > 0:              # nothing to be full of; NaN too
                     continue
                 used = sum(float((asked.get(n) or {}).get(r, 0.0))
                            for n in caps)
+                if not math.isfinite(used) or used < 0:
+                    # Infinity would ask for a node on nothing, and NaN would
+                    # compare false and slip past: both are a reading that
+                    # cannot be trusted, which is a failed read.
+                    raise ValueError("requested %s is not a finite amount: %r"
+                                     % (r, used))
                 fill[r] = used / total
                 if not idle:
                     without[r] = 0.0           # nothing to sleep: nothing to hold
@@ -2455,8 +2464,10 @@ class Controller:
         # With no demand signal there is no reading to make: whatever is
         # decided below is dropped to 0 for want of one, and a pod list spent
         # on a tick that cannot use it is one more call on a degraded cluster.
-        headroom = (self._headroom(awake, states, in_use) if demand_known
-                    else None)
+        headroom = (self._headroom(
+            awake, states, in_use,
+            set(shortfall) if isinstance(shortfall, dict) else {"memory"})
+            if demand_known else None)
         # A saturated queue admits no more work, so its demand is invisible to
         # shortfall() -- and it is a FLOOR, not more demand. Its runners sit on
         # nodes already counted in use; a node woken on top of them is one the
