@@ -192,6 +192,53 @@ class PendingPodShortfall:
         return shortfall
 
 
+class RunnerRequests:
+    """What the runner pods on each node have asked for, per node and resource.
+
+    The headroom wake's reading: `__call__()` is {node: {resource: amount}} --
+    memory in GiB, CPU in cores, the units `allocatable()` reports -- for
+    PrometheusSignal.requested() to hand the controller.
+
+    Scoped to the runners by the scale-set label ArcDrain.residual() uses, and
+    not to the whole namespace. Headroom is how much of the pool THE WORK has
+    taken, so anything else living there -- the warmup pod, a DaemonSet -- would
+    fill it with what is not work, and a baseline that large is never going to
+    leave.
+
+    Only pods the scheduler has placed and that still hold their requests: a
+    Succeeded or Failed pod holds none, and a pod with no node has none to
+    count against -- that one is the shortfall's, which is the pending path.
+    Each pod is counted with the scheduler's own effective-request formula, as
+    the shortfall and the fit check are.
+    """
+
+    #: A pod in either phase is finished, and the scheduler stops counting it.
+    TERMINAL = ("Succeeded", "Failed")
+
+    def __init__(self, kube, namespace,
+                 pod_label="actions.github.com/scale-set-name",
+                 resources=("memory", "cpu")):
+        self.kube, self.ns = kube, namespace
+        self.pod_label, self.resources = pod_label, tuple(resources)
+
+    def __call__(self):
+        import urllib.parse
+        sel = urllib.parse.quote(self.pod_label, safe="")
+        pods = self.kube.request(
+            "GET", "/api/v1/namespaces/%s/pods?labelSelector=%s"
+                   % (self.ns, sel))
+        out = {}
+        for p in pods.get("items", []):
+            node = p["spec"].get("nodeName")
+            if not node or p.get("status", {}).get("phase") in self.TERMINAL:
+                continue
+            asked = effective_requests(p["spec"], self.resources)
+            have = out.setdefault(node, dict.fromkeys(self.resources, 0.0))
+            for r, v in asked.items():
+                have[r] += v
+        return out
+
+
 def allocatable(resources=("memory", "cpu")):
     """A KubeNodeSource `capacity_of` that reports several resources.
 

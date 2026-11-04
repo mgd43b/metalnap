@@ -59,7 +59,8 @@ class TestChart(unittest.TestCase):
 
     def test_it_lints(self):
         for values in ("", "capacityCeiling: {static: 0}\n",
-                       "metrics: {port: 9100}\n"):
+                       "metrics: {port: 9100}\n",
+                       "headroom: {requestedPct: 80}\n"):
             with self.subTest(values=values):
                 with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
                     f.write("nodes: [node1]\n" + values)
@@ -72,7 +73,8 @@ class TestChart(unittest.TestCase):
     def test_a_default_install_has_no_ceiling_no_status_and_no_listener(self):
         out = self.ok()
         for absent in ("CEILING_QUERY", "CEILING_STATIC", "STATUS_CONFIGMAP",
-                       "METRICS_PORT", "containerPort", "metalnap-status"):
+                       "METRICS_PORT", "containerPort", "metalnap-status",
+                       "HEADROOM_REQUESTED_PCT"):
             self.assertNotIn(absent, out)
         self.assertNotIn("Service", self.kinds(out),
                          "there is deliberately no Service")
@@ -171,6 +173,47 @@ class TestChart(unittest.TestCase):
         out = self.ok("capacityCeiling: {releaseHoldS: 0, drainDeadlineS: 0}\n")
         self.assertIn('CEILING_RELEASE_HOLD_S: "0"', out)
         self.assertIn('CEILING_DRAIN_DEADLINE_S: "0"', out)
+
+    # -- headroom ---------------------------------------------------------------
+    def test_a_default_install_renders_exactly_what_it_did_without_headroom(self):
+        """The value is 0 and the key is not rendered, so the controller reads
+        its own default -- and nothing else in the chart moved."""
+        self.assertNotIn("HEADROOM", self.ok())
+        self.assertNotIn("HEADROOM", self.ok("headroom: {requestedPct: 0}\n"))
+        self.assertNotIn("HEADROOM", self.ok("headroom: {}\n"))
+
+    def test_a_percentage_reaches_the_controller_with_its_fraction(self):
+        self.assertIn('HEADROOM_REQUESTED_PCT: "80"',
+                      self.ok("headroom: {requestedPct: 80}\n"))
+        self.assertIn('HEADROOM_REQUESTED_PCT: "80.5"',
+                      self.ok("headroom: {requestedPct: 80.5}\n"))
+        self.assertIn('HEADROOM_REQUESTED_PCT: "100"',
+                      self.ok("headroom: {requestedPct: 100}\n"))
+
+    def test_a_percentage_outside_0_to_100_is_refused_by_both_checks(self):
+        for bad in ("-1", "100.5", "101", "800"):
+            with self.subTest(pct=bad):
+                values = "headroom: {requestedPct: %s}\n" % bad
+                code, _out, _err = self.render(values)
+                self.assertNotEqual(code, 0, "the schema let it through")
+                if CAN_SKIP_SCHEMA:
+                    code, _out, err = self.render(values,
+                                                  "--skip-schema-validation")
+                    self.assertNotEqual(code, 0)
+                    self.assertIn("must be from 0 to 100", err)
+
+    def test_headroom_adds_no_object_and_no_permission(self):
+        """It reads the pods it already may read."""
+        self.assertEqual(self.kinds(self.ok("headroom: {requestedPct: 80}\n")),
+                         self.kinds(self.ok()))
+        # Everything else is the same text, bar the checksum of the one
+        # ConfigMap line that pods roll on.
+        def bare(text):
+            return "".join(ln for ln in text.splitlines(True)
+                           if "HEADROOM_REQUESTED_PCT" not in ln
+                           and "checksum/" not in ln)
+        self.assertEqual(bare(self.ok("headroom: {requestedPct: 80}\n")),
+                         bare(self.ok()))
 
     # -- the status object and its RBAC ---------------------------------------
     def test_a_ceiling_brings_an_empty_status_object_and_a_scoped_role(self):

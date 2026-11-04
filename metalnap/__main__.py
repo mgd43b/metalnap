@@ -58,6 +58,15 @@ Optional:
                             alone. The pool is sized on whichever of the two
                             needs more nodes.
     SATURATION_QUERY        override, or "" to disable the saturation term
+    HEADROOM_REQUESTED_PCT  wake one more node BEFORE anything is Pending, when
+                            the runner pods on the awake nodes have requested
+                            this percent of their allocatable CPU or memory,
+                            whichever is higher. 0 (the default) disables it;
+                            80 is a sensible start. Counts only runner pods,
+                            and the resources the pool is sized on (both,
+                            unless CPU_SHORTFALL_QUERY=""). A node it woke is
+                            not slept while the pool without it would be at or
+                            above this.
     MAINTENANCE_INTERVAL_S  wake a node that has been asleep this long, so it
                             collects updates and config changes it would
                             otherwise never see. 0 (the default) disables it;
@@ -134,7 +143,7 @@ from .ceiling import from_config as ceiling_from_config
 from .drain import ArcDrain
 from .drain.arc import ARC_SATURATION_QUERY
 from .kube import (Kube, KubeNodeSource, PendingPodFit, PendingPodShortfall,
-                   allocatable)
+                   RunnerRequests, allocatable)
 from .metrics import Metrics, serve as serve_metrics
 from .notify import AlertmanagerNotifier
 from .power import IpmiPower
@@ -285,7 +294,9 @@ def main(argv=None):
             prom_url,
             queries,
             sat_q or None,
-            fit_check=PendingPodFit(kube, ns, taint=taint)),
+            fit_check=PendingPodFit(kube, ns, taint=taint),
+            # Never called with HEADROOM_REQUESTED_PCT at 0, its default.
+            pod_requests=RunnerRequests(kube, ns)),
         drain=ArcDrain(kube, namespace=ns),
         config=cfg,
     ).run_forever()

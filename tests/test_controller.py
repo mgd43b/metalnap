@@ -67,9 +67,15 @@ class Harness:
     """A minimal stub world. Records what the controller tried to do."""
 
     def __init__(self, states, shortfall=0.0, saturated=0, busy=(), idle=(),
-                 holds=False, fits=True, chassis=None, ceiling=None):
+                 holds=False, fits=True, chassis=None, ceiling=None,
+                 requested=None):
         self.states = states
         self._shortfall, self._saturated, self._fits = shortfall, saturated, fits
+        #: What the work on each node has asked for, {node: {resource:
+        #: amount}}, or an exception to raise. The headroom wake's reading,
+        #: and how often it was taken.
+        self._requested = {} if requested is None else requested
+        self.requested_reads = self.fit_calls = 0
         #: What the capacity ceiling reads, tick by tick: an int, None (no
         #: ceiling) or an exception to raise (the signal is unavailable).
         self._ceiling = ceiling
@@ -162,9 +168,16 @@ class Harness:
         return self._saturated
 
     def fits_node(self, capacity):
+        self.fit_calls += 1
         if isinstance(self._fits, BaseException):
             raise self._fits
         return self._fits
+
+    def requested(self):
+        self.requested_reads += 1
+        if isinstance(self._requested, BaseException):
+            raise self._requested
+        return self._requested
 
     # DrainPolicy
     def busy(self, n):
@@ -6137,7 +6150,7 @@ class TestCeilingWiring(unittest.TestCase):
         entry.Controller.run_forever = lambda c: built.update(c=c)
         try:
             for k in [k for k in os.environ if k.startswith(
-                    ("CEILING_", "STATUS_", "METRICS_"))]:
+                    ("CEILING_", "STATUS_", "METRICS_", "HEADROOM_"))]:
                 del os.environ[k]
             os.environ.update(self.ENV, **extra)
             entry.main([])
@@ -6252,6 +6265,699 @@ class TestCeilingWiring(unittest.TestCase):
             self.assertIsNotNone(c.metrics)
         finally:
             entry.serve_metrics = real
+
+
+# -- headroom -------------------------------------------------------------
+def sized(**kw):
+    """A pool node as the reference wiring reports one: CPU and memory."""
+    kw.setdefault("capacity", {"cpu": 10.0, "memory": 100.0})
+    return node(**kw)
+
+
+def sized_asleep(**kw):
+    kw.setdefault("capacity", {"cpu": 10.0, "memory": 100.0})
+    return asleep(**kw)
+
+
+def asked(**per_node):
+    """What the work on each node requested: asked(a=(cpu, memory), ...)."""
+    return {n: {"cpu": c, "memory": m} for n, (c, m) in per_node.items()}
+
+
+#: Nothing is waiting. A node source that reports CPU and memory is sized per
+#: resource, and a bare 0.0 against it is refused as a mismatch.
+NOTHING_PENDING = {"cpu": 0.0, "memory": 0.0}
+
+
+def headroom_world(states, **kw):
+    kw.setdefault("shortfall", dict(NOTHING_PENDING))
+    return world(states, **kw)
+
+
+def headroom_seen(h):
+    return h.logged("observed")[-1]
+
+
+class TestHeadroomSizing(unittest.TestCase):
+    """fill = requested / allocatable over the AWAKE nodes, per resource, and
+    the pool's is the higher of the two."""
+
+    def seen(self, states, requested, pct=80.0, **kw):
+        # A copy: the world replaces the entries of the dict it is given.
+        h = headroom_world(dict(states), requested=requested, **kw)
+        h.controller(headroom_requested_pct=pct).tick()
+        return h, headroom_seen(h)
+
+    def test_the_higher_of_cpu_and_memory_is_the_pools_fill(self):
+        pool = {"a": sized(), "b": sized()}
+        _, seen = self.seen(pool, asked(a=(6, 30), b=(4, 20)), pct=50.0)
+        self.assertEqual(seen["headroom_pct"], {"cpu": 50.0, "memory": 25.0})
+        self.assertEqual(seen["headroom_floor"], 3,
+                         "50% of CPU is the threshold: ask for a third node")
+        _, seen = self.seen(pool, asked(a=(1, 100), b=(1, 80)), pct=85.0)
+        self.assertEqual(seen["headroom_pct"], {"cpu": 10.0, "memory": 90.0})
+        self.assertEqual(seen["headroom_floor"], 3,
+                         "memory, the fuller of the two, was ignored")
+
+    def test_allocatable_is_summed_over_nodes_of_different_sizes(self):
+        pool = {"a": sized(capacity={"cpu": 10.0, "memory": 100.0}),
+                "b": sized(capacity={"cpu": 30.0, "memory": 300.0})}
+        _, seen = self.seen(pool, asked(a=(5, 5), b=(15, 5)))
+        self.assertEqual(seen["headroom_pct"], {"cpu": 50.0, "memory": 2.5})
+
+    def test_exactly_the_threshold_asks_and_just_under_does_not(self):
+        pool = {"a": sized(), "b": sized_asleep()}   # one node awake: no hold
+        _, seen = self.seen(pool, asked(a=(8.0, 1)))
+        self.assertEqual(seen["headroom_floor"], 2, "80% is AT 80%")
+        _, seen = self.seen(pool, asked(a=(7.9, 1)))
+        self.assertEqual(seen["headroom_floor"], 0)
+
+    def test_a_threshold_reached_by_a_sum_of_fractions_is_reached(self):
+        """700m and 100m are 800m of a core to the scheduler, and a hair
+        under 0.8 to a float. The comparison must not decide on that hair."""
+        self.assertLess(0.7 + 0.1, 0.8)
+        one_core = {"cpu": 1.0, "memory": 100.0}
+        _, seen = self.seen({"a": sized(capacity=one_core),
+                             "b": sized_asleep(capacity=one_core)},
+                            {"a": {"cpu": 0.7 + 0.1, "memory": 0.0}})
+        self.assertEqual(seen["headroom_floor"], 2)
+
+    def test_only_the_awake_nodes_count_on_either_side_of_the_ratio(self):
+        pool = {"a": sized(),
+                "b": sized_asleep(),
+                "c": sized(cordoned=True, ours=False)}      # an operator's
+        _, seen = self.seen(pool, asked(a=(4, 4), b=(50, 50), c=(50, 50)))
+        self.assertEqual(seen["headroom_pct"], {"cpu": 40.0, "memory": 4.0},
+                         "a sleeping node's or an operator's was counted")
+
+    def test_a_node_missing_from_the_answer_has_nothing_on_it(self):
+        _, seen = self.seen({"a": sized(), "b": sized()}, asked(a=(10, 10)))
+        self.assertEqual(seen["headroom_pct"], {"cpu": 50.0, "memory": 5.0})
+
+    def test_a_bare_number_of_capacity_is_memory(self):
+        pool = {"a": node(capacity=100.0), "b": node(capacity=100.0)}
+        _, seen = self.seen(pool, asked(a=(99, 85)), shortfall=0.0)
+        self.assertEqual(seen["headroom_pct"], {"memory": 42.5},
+                         "CPU was read where the node reports none")
+
+    def test_a_resource_with_no_allocatable_is_left_out(self):
+        pool = {"a": sized(capacity={"cpu": 0.0, "memory": 100.0}),
+                "b": sized(capacity={"cpu": 0.0, "memory": 100.0})}
+        _, seen = self.seen(pool, asked(a=(5, 50)))
+        self.assertEqual(seen["headroom_pct"], {"memory": 25.0})
+
+    def test_no_awake_node_is_no_reading_and_no_call(self):
+        h, seen = self.seen({"a": sized_asleep(), "b": sized_asleep()},
+                            asked(a=(99, 99)))
+        self.assertEqual(h.requested_reads, 0)
+        self.assertEqual((seen["headroom_pct"], seen["headroom_floor"]),
+                         (None, None))
+        self.assertEqual(h.acted["on"], [], "a cold start is the shortfall's")
+
+
+class TestHeadroomWakes(unittest.TestCase):
+    """A full pool asks for one more node than is awake -- and everything a
+    wake goes through still applies, the fit guard apart."""
+
+    FULL = asked(a=(9, 10))                        # 90% of one node's CPU
+
+    def pool(self, **kw):
+        h = headroom_world({"a": sized(), "b": sized_asleep()},
+                           requested=self.FULL, **kw)
+        return h
+
+    def test_a_full_pool_wakes_the_next_node_with_nothing_pending(self):
+        h = self.pool()
+        h.controller(headroom_requested_pct=80.0).tick()
+        self.assertEqual(h.acted["on"], ["b"])
+        self.assertEqual(h.fit_calls, 0,
+                         "the fit guard has nothing pending to inspect")
+
+    def test_a_pool_under_the_threshold_wakes_nothing(self):
+        h = self.pool()
+        h._requested = asked(a=(7, 10))
+        run(h, h.controller(headroom_requested_pct=80.0), 3)
+        self.assertEqual(h.acted["on"], [])
+
+    def test_it_waits_out_the_wake_sustain_timer_like_any_demand(self):
+        h = self.pool()
+        c = h.controller(headroom_requested_pct=80.0, wake_sustain_s=120)
+        c.tick()
+        self.assertEqual(h.acted["on"], [], "woke before the sustain window")
+        h.t += 119
+        c.tick()
+        self.assertEqual(h.acted["on"], [])
+        h.t += 1
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"])
+
+    def test_a_dip_below_the_threshold_does_not_clear_the_evidence(self):
+        """`want` flickers when a pool sits at its threshold; the sustain
+        timer holds its evidence across the dips the same way it does for any
+        other demand."""
+        h = self.pool(busy={"a": ["j1"]})
+        c = h.controller(headroom_requested_pct=80.0, wake_sustain_s=120)
+        c.tick()
+        h.t += 60
+        h._requested = asked(a=(7, 10))
+        c.tick()
+        h.t += 60
+        h._requested = self.FULL
+        c.tick()
+        self.assertEqual(h.acted["on"], ["b"])
+
+    def test_a_node_already_booting_is_the_one_asked_for(self):
+        """Not `world`: a plain Harness leaves the powered-on node booting,
+        which is the state `coming` is made of. The full pool still asks for
+        one more than is awake while that node boots, and a second one on top
+        of it is the over-wake `coming` exists to stop."""
+        h = Harness({"a": sized(), "b": sized_asleep(), "c": sized_asleep()},
+                    shortfall=dict(NOTHING_PENDING), requested=self.FULL)
+        c = h.controller(nodes=("a", "b", "c"), headroom_requested_pct=80.0)
+        run(h, c, 6)
+        self.assertEqual(h.acted["on"], ["b"],
+                         "a second node was woken beside the one booting")
+        self.assertEqual(headroom_seen(h)["coming"], ["b"])
+
+    def test_a_node_in_wake_backoff_is_passed_over(self):
+        h = headroom_world({"a": sized(), "b": sized_asleep(),
+                            "c": sized_asleep()}, requested=self.FULL)
+        c = h.controller(nodes=("a", "b", "c"), headroom_requested_pct=80.0)
+        c.st["b"] = {"wake_backoff_until": h.t + 10_000}
+        c.tick()
+        self.assertEqual(h.acted["on"], ["c"])
+
+    def test_an_operators_cordon_and_a_maintenance_request_are_exempt(self):
+        """Neither is a candidate, so neither is in what is asked for. (A
+        maintenance request powers its own node on, once, by its own rule: it
+        is `want` and the wake log that say headroom did not.)"""
+        for held in (sized_asleep(cordoned=True, ours=False),
+                     sized_asleep(maintenance="kernel upgrade")):
+            with self.subTest(held=held):
+                h = headroom_world({"a": sized(), "b": held},
+                                   requested=self.FULL, busy={"a": ["j1"]})
+                run(h, h.controller(headroom_requested_pct=80.0), 3)
+                self.assertEqual(headroom_seen(h)["want"], 1,
+                                 "asked for a node an operator holds")
+                self.assertFalse(h.logged("WAKE begin"))
+
+    def test_the_ceiling_caps_it_afterward(self):
+        h = self.pool(ceiling=1)
+        h.controller(headroom_requested_pct=80.0).tick()
+        seen = headroom_seen(h)
+        self.assertEqual((seen["wanted"], seen["want"]), (2, 1),
+                         "the clamp must come after the floor")
+        self.assertEqual(h.acted["on"], [], "woke a node past the ceiling")
+        h = self.pool(ceiling=2)
+        h.controller(headroom_requested_pct=80.0).tick()
+        self.assertEqual(h.acted["on"], ["b"], "a ceiling with room refused it")
+
+    def test_it_never_asks_for_more_nodes_than_can_be_woken(self):
+        h = headroom_world({"a": sized(), "b": sized(cordoned=True,
+                                                    ours=False)},
+                           requested=self.FULL)
+        run(h, h.controller(headroom_requested_pct=80.0), 3)
+        self.assertEqual((h.acted["on"], headroom_seen(h)["want"]), ([], 1))
+
+    def test_an_unfittable_backlog_does_not_cancel_the_floor(self):
+        """A pod stuck on a selector is a backlog the fit guard rightly
+        discounts -- to the nodes in use, or to the pool as it is. Either
+        would take a full pool's floor with it."""
+        for fits in (False, RuntimeError("apiserver")):
+            with self.subTest(fits=fits):
+                h = self.pool(shortfall={"cpu": 4.0, "memory": 0.0},
+                              fits=fits)
+                h.controller(headroom_requested_pct=80.0).tick()
+                self.assertEqual(h.acted["on"], ["b"],
+                                 "the fit guard canceled the headroom floor")
+
+    def test_it_is_not_more_demand_on_top_of_the_work_in_use(self):
+        """A floor, like saturation: a node busy with the work that fills the
+        pool is not also a node's worth of NEW demand."""
+        h = headroom_world({"a": sized(), "b": sized_asleep(),
+                            "c": sized_asleep()}, requested=self.FULL,
+                           busy={"a": ["j1"]})
+        c = h.controller(nodes=("a", "b", "c"), headroom_requested_pct=80.0)
+        c.tick()
+        self.assertEqual(headroom_seen(h)["want"], 2,
+                         "in_use + a node, instead of the floor")
+        self.assertEqual(h.acted["on"], ["b"])
+
+    def test_dry_run_says_so_and_touches_nothing(self):
+        h = self.pool()
+        h.controller(headroom_requested_pct=80.0, mode="dry_run").tick()
+        self.assertEqual((h.acted["on"], h.acted["cordon"]), ([], []))
+        self.assertTrue(h.logged("dry_run: would power on"))
+
+    def test_a_node_going_to_sleep_comes_back_when_the_pool_would_be_full(self):
+        """The mid-sleep rescue reads the same floor: a node already being
+        drained is not in the pool, so a pool that is full without it keeps
+        it."""
+        h = Harness({"a": sized(), "b": sized(cordoned=True, ours=True)},
+                    shortfall=dict(NOTHING_PENDING), requested=self.FULL)
+        c = h.controller(headroom_requested_pct=80.0)
+        c.st["b"] = {"phase": "sleeping", "phase_since": h.t}
+        c.tick()
+        self.assertIn(("b", False), h.acted["cordon"])
+        self.assertTrue(h.logged("demand arrived mid-sleep"))
+
+
+class TestHeadroomDoesNotFlap(unittest.TestCase):
+    """A node woken because the pool was nearly full arrives empty -- nothing
+    already running moves onto it -- and the pool reads well under the
+    threshold with it counted. Without a hold the ordinary sleep takes it back
+    down into the load that woke it, once per cold boot."""
+
+    LOAD = asked(a=(9, 10))
+
+    def two_idle(self, requested, **cfg):
+        """Two awake nodes, the load on `a`, which is busy with it: only `b`
+        is ever a candidate to sleep."""
+        h = headroom_world({"a": sized(), "b": sized()}, requested=requested,
+                           busy={"a": ["j1"]})
+        return h, h.controller(headroom_requested_pct=80.0, **cfg)
+
+    def test_the_pool_is_held_while_losing_a_node_would_leave_it_full(self):
+        h, c = self.two_idle(self.LOAD)         # 45% with both, 90% with one
+        run(h, c, 10)
+        self.assertEqual(h.acted["cordon"], [], "slept into the load")
+        self.assertEqual(h.acted["off"], [])
+        seen = headroom_seen(h)
+        self.assertEqual((seen["headroom_floor"], seen["want"]), (2, 2))
+
+    def test_the_hold_is_not_for_ever_it_lifts_with_the_load(self):
+        h, c = self.two_idle(self.LOAD)
+        run(h, c, 5)
+        self.assertEqual(h.acted["cordon"], [])
+        h._requested = asked(a=(7, 10))         # 70% without one node
+        run(h, c, 3)
+        self.assertEqual(len(cordoned(h)), 1,
+                         "the load fell and the node was still refused")
+
+    def test_the_boundary_holds_at_exactly_the_threshold_and_not_under(self):
+        h, c = self.two_idle(asked(a=(8.0, 10)))
+        run(h, c, 3)
+        self.assertEqual(h.acted["cordon"], [], "80% without a node is AT 80%")
+        h._requested = asked(a=(7.9, 10))
+        run(h, c, 3)
+        self.assertEqual(len(cordoned(h)), 1)
+
+    def test_the_sleep_window_runs_in_full_from_the_moment_the_hold_lifts(self):
+        """Held, `want == len(awake)` is "demand exactly met", which resets the
+        sleep timer: a node is not slept the tick the hold lifts, but a full
+        window after it."""
+        h, c = self.two_idle(self.LOAD, sleep_sustain_s=300)
+        run(h, c, 10)
+        h._requested = asked(a=(5, 10))
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [], "slept on the first tick")
+        h.t += 299
+        c.tick()
+        self.assertEqual(h.acted["cordon"], [])
+        h.t += 1
+        c.tick()
+        self.assertEqual(len(cordoned(h)), 1)
+
+    def test_a_busy_big_node_does_not_hold_a_small_idle_one(self):
+        """The node whose loss is tested is one the sleep could PICK. Tested
+        against the largest awake node, `big` -- busy, never slept -- reads the
+        pool at 100% without it and holds `small` for as long as its job runs,
+        when without `small` the pool is at 33% and nothing would wake it."""
+        h = headroom_world(
+            {"big": sized(capacity={"cpu": 30.0, "memory": 300.0}),
+             "small": sized()}, requested=asked(big=(10, 10), small=(0, 0)),
+            busy={"big": ["j1"]})
+        c = h.controller(nodes=("big", "small"), headroom_requested_pct=80.0)
+        run(h, c, 3)
+        self.assertEqual(cordoned(h), ["small"],
+                         "held a node the pool could do without")
+        self.assertEqual(h.acted["on"], [], "and it did not come straight back")
+
+    def test_the_largest_idle_node_is_the_one_whose_loss_is_tested(self):
+        """Whichever node the sleep picks, its loss must already have been
+        allowed: with a big idle node and a small one, what is left without
+        the BIG one is what has to stay under the threshold."""
+        h = headroom_world(
+            {"big": sized(capacity={"cpu": 30.0, "memory": 300.0}),
+             "small": sized()}, requested=asked(big=(0, 0), small=(9, 10)),
+            busy={"small": ["j1"]})
+        c = h.controller(nodes=("big", "small"), headroom_requested_pct=80.0)
+        run(h, c, 5)
+        # 9 of 40 is 22%, but without "big" it is 9 of 10: 90%.
+        self.assertEqual(h.acted["cordon"], [],
+                         "slept a node while the pool without the big one "
+                         "would be full")
+
+    def test_a_pool_of_one_is_never_held(self):
+        """Its fill without itself is every request over nothing. Held on
+        that, the last awake node could never sleep for a warm pool alone."""
+        h = headroom_world({"a": sized()}, requested=asked(a=(5, 10)))
+        c = h.controller(nodes=("a",), headroom_requested_pct=80.0)
+        run(h, c, 3)
+        self.assertEqual(cordoned(h), ["a"],
+                         "held the last awake node on a reading it cannot "
+                         "test")
+
+    def test_three_idle_nodes_sleep_one_at_a_time_as_the_load_allows(self):
+        h = headroom_world({n: sized() for n in "abc"},
+                           requested=asked(a=(10, 10)),   # 33% of 30
+                           busy={"a": ["j1"]})
+        c = h.controller(nodes=("a", "b", "c"), headroom_requested_pct=80.0)
+        run(h, c, 2)
+        # Without the largest of three the rest are 20 cores: 50%. Free to go.
+        self.assertEqual(len(cordoned(h)), 1)
+        run(h, c, 3)
+        # Two awake now: without one, the other is 10 cores at 100%. Held.
+        self.assertEqual(len(cordoned(h)), 1, "slept a second node into it")
+
+    def test_a_node_woken_by_headroom_stays_until_the_load_drops(self):
+        """The whole cycle, end to end: wake on a full pool, keep the node
+        through every tick of a load that has not moved, and give it back only
+        once the load has."""
+        h = headroom_world({"a": sized(), "b": sized_asleep()},
+                           requested=self.LOAD, busy={"a": ["j1"]})
+        c = h.controller(headroom_requested_pct=80.0)
+        run(h, c, 25)
+        self.assertEqual(h.acted["on"], ["b"], "woken more than once")
+        self.assertEqual(h.acted["off"], [], "put back down into the load")
+        self.assertEqual(cordoned(h), [])
+        h._requested = asked(a=(3, 10))
+        run(h, c, 5)
+        self.assertEqual(cordoned(h), ["b"], "the load fell; b never left")
+
+    def test_the_hold_never_keeps_a_node_the_ordinary_rule_would_not(self):
+        """It is a floor: where nothing says to hold, the pool sleeps exactly
+        as it did."""
+        h, c = self.two_idle(asked(a=(1, 1)))
+        run(h, c, 3)
+        self.assertEqual(len(cordoned(h)), 1)
+
+
+class TestHeadroomFailsTowardNoChange(unittest.TestCase):
+    """A reading that cannot be taken is the term missing from the tick: never
+    a full pool, so never a wake."""
+
+    def full_pool(self, requested):
+        return headroom_world({"a": sized(), "b": sized_asleep()},
+                              requested=requested, busy={"a": ["j1"]})
+
+    def test_a_failed_read_wakes_nothing_and_says_so(self):
+        h = self.full_pool(RuntimeError("apiserver said no"))
+        run(h, h.controller(headroom_requested_pct=80.0), 3)
+        self.assertEqual(h.acted["on"], [])
+        warned = h.at_level("warn", "headroom reading failed")
+        self.assertEqual(len(warned), 3)
+        self.assertIn("apiserver said no", warned[0]["err"])
+        seen = headroom_seen(h)
+        self.assertEqual((seen["headroom_pct"], seen["headroom_floor"]),
+                         (None, None))
+
+    def test_an_answer_that_is_not_a_reading_is_a_failed_read(self):
+        for junk in (42, "full", [], {"a": 7}, {"a": {"cpu": "lots"}}):
+            with self.subTest(junk=junk):
+                h = self.full_pool(junk)
+                run(h, h.controller(headroom_requested_pct=80.0), 2)
+                self.assertEqual(h.acted["on"], [])
+                self.assertTrue(h.at_level("warn", "headroom reading failed"))
+
+    def test_a_request_that_is_not_a_finite_amount_is_a_failed_read(self):
+        for bad in (float("inf"), float("nan"), -1.0):
+            with self.subTest(bad=bad):
+                h = self.full_pool({"a": {"cpu": bad, "memory": 1.0}})
+                run(h, h.controller(headroom_requested_pct=80.0), 2)
+                self.assertEqual(h.acted["on"], [])
+                self.assertTrue(h.at_level("warn", "headroom reading failed"))
+
+    def test_only_the_resources_the_pool_is_sized_on_count(self):
+        h = headroom_world({"a": sized(), "b": sized()},
+                           shortfall={"memory": 0.0},
+                           requested=asked(a=(10, 10), b=(10, 10)))
+        h.controller(headroom_requested_pct=80.0).tick()
+        self.assertEqual(headroom_seen(h)["headroom_pct"],
+                         {"memory": 10.0}, "CPU, not sized on, was counted")
+
+    def test_nodes_that_report_no_allocatable_are_a_failed_read(self):
+        h = headroom_world({"a": sized(capacity={"cpu": 0.0, "memory": 0.0}),
+                            "b": sized_asleep()}, requested=asked(a=(9, 9)))
+        run(h, h.controller(headroom_requested_pct=80.0), 2)
+        self.assertEqual(h.acted["on"], [])
+        self.assertTrue(h.at_level("warn", "headroom reading failed"))
+
+    def test_the_rest_of_the_decision_is_what_it_was(self):
+        """A failed read must not change anything else: against the same world
+        with headroom off, an idle pool sleeps what it slept and a pending
+        backlog wakes what it woke."""
+        def both(states, **kw):
+            out = []
+            for pct, requested in ((80.0, RuntimeError("down")), (0, {})):
+                h = headroom_world(dict(states), requested=requested, **kw)
+                run(h, h.controller(headroom_requested_pct=pct), 4)
+                out.append(h)
+            return out
+        failed, off = both({"a": sized(), "b": sized()})
+        self.assertTrue(cordoned(off), "the baseline sleeps nothing")
+        self.assertEqual(failed.acted, off.acted)
+        failed, off = both({"a": sized(), "b": sized_asleep()}, busy=["j1"],
+                           shortfall={"cpu": 400.0, "memory": 0.0})
+        self.assertEqual(off.acted["on"], ["b"], "the baseline wakes nothing")
+        self.assertEqual(failed.acted, off.acted)
+
+    def test_it_is_not_read_while_the_demand_signal_is_down(self):
+        """With a ceiling in force the tick goes on without demand, and decides
+        nothing that depends on it -- including this."""
+        h = headroom_world({"a": sized(), "b": sized_asleep()}, ceiling=1,
+                           shortfall=RuntimeError("prometheus down"),
+                           requested=asked(a=(9, 9)))
+        h.controller(headroom_requested_pct=80.0).tick()
+        self.assertEqual((h.requested_reads, h.acted["on"]), (0, []))
+
+
+class TestHeadroomIsOffByDefault(unittest.TestCase):
+    """0 -- the default -- is no signal, no read and no change."""
+
+    def test_the_default_is_zero_and_the_environment_sets_it(self):
+        saved = os.environ.pop("HEADROOM_REQUESTED_PCT", None)
+        try:
+            self.assertEqual(Config().headroom_requested_pct, 0)
+            os.environ["HEADROOM_REQUESTED_PCT"] = "80.5"
+            self.assertEqual(Config().headroom_requested_pct, 80.5)
+        finally:
+            os.environ.pop("HEADROOM_REQUESTED_PCT", None)
+            if saved is not None:
+                os.environ["HEADROOM_REQUESTED_PCT"] = saved
+
+    def test_it_is_validated_from_0_to_100(self):
+        for ok in (0, 0.5, 80, 100):
+            self.assertIsNotNone(Config(mode="on",
+                                        headroom_requested_pct=ok).validate())
+        for bad in (-1, -0.01, 100.01, 101, float("nan"), float("inf")):
+            with self.subTest(pct=bad), self.assertRaises(ValueError) as e:
+                Config(mode="on", headroom_requested_pct=bad).validate()
+            self.assertIn("HEADROOM_REQUESTED_PCT", str(e.exception))
+
+    def test_unset_it_reads_nothing_and_decides_exactly_as_without_it(self):
+        """The same worlds, one with a pool full to the brim and one with
+        nothing requested at all: with the signal off they cannot differ."""
+        runs = []
+        for requested in (asked(a=(10, 100), b=(10, 100)), {}):
+            h = headroom_world({"a": sized(), "b": sized(),
+                                "c": sized_asleep()}, requested=requested)
+            run(h, h.controller(nodes=("a", "b", "c")), 6)
+            runs.append(h)
+        full, empty = runs
+        self.assertEqual((full.requested_reads, empty.requested_reads), (0, 0))
+        self.assertEqual(full.acted, empty.acted)
+        self.assertEqual(full.logs, empty.logs)
+
+    def test_the_observed_line_is_the_one_it_always_was(self):
+        h = headroom_world({"a": sized(), "b": sized_asleep()})
+        h.controller().tick()
+        self.assertEqual(sorted(headroom_seen(h)),
+                         ["awake", "ceiling", "coming", "in_use", "mode",
+                          "saturated", "shortfall", "want", "wanted"])
+
+    def test_a_signal_that_cannot_be_read_is_refused_when_it_is_asked_for(self):
+        class Bare:
+            pass
+        h = Harness({"a": node()})
+        with self.assertRaises(ValueError) as e:
+            Controller(nodes=["a"], node_source=h, power=h.power, signal=Bare(),
+                       drain=h, config=Config(mode="on",
+                                              headroom_requested_pct=80.0))
+        self.assertIn("HEADROOM_REQUESTED_PCT", str(e.exception))
+        Controller(nodes=["a"], node_source=h, power=h.power, signal=Bare(),
+                   drain=h, config=Config(mode="on"))     # off: no demand
+
+
+class TestHeadroomIsObservable(unittest.TestCase):
+    def full(self, **kw):
+        return headroom_world({"a": sized(), "b": sized()},
+                              requested=asked(a=(6, 30), b=(4, 20)), **kw)
+
+    def test_the_reading_and_the_threshold_are_on_the_observed_line(self):
+        h = self.full()
+        h.controller(headroom_requested_pct=80.0).tick()
+        seen = headroom_seen(h)
+        self.assertEqual(seen["headroom_pct"], {"cpu": 50.0, "memory": 25.0})
+        self.assertEqual(seen["headroom_threshold_pct"], 80.0)
+        # 10 cores asked of the 10 left without a node: held, not asked.
+        self.assertEqual(seen["headroom_floor"], 2)
+
+    def test_a_change_is_said_once_not_on_every_tick(self):
+        h = headroom_world({"a": sized(), "b": sized()},
+                           requested=asked(a=(9, 10)))
+        c = h.controller(headroom_requested_pct=80.0)
+        run(h, c, 4)
+        self.assertEqual(len(h.logged("headroom: the pool without")), 1)
+        h._requested = asked(a=(1, 1))
+        run(h, c, 2)
+        self.assertEqual(len(h.logged("headroom no longer asks")), 1)
+
+    def test_the_gauges_are_exported_when_the_listener_is_on(self):
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        h = self.full()
+        h.controller(headroom_requested_pct=80.0, metrics=m).tick()
+        got = [ln for ln in m.render().splitlines() if not ln.startswith("#")]
+        self.assertIn("metalnap_headroom_requested_ratio 0.5", got)
+        self.assertIn("metalnap_headroom_requested_threshold_ratio 0.8", got)
+
+    def test_no_gauge_where_there_is_no_reading_and_none_where_it_is_off(self):
+        from metalnap.metrics import Metrics
+
+        def lines(**kw):
+            m = Metrics()
+            h = headroom_world({"a": sized(), "b": sized()},
+                               requested=kw.pop("requested", {}))
+            h.controller(metrics=m, **kw).tick()
+            return [ln for ln in m.render().splitlines()
+                    if ln.startswith("metalnap_headroom")]
+        self.assertEqual(lines(), [], "a gauge for a signal that is off")
+        broken = lines(headroom_requested_pct=80.0,
+                       requested=RuntimeError("down"))
+        self.assertEqual(broken, ["metalnap_headroom_requested_threshold_ratio"
+                                  " 0.8"],
+                         "a stale fill stood in for a reading not taken")
+
+    def test_the_status_object_never_sees_it(self):
+        """It moves every tick, and the status object writes on change: put in
+        the report both sinks share, it would be a ConfigMap update a tick for
+        a number `metalnap status` does not show."""
+        class Sink:
+            def __init__(self):
+                self.reports = []
+
+            def publish(self, report):
+                self.reports.append(report)
+        status, metrics = Sink(), Sink()
+        h = self.full()
+        h.controller(headroom_requested_pct=80.0, status=status,
+                     metrics=metrics).tick()
+        self.assertNotIn("headroom", status.reports[-1])
+        self.assertEqual(metrics.reports[-1]["headroom"],
+                         {"threshold": 0.8, "fill": 0.5})
+
+    def test_the_text_format_keeps_the_fraction(self):
+        """Every sample was `%d`, which prints a fill of 0.83 as 0."""
+        from metalnap.metrics import Metrics
+        m = Metrics()
+        m.publish({"headroom": {"fill": 0.8333333333, "threshold": 0.8}})
+        got = [ln for ln in m.render().splitlines() if not ln.startswith("#")]
+        self.assertIn("metalnap_headroom_requested_ratio 0.833333", got)
+        self.assertIn("metalnap_capacity_ceiling_engaged 0", got)
+        m.publish({"headroom": {"fill": 1.25, "threshold": 1}})
+        self.assertIn("metalnap_headroom_requested_ratio 1.25",
+                      m.render().splitlines())
+
+    def test_the_help_says_which_resource_and_when_it_is_absent(self):
+        from metalnap.metrics import Metrics
+        helps = {ln.split()[2]: ln for ln in Metrics().render().splitlines()
+                 if ln.startswith("# HELP")}
+        ratio = helps["metalnap_headroom_requested_ratio"]
+        for word in ("higher of CPU and memory", "Absent"):
+            self.assertIn(word, ratio)
+        self.assertIn("# TYPE metalnap_headroom_requested_ratio gauge",
+                      Metrics().render())
+
+
+class TestRunnerRequests(unittest.TestCase):
+    """What the headroom reads off the cluster: per node, in the units
+    allocatable() reports, for the runner pods that hold requests."""
+
+    def pod(self, node, cpu="1", mem="2Gi", phase="Running", **spec):
+        return {"metadata": {"name": "p"}, "status": {"phase": phase},
+                "spec": dict({"nodeName": node, "containers": [
+                    {"resources": {"requests": {"cpu": cpu,
+                                                "memory": mem}}}]}, **spec)}
+
+    def read(self, pods):
+        from metalnap.kube import RunnerRequests
+        calls = []
+
+        class K:
+            def request(self, method, path, body=None):
+                calls.append((method, path))
+                return {"items": pods}
+        got = RunnerRequests(K(), "ci ns")()
+        return got, calls
+
+    def test_pods_are_summed_per_node_in_cores_and_gib(self):
+        got, _ = self.read([self.pod("a", "500m", "1Gi"),
+                            self.pod("a", "1500m", "3Gi"),
+                            self.pod("b", "2", "512Mi")])
+        self.assertEqual(got, {"a": {"cpu": 2.0, "memory": 4.0},
+                               "b": {"cpu": 2.0, "memory": 0.5}})
+
+    def test_a_sidecar_and_an_init_floor_count_as_the_scheduler_counts_them(self):
+        runner = self.pod("a", "4", "8Gi", initContainers=[
+            {"restartPolicy": "Always", "resources": {"requests": {
+                "cpu": "4", "memory": "8Gi"}}},
+            {"resources": {"requests": {"cpu": "1", "memory": "0"}}}])
+        got, _ = self.read([runner])
+        self.assertEqual(got, {"a": {"cpu": 8.0, "memory": 16.0}},
+                         "a runner's dind sidecar was left out")
+
+    def test_finished_and_unplaced_pods_hold_nothing(self):
+        got, _ = self.read([self.pod("a", phase="Succeeded"),
+                            self.pod("a", phase="Failed"),
+                            self.pod(None, phase="Pending"),
+                            self.pod("a", phase="Pending")])
+        self.assertEqual(got, {"a": {"cpu": 1.0, "memory": 2.0}},
+                         "only the placed, unfinished pod holds requests")
+
+    def test_it_asks_for_the_runners_of_the_namespace_and_nothing_else(self):
+        _, calls = self.read([])
+        self.assertEqual(calls, [(
+            "GET", "/api/v1/namespaces/ci ns/pods?labelSelector="
+                   "actions.github.com%2Fscale-set-name")])
+
+    def test_the_signal_hands_it_over_and_without_one_cannot_tell(self):
+        from metalnap.signal import PrometheusSignal
+        have = PrometheusSignal("http://prom", {}, pod_requests=lambda: {"a": 1})
+        self.assertEqual(have.requested(), {"a": 1})
+        with self.assertRaises(RuntimeError):
+            PrometheusSignal("http://prom", {}).requested()
+
+
+class TestHeadroomWiring(unittest.TestCase):
+    """python -m metalnap builds the reading from the environment."""
+
+    ENV = TestCeilingWiring.ENV
+    build = TestCeilingWiring.build
+
+    def test_off_unless_asked_for(self):
+        self.assertEqual(self.build().cfg.headroom_requested_pct, 0)
+
+    def test_the_setting_reaches_the_controller_with_a_source_to_read(self):
+        from metalnap.kube import RunnerRequests
+        c = self.build(HEADROOM_REQUESTED_PCT="80")
+        self.assertEqual(c.cfg.headroom_requested_pct, 80)
+        self.assertIsInstance(c.signal.pod_requests, RunnerRequests)
+
+    def test_a_percentage_that_is_not_one_stops_the_start(self):
+        for bad in ("101", "-5", "nan", "eighty"):
+            with self.subTest(pct=bad), self.assertRaises(ValueError):
+                self.build(HEADROOM_REQUESTED_PCT=bad)
 
 
 if __name__ == "__main__":

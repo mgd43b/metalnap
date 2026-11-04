@@ -266,6 +266,18 @@
         }
       }
     },
+    "headroom": {
+      "type": "object",
+      "description": "Wake the next node before anything is Pending, when the awake pool is nearly full of what the runner pods requested. Off at 0.",
+      "properties": {
+        "requestedPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Wake one more node when the runner pods on the awake nodes have requested this percent of their allocatable CPU or memory, whichever is higher. 0 disables, and is the default. 80 is a sensible start. Only runner pods in arc.namespace count, not the baseline beside them."
+        }
+      }
+    },
     "queries": {
       "type": "object",
       "properties": {

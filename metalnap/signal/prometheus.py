@@ -102,7 +102,7 @@ def _read_before(path, query, socket_timeout, deadline):
 
 class PrometheusSignal:
     def __init__(self, url, shortfall_query, saturation_query=None,
-                 timeout=20, fit_check=None):
+                 timeout=20, fit_check=None, pod_requests=None):
         self.url = url.rstrip("/")
         #: A PromQL query or a callable returning the amount, or {resource:
         #: either} to size on several -- which then needs a NodeSource that
@@ -116,6 +116,11 @@ class PrometheusSignal:
         #: MUCH work is waiting but not WHY, so the fit question needs a
         #: different source -- see PendingPodFit in metalnap/kube.py.
         self.fit_check = fit_check
+        #: Optional callable() -> {node: {resource: amount}}: what the work on
+        #: each node has asked for, which the headroom wake reads. Not a
+        #: PromQL query -- the scheduler's effective-request formula is not
+        #: expressible there, as for the shortfall -- see kube.RunnerRequests.
+        self.pod_requests = pod_requests
 
     def _scalar(self, query):
         res = instant_query(self.url, query, self.timeout)["result"]
@@ -145,3 +150,11 @@ class PrometheusSignal:
             # is worse.
             return True
         return bool(self.fit_check(capacity))
+
+    def requested(self):
+        if self.pod_requests is None:
+            # Raised, not guessed at: no source reads as "cannot tell", and
+            # the controller then acts as if headroom were not configured.
+            raise RuntimeError("no source of pod requests is wired; headroom "
+                               "needs one (kube.RunnerRequests)")
+        return self.pod_requests()
