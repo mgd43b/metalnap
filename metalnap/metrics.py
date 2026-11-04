@@ -35,6 +35,9 @@ class Metrics:
         with self._lock:
             r = dict(self._report)
         limit = r.get("limit")
+        # Present only while HEADROOM_REQUESTED_PCT is set; the fill, only
+        # while it could be read. A ratio, 0 to 1 and over, not a percentage.
+        headroom = r.get("headroom") or {}
         samples = (
             ("metalnap_capacity_ceiling", "gauge",
              "The most managed nodes allowed awake: the effective limit, the "
@@ -61,13 +64,28 @@ class Metrics:
              "counted once per shed when the power-off is confirmed, since "
              "the controller started.",
              int(r.get("forced") or 0)),
+            ("metalnap_headroom_requested_ratio", "gauge",
+             "What the runner pods on the awake nodes have requested, over "
+             "what those nodes can allocate: the higher of CPU and memory, as "
+             "a ratio (0.8 is 80%). Absent while headroom is not configured, "
+             "no node is awake, or the reading could not be taken.",
+             headroom.get("fill")),
+            ("metalnap_headroom_requested_threshold_ratio", "gauge",
+             "The ratio at which headroom asks for one more awake node "
+             "(HEADROOM_REQUESTED_PCT over 100). Absent while it is not "
+             "configured.",
+             headroom.get("threshold")),
         )
         out = []
         for name, kind, help_, value in samples:
             out.append("# HELP %s %s" % (name, help_))
             out.append("# TYPE %s %s" % (name, kind))
             if value is not None:       # absent is how "no limit" is said
-                out.append("%s %d" % (name, value))
+                # Counts are whole; a ratio is not, and %d would print 0.83 as
+                # 0.
+                out.append("%s %s" % (name, "%d" % value
+                                      if isinstance(value, int)
+                                      else "%.6g" % value))
         return "\n".join(out) + "\n"
 
 

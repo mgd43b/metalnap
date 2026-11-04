@@ -200,6 +200,25 @@ class DemandSignal(Protocol):
         powering on a machine for work it can never run.
         """
 
+    def requested(self) -> dict:
+        """
+        OPTIONAL. What the work metalnap sizes for has asked for, per node:
+        {node: {resource: amount}}, in the unit NodeState.capacity uses for
+        that resource. Read only when HEADROOM_REQUESTED_PCT is above 0 -- and
+        a signal without this method is refused at construction if it is.
+
+        The headroom wake is built on it: the requests on the awake nodes, over
+        their allocatable, say how full the pool is BEFORE the scheduler has
+        failed to place anything. So count only the work that is sized for --
+        runner pods -- and not the baseline beside it, which would put the pool
+        permanently nearer to full than the work is. A node absent from the
+        answer has nothing on it.
+
+        Raise if you cannot tell. That reads as "no headroom reading": the term
+        is dropped from this tick's decision and never stands in for one, so
+        the one thing an outage of this read cannot do is wake a node.
+        """
+
 
 class CapacityCeiling(Protocol):
     """The most managed nodes that may be awake right now."""

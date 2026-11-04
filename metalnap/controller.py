@@ -17,6 +17,12 @@ this against real hardware and real CI:
     the failure mode that hides longest.
   * Wake readily, sleep reluctantly, and hold evidence of demand across the
     dips a noisy signal produces.
+  * A cold boot takes minutes, so waiting for work to go Pending wakes a node
+    for an episode that is half over. Where an operator asks for it, a pool
+    nearly full of what runner pods requested wakes the next node BEFORE that
+    -- and it is only ever a floor: it cannot wake on a reading it failed to
+    take, it cannot hold a node the pool could do without, and a node it woke
+    is not slept for the load that woke it.
   * A node nobody wants still has to be maintained. One that sleeps for weeks
     misses every package update and config run, and then has to catch up at
     the exact moment demand finally wanted it. Scheduled visits are the answer,
@@ -129,6 +135,15 @@ class Controller:
             self.notifier = _WithoutAlerts(self.notifier)
         self.warmup = warmup or NullWarmup()
         self.cfg = config.validate()
+        if (self.cfg.headroom_requested_pct > 0
+                and not callable(getattr(signal, "requested", None))):
+            # At construction, with the setting named, like every other
+            # configuration that cannot work: a headroom that is silently
+            # never read looks exactly like one that is never needed.
+            raise ValueError(
+                "HEADROOM_REQUESTED_PCT is set, but the demand signal has no "
+                "requested() to read what the work on the nodes asked for "
+                "(see DemandSignal.requested)")
         self.now = clock
         self._log = log or _default_log
         #: Per-node operational state, plus a few controller-wide timers. In
@@ -158,6 +173,10 @@ class Controller:
         self._states, self._pool = {}, []
         self._busy_seen = {}    # busy() answers already read this tick
         self._rep = None        # what to publish, if the tick got that far
+        #: The headroom reading, for the metrics ONLY: it moves every tick, and
+        #: in the report the status object writes it would make that a write
+        #: per tick for a number `metalnap status` does not show.
+        self._headroom_rep = None
 
     def log(self, level, msg, **kv):
         self._log(level, msg, mode=self.cfg.mode, **kv)
@@ -1400,6 +1419,129 @@ class Controller:
         return cap, max((math.ceil(v / cap[r]) for r, v in shortfall.items()
                          if v > 0 and r in cap), default=0)
 
+    def _headroom(self, awake, states, in_use):
+        """How full the awake pool is, and the floor on `want` that says.
+
+        {"fill": {resource: ratio}, "peak": the higher of them, "without": the
+        peak with the largest node a sleep could pick gone, "floor": an int}, or
+        None --
+        not configured, no node awake (a pool of none has no fill, and a cold
+        start is the shortfall's), or a reading that could not be taken. That
+        last is logged and NEVER read as a full pool: it is the term missing
+        from this tick, the way a failed saturation check is.
+
+        Fill is what the runner pods on the awake nodes REQUESTED over what
+        those nodes can allocate, per resource, because that is what the
+        scheduler places against: a pool at 100% of requests fails the next
+        pod whatever the CPU graph says. `awake` is Ready and schedulable by
+        construction, so a node mid-wake (cordoned until it arrives) and one
+        mid-drain are not in it, and are not capacity here.
+
+        The floor is one of three, and the middle one is the hysteresis:
+
+          fill >= T                   len(awake) + 1  ask for another node
+          fill < T but, with the      len(awake)      keep every node
+            largest idle node gone,
+            the rest would be >= T
+          otherwise                   0               no opinion
+
+        Without the middle one a node woken at 85% is idle -- its arrival
+        moved nothing already running -- the pool reads 55% with it counted,
+        and the ordinary sleep takes it back down the moment min-uptime and the
+        sleep window allow, into the 85% that woke it. Every cycle is a cold
+        boot, 5 to 8 minutes of it. So a node is not put to sleep while taking
+        it away would leave the pool at or above the threshold. The node taken
+        away in the test is the LARGEST ONE THE SLEEP COULD PICK -- awake and
+        carrying no work, since a busy node is never slept -- so that whichever
+        idle node it does pick was one whose absence the test already allowed.
+        Not the largest awake node: with a big node busy and a small one idle,
+        "without the big one" reads 100% and would hold a node the pool can do
+        without, for as long as the big node's job runs.
+
+        What the hold is NOT: a node held for ever. It is the load that holds
+        it, measured on the pool without it, so the first reading under the
+        threshold lifts it -- as jobs finish, or the pool is rebuilt around
+        fewer, bigger runners. No idle node, no hold: there is nothing to
+        sleep. And a pool of one is never held: its fill without itself is every
+        request over nothing, which would keep the last awake node up for a warm
+        pool alone.
+
+        The requests on the node a sleep would remove are counted as moving,
+        not vanishing -- an idle runner released there is recreated elsewhere
+        by the scale set -- which is the side to err on: it holds a node too
+        long, never sleeps one that has to come back. And the floor is exactly
+        the pool as it is, so `want == len(awake)` and the ordinary decision is
+        "demand exactly met": the sleep window, which that branch resets,
+        has to run again in full from the moment the hold lifts.
+        """
+        pct = self.cfg.headroom_requested_pct
+        if pct <= 0:
+            return None
+        threshold = pct / 100.0
+        self._headroom_rep = {"threshold": threshold, "fill": None}
+        if not awake:
+            return None
+        try:
+            asked = self.signal.requested()
+            #: What a sleep could pick. A node in use is never slept, and one
+            #: whose busy check failed counts as in use, as it does everywhere.
+            idle = [n for n in awake if n not in in_use]
+            caps = {}
+            for n in awake:
+                c = states[n].capacity
+                # A bare number is the one resource a signal sized on before
+                # there were several: memory, as everywhere else.
+                caps[n] = ({r: float(v) for r, v in c.items()}
+                           if isinstance(c, dict) else {"memory": float(c)})
+            fill, without = {}, {}
+            for r in sorted(set().union(*caps.values())):
+                total = sum(c.get(r, 0.0) for c in caps.values())
+                if not total > 0:              # nothing to be full of; NaN too
+                    continue
+                used = sum(float((asked.get(n) or {}).get(r, 0.0))
+                           for n in caps)
+                fill[r] = used / total
+                if not idle:
+                    without[r] = 0.0           # nothing to sleep: nothing to hold
+                    continue
+                rest = total - max(caps[n].get(r, 0.0) for n in idle)
+                without[r] = (used / rest if rest > 0
+                              else math.inf if used > 0 else 0.0)
+            if not fill:
+                raise ValueError("no awake node reports allocatable capacity "
+                                 "for any resource")
+        except Exception as e:                        # noqa: BLE001
+            self.log("warn", "headroom reading failed; deciding without it",
+                     err=str(e))
+            return None
+        peak, peak_without = max(fill.values()), max(without.values())
+        # `_HEADROOM_EPS`: a pool at EXACTLY the threshold asks, and the sum of
+        # a few fractional requests must not decide that by its last bit.
+        if peak + _HEADROOM_EPS >= threshold:
+            floor, kind = len(awake) + 1, "asks"
+        elif len(awake) >= 2 and peak_without + _HEADROOM_EPS >= threshold:
+            floor, kind = len(awake), "holds"
+        else:
+            floor, kind = 0, None
+        self._headroom_rep["fill"] = peak
+        if kind != self.st.get("_headroom_last"):
+            if kind:
+                self.log("info", "headroom: the awake pool has requested "
+                                 "the threshold or more; asking for one more "
+                                 "node" if kind == "asks" else
+                                 "headroom: the pool without its largest idle "
+                                 "node would be at or above the threshold; "
+                                 "keeping every node awake",
+                         fill_pct=_pct(fill),
+                         without_pct=round(100 * peak_without, 1),
+                         threshold_pct=pct, awake=len(awake))
+            elif self.st.get("_headroom_last"):
+                self.log("info", "headroom no longer asks for a node",
+                         fill_pct=_pct(fill), threshold_pct=pct)
+            self.st["_headroom_last"] = kind
+        return {"fill": fill, "peak": peak, "without": peak_without,
+                "floor": floor}
+
     def _in_use(self, awake):
         """Awake nodes carrying work, by the work queue's own records.
 
@@ -2045,7 +2187,10 @@ class Controller:
                 # the writer, whose retry could succeed and clear `error`
                 # before it was read, and a failure nobody saw is not logged.
                 err = getattr(sink, "error", None)
-                sink.publish(copy.deepcopy(rep))
+                snap = copy.deepcopy(rep)
+                if what == "metrics" and self._headroom_rep is not None:
+                    snap["headroom"] = dict(self._headroom_rep)
+                sink.publish(snap)
             except Exception as e:                    # noqa: BLE001
                 err = str(e) or type(e).__name__
             if err:
@@ -2063,7 +2208,7 @@ class Controller:
         down must not also silence the one place an operator reads that a
         ceiling is engaged.
         """
-        self._rep = None
+        self._rep = self._headroom_rep = None
         # Rebuilt from scratch: a tick that returns before the ceiling is read
         # -- no node exists yet, mode=off -- must not leave the last tick's
         # conclusion for sleep(), maintain() or a power cycle to act on.
@@ -2303,6 +2448,15 @@ class Controller:
                 self._node(n).setdefault("idle_since", self.now())
             else:
                 self._node(n).pop("idle_since", None)
+        # After in_use, which the hold is measured against: the node a sleep
+        # could take is one that is carrying no work. The busy answers are
+        # cached for the tick, so this costs the work queue no further reads.
+        #
+        # With no demand signal there is no reading to make: whatever is
+        # decided below is dropped to 0 for want of one, and a pod list spent
+        # on a tick that cannot use it is one more call on a degraded cluster.
+        headroom = (self._headroom(awake, states, in_use) if demand_known
+                    else None)
         # A saturated queue admits no more work, so its demand is invisible to
         # shortfall() -- and it is a FLOOR, not more demand. Its runners sit on
         # nodes already counted in use; a node woken on top of them is one the
@@ -2341,6 +2495,17 @@ class Controller:
                 self.log("warn", "fit check failed; holding the pool as it is",
                          err=str(e))
                 want = len(awake)
+        # The headroom floor goes in AFTER the fit guard, not before it: it
+        # has nothing pending behind it to inspect -- that is the point of it,
+        # as it is of saturation -- so the guard has no say, and the two ways
+        # the guard has of lowering `want` (to what is in use, or to the pool
+        # as it is) would each cancel a floor that was asked for. An unrelated
+        # pod stuck on a selector must not stop a full pool being given room.
+        # It is still BEFORE the ceiling, which caps everything below.
+        if headroom is not None:
+            floor = min(len(wakeable), headroom["floor"])
+            want = max(want, floor)
+            unguarded = max(unguarded, floor)
         # The ceiling caps what is wanted -- AFTER the fit guard, which can
         # hand `want` back as "the pool as it is", and to `unguarded` as well,
         # which the stranded repair reads: clamped before either, a guard that
@@ -2527,9 +2692,18 @@ class Controller:
         coming = [n for n in present
                   if st.get(n, {}).get("phase") == "waking"
                   and st[n].get("booting")]
+        seen = {}
+        if cfg.headroom_requested_pct > 0:
+            # Only when it is configured: a deployment that never asked for
+            # headroom keeps the line it has always had. None is a reading
+            # that was not taken, which the warning above says why.
+            seen = dict(
+                headroom_pct=_pct(headroom["fill"]) if headroom else None,
+                headroom_threshold_pct=cfg.headroom_requested_pct,
+                headroom_floor=headroom["floor"] if headroom else None)
         self.log("info", "observed", shortfall=_show(shortfall),
                  saturated=saturated, want=want, awake=awake, in_use=in_use,
-                 coming=coming, ceiling=self._eff, wanted=wanted)
+                 coming=coming, ceiling=self._eff, wanted=wanted, **seen)
         # Demand the ceiling is refusing stays visible, once per change -- it
         # is the one reason a node does not come up that is not a fault -- and
         # a shadow says what it would not have done.
@@ -2701,6 +2875,16 @@ def _hash_fraction(digest):
     names will ever produce -- but an all-ones digest produces it every time.
     """
     return int.from_bytes(digest[:4], "big") / 2.0 ** 32
+
+
+#: Slack on a headroom comparison, in ratio: requests are sums of fractions,
+#: and "at the threshold" has to survive their rounding.
+_HEADROOM_EPS = 1e-9
+
+
+def _pct(fill):
+    """A headroom ratio per resource, as the percentages a log line reads."""
+    return {r: round(100 * v, 1) for r, v in fill.items()}
 
 
 def _show(amount):

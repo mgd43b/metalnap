@@ -172,7 +172,8 @@ capacityCeiling:
 # default: before this the controller listened on nothing at all. Set a port to
 # serve /metrics there -- metalnap_capacity_ceiling (the reading, not clamped to
 # the pool), ..._pool_nodes, ..._engaged, ..._signal_ok, metalnap_nodes_shed and
-# metalnap_shed_forced_total. There is deliberately no
+# metalnap_shed_forced_total, and with headroom.requestedPct set
+# metalnap_headroom_requested_ratio and ..._threshold_ratio. There is deliberately no
 # Service: scrape the pod (a PodMonitor), or add a Service of your own. 1024 or
 # more -- the container runs unprivileged with every capability dropped. At most
 # eight connections are handled at once; the rest are closed as they arrive.
@@ -223,6 +224,37 @@ queries:
   # reads as saturated on every ordinary run, with nothing queued behind it,
   # and holds a node awake for it.
   saturation: ""          # empty = the ARC default; "-" disables the term
+
+# Wake the next node BEFORE anything goes Pending. A cold boot takes minutes, so
+# waiting for the scheduler to fail leaves the node arriving half way through
+# the burst it was woken for. This watches how full the awake pool already is:
+# what the runner pods on the awake nodes have REQUESTED, over what those nodes
+# can allocate, for CPU and for memory, whichever is higher. At or above
+# `requestedPct` it asks for one more awake node than there are now, and goes
+# through everything a wake does -- timers.wakeSustainS, a node already booting
+# counting as the one asked for, the backoff, an operator's cordon, the
+# capacity ceiling -- except the fit check, which has nothing pending to look at.
+#
+# OFF at 0, the default, and the chart then renders exactly as it did before.
+# It powers hardware on when nothing is yet waiting, and that should be a
+# decision somebody made. 80 is a sensible start.
+#
+# Only the runner pods in arc.namespace count (the ones carrying ARC's
+# scale-set label), not DaemonSets or anything else beside them. The baseline
+# is inside what a node can allocate and outside what is counted against it, so
+# a heavy DaemonSet footprint lowers the fill you can actually reach: choose the
+# percentage for the room the runners have, not for the whole node. It follows
+# the resources the pool is sized on -- both, unless queries.cpuShortfall is "-".
+#
+# A node it woke is not put straight back to sleep: the ordinary sleep waits
+# while taking away the largest node it could pick -- one carrying no work --
+# would leave the rest at or above `requestedPct`, and goes ahead the moment it
+# would not. If the reading cannot
+# be taken it is as if this were off for that tick, and never a reason to wake.
+# With metrics.port set it exports metalnap_headroom_requested_ratio and
+# metalnap_headroom_requested_threshold_ratio.
+headroom:
+  requestedPct: 0         # 0 disables. 0 to 100; 80 is a sensible start.
 
 rbac:
   create: true

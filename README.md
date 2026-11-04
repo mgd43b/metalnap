@@ -124,9 +124,12 @@ Implement three small duck-typed interfaces (`metalnap/types.py`):
 Plus `NodeSource` for reading node state and applying cordons — `KubeNodeSource`
 covers Kubernetes.
 
-`PowerBackend.cycle()`, `NodeSource.note()` / `disown()` and
-`Notifier.alert()` / `clear_alert()` are optional: a backend without them
-still works, and a wedged node is then alerted on rather than power-cycled.
+`PowerBackend.cycle()`, `NodeSource.note()` / `disown()`,
+`Notifier.alert()` / `clear_alert()` and `DemandSignal.requested()` are
+optional: a backend without them still works, and a wedged node is then
+alerted on rather than power-cycled. (`requested()` is what the
+[headroom wake](#waking-before-anything-is-pending) reads, and is asked for
+only when `HEADROOM_REQUESTED_PCT` is set.)
 
 **Configure a `Notifier` even though it is optional.** A node powering off looks
 exactly like a node dying, so without one every sleep pages someone — and worse,
@@ -171,6 +174,79 @@ equals the most jobs a single run starts — a four-job matrix on
 `maxRunners: 4` — reads as saturated on every ordinary run, with nothing queued
 behind it, and holds a node awake for it. Above that width, only work actually
 waiting on the cap reads as saturated.
+
+## Waking before anything is Pending
+
+Everything above wakes a node for work that has already failed to be placed, or
+for a queue already at its cap. A cold boot takes five to eight minutes, so by
+the time the node is up the burst it was woken for is half over, and the first
+jobs have sat Pending behind it. **Headroom** is an optional signal that wakes
+the next node *before* that, when the awake pool is nearly full.
+
+It is **off by default**. `HEADROOM_REQUESTED_PCT` (chart
+`headroom.requestedPct`) is `0` unless an operator sets it — a chart that does
+not set it renders exactly as it did before, and the controller never reads the
+pods for it — because it powers hardware on while nothing is yet waiting, and
+that should be a decision somebody made. `80` is a sensible start.
+
+**The reading.** For each resource, *requested ÷ allocatable* over the **awake**
+managed nodes — Ready, schedulable, not held by an operator or taken for
+maintenance, and not mid-wake (those are cordoned until they arrive). The pool's
+fill is the higher of CPU and memory: the scheduler places against requests, so
+a pool at 100% of either fails the next pod whatever the CPU graph says. At or
+above the threshold the headroom asks for **one more awake node than are awake
+now**.
+
+- **Only the work metalnap sizes for counts**: runner pods in `ARC_NAMESPACE`
+  (the ones carrying ARC's scale-set label), counted with the scheduler's own
+  effective-request formula. DaemonSets and anything else beside them are not
+  — but they are inside what a node can *allocate*, so a heavy baseline lowers
+  the fill you can reach. Choose the percentage for the room the runners have,
+  not for the whole node.
+- **It follows the resources the pool is sized on:** CPU and memory by default,
+  memory alone with `CPU_SHORTFALL_QUERY=""`.
+- **It is a floor**, like saturation, not more demand on top of it: a node busy
+  with the work that fills the pool is not also a node's worth of new demand.
+  It has no pending pods behind it, so it skips the fit check a
+  pending-driven wake goes through (`fits_node`, a scale-up simulation over
+  the pending pods) — and an unrelated pod stuck on a selector cannot cancel
+  it. Everything else a wake goes through
+  still applies: `WAKE_SUSTAIN_S`, a node already booting counting as the one
+  asked for (so a boot is never doubled), the wake backoff, an operator's
+  cordon and maintenance requests, and the [capacity ceiling](#capacity-ceiling),
+  which caps the answer last.
+
+**It does not flap.** A node woken at 85% arrives empty — nothing already
+running moves onto it — so with it counted the pool reads, say, 55%, and the
+ordinary sleep would take it back down as soon as `MIN_UPTIME_S` and the sleep
+window allow, into the 85% that woke it: a cold boot per cycle. So while taking
+away the **largest node the sleep could pick** would leave the rest *at or
+above* the threshold, every node is kept — `want` equals the pool as it is,
+which reads as demand exactly met. The node tested is the largest one carrying
+no work, since a busy node is never slept: tested against the largest awake
+node instead, a big busy node beside a small idle one would hold the small one
+for as long as the big one's job ran, with nothing that would wake it again. And
+because it is the largest idle node, whichever one the sleep does pick was
+already allowed. It is a floor and not a lock: the test is the load on the pool
+without the node, so the first reading under the threshold lifts it (jobs
+finish; the sleep window then runs in full from that moment, since a held pool
+resets it). With no idle node there is nothing to hold, and a pool of one is
+never held, or the last node could never sleep for a warm pool alone.
+
+**It fails toward no change.** If the pods cannot be listed, or the nodes report
+no allocatable capacity, the tick logs a warning and decides as if headroom were
+not configured — it never wakes a node on a reading it failed to take, and it is
+not read at all while the demand signal itself is down. A custom `DemandSignal`
+without `requested()` cannot be given a threshold; the controller refuses to
+start rather than silently never reading it.
+
+**Seeing it.** When it is set, every `observed` log line carries
+`headroom_pct` (the fill per resource, in percent; `null` when no reading was
+taken), `headroom_threshold_pct` and `headroom_floor` (`0` no opinion, the pool
+size to hold it, one more to ask for a node), a change is logged once, and the
+metrics listener exports `metalnap_headroom_requested_ratio` and
+`metalnap_headroom_requested_threshold_ratio` (ratios, `0.8` is 80%). The
+status object does not carry it: it moves every tick.
 
 ## When a node will not come back
 
@@ -625,6 +701,8 @@ after ten seconds, which frees its slot):
 | `metalnap_capacity_ceiling_signal_ok` | 0 while the signal is unavailable and treated as no ceiling |
 | `metalnap_nodes_shed` | nodes currently held down by the ceiling |
 | `metalnap_shed_forced_total` | busy nodes shut down at the deadline with work still running, counted once per shed when the power-off is confirmed (a node that ignores the request is not counted) |
+| `metalnap_headroom_requested_ratio` | what runner pods on the awake nodes have requested, over what those nodes can allocate: the higher of CPU and memory, as a ratio (`0.8` is 80%); absent while [headroom](#waking-before-anything-is-pending) is off, no node is awake, or the reading could not be taken |
+| `metalnap_headroom_requested_threshold_ratio` | the ratio at which headroom asks for one more node; absent while it is off |
 
 "The ceiling binds" is `metalnap_capacity_ceiling < metalnap_capacity_ceiling_pool_nodes`
 (which is `..._engaged`); "shedding happened" is `metalnap_capacity_ceiling_engaged == 1`, or
@@ -793,6 +871,11 @@ ceiling](#capacity-ceiling) and is off by default. `CEILING_RELEASE_HOLD_S`
 busy node) and `CEILING_TIMEOUT_S` (default `5`, the read's own timeout) shape
 it. `STATUS_CONFIGMAP` names the object `metalnap status`
 reads it from, and `METRICS_PORT` (default `0`, off) serves the metrics.
+
+`HEADROOM_REQUESTED_PCT` (default `0`, off; `80` is a sensible start) wakes one
+more node *before* anything is Pending, once the runner pods on the awake nodes
+have requested that percent of their allocatable CPU or memory — see [Waking
+before anything is Pending](#waking-before-anything-is-pending).
 
 The pool is sized on **memory and CPU**, whichever needs more nodes
 (set `CPU_SHORTFALL_QUERY=""` to size on memory alone). Runners that run out

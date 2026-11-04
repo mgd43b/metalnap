@@ -41,6 +41,17 @@
 {{- end }}
 {{- end }}
 {{- /*
+  Headroom is a percentage of the pool, so outside 0 to 100 it is a typo -- 800
+  for 80 would otherwise render and never fire. The same check as
+  metalnap/config.py, here to move the discovery to install time. Compared as
+  float64: Helm reads a number in values as one, and `int` would floor 80.5.
+*/ -}}
+{{- with .Values.headroom }}
+{{- if or (lt (float64 .requestedPct) 0.0) (gt (float64 .requestedPct) 100.0) }}
+{{- fail (printf "headroom.requestedPct (%v) must be from 0 to 100; 0 disables" .requestedPct) }}
+{{- end }}
+{{- end }}
+{{- /*
   The capacity ceiling's two sources are mutually exclusive, and its numbers
   cannot be negative -- the same checks as metalnap/config.py, here to move the
   discovery to install time. `static` is tested for null and never for
@@ -149,4 +160,10 @@ data:
   {{- end }}
   {{- if .Values.queries.saturation }}
   SATURATION_QUERY: {{ if eq .Values.queries.saturation "-" }}""{{ else }}{{ .Values.queries.saturation | quote }}{{ end }}
+  {{- end }}
+  {{- with .Values.headroom }}
+  {{- /* Rendered only above 0, so a default install is byte-for-byte what it was. */}}
+  {{- if gt (float64 .requestedPct) 0.0 }}
+  HEADROOM_REQUESTED_PCT: {{ .requestedPct | quote }}
+  {{- end }}
   {{- end }}

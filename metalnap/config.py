@@ -139,12 +139,24 @@ class Config:
     #: added to a safety-critical path to hide a slow one.
     ceiling_timeout_s: int = _i("CEILING_TIMEOUT_S", 5)
 
+    # -- headroom ----------------------------------------------------------
+    # A wake signal that fires BEFORE anything is Pending. A cold boot takes
+    # minutes, so waiting for the scheduler to fail leaves the node arriving
+    # half way through the episode it was woken for.
+    #: Wake one more node when the work on the awake pool has REQUESTED this
+    #: percent of its allocatable CPU or memory, whichever is higher. Only the
+    #: runner pods count, not the baseline beside them. 0 disables it, which is
+    #: the default: it powers hardware on when nothing is yet waiting, and that
+    #: should be a decision somebody made.
+    headroom_requested_pct: float = _f("HEADROOM_REQUESTED_PCT", 0)
+
     def validate(self):
         if self.mode not in ("off", "dry_run", "on"):
             raise ValueError("MODE must be off|dry_run|on, got %r" % self.mode)
         self._validate_maintenance()
         self._validate_escalation()
         self._validate_ceiling()
+        self._validate_headroom()
         return self
 
     def warnings(self):
@@ -175,6 +187,13 @@ class Config:
                 % (self.power_cycle_cooldown_s, self.wake_timeout_s))
         if self.shutdown_timeout_s <= 0:
             raise ValueError("SHUTDOWN_TIMEOUT_S must be > 0")
+
+    def _validate_headroom(self):
+        # Written as a negated range so that NaN, which compares false to
+        # everything, is refused with the rest.
+        if not 0 <= self.headroom_requested_pct <= 100:
+            raise ValueError("HEADROOM_REQUESTED_PCT must be from 0 to 100 "
+                             "(0 disables), got %r" % self.headroom_requested_pct)
 
     def _validate_ceiling(self):
         """Reject a ceiling that is ambiguous, rather than pick a source.
