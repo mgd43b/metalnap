@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/mgd43b/metalnap/compare/v0.7.0...v0.7.1) (2026-11-18)
+
+
+### Fixes
+
+* **deps:** bump alpine from `be26560` to `f59abe6` ([5a8b8fe](https://github.com/mgd43b/metalnap/commit/5a8b8fe0456d7a0c957d08c02e4f79efce187561))
+* **deps:** bump alpine from `be26560` to `f59abe6` ([6b8502a](https://github.com/mgd43b/metalnap/commit/6b8502aff63c9613c0bb044fe8ef13c0b130200d))
+
 ## [0.7.0](https://github.com/mgd43b/metalnap/compare/v0.6.3...v0.7.0) (2026-11-04)
 
 
